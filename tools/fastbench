@@ -1,0 +1,32 @@
+#!/bin/zsh
+# One entry point for fast benches on the DS4.1 lane. Doc: docs/FAST_BENCH.md
+#   fastbench up [TREE]                 lane on TREE, reused without a model reload when the code did not change
+#   fastbench build [DEPTHS]            corpus checkpoints on disk, pinned against eviction (~10 min, once)
+#   fastbench ab 'name:{"flag":1}' ...  A/B at depth from the checkpoints, flags only (~1 min per 1M cell); FB_DEPTHS, FB_JSON
+#   fastbench flags name=value ...      every flag back to its default, then these, on the live lane
+#   fastbench status                    lane, tree, pinned checkpoints, flag state
+setopt err_exit no_unset
+TREE=${FB_TREE:-$HOME/kyojin-work/wt_int1}
+DEPTHS=${FB_DEPTHS:-131072,524288,983040}
+LANE=$HOME/kyojin-work/ds41-lane; LC=$HOME/kyojin-work/oc-runs/lanectl; LOCK=/tmp/lane_ab.lock
+PY=$HOME/kyojin-mlx/.venv/bin/python; FL=/opt/homebrew/bin/flock
+cmd=${1:-status}; (( $# )) && shift
+case $cmd in
+  up)
+    [[ ! -e $LANE/no_kvdisk ]] || { echo "marker no_kvdisk present: use flag kv_disk_off instead"; exit 2; }
+    timeout 500 $FL -w 300 $LOCK $LC start ${1:-$TREE} ;;
+  build)
+    cd $TREE; timeout 2000 $FL -w 300 $LOCK timeout 1800 $PY tools/depth_ab.py --build --depths ${1:-$DEPTHS} ;;
+  ab)
+    (( $# )) || { sed -n 2,7p $0; exit 2; }
+    args=(); for a in "$@"; do args+=(--arm "$a"); done
+    [[ -z ${FB_JSON:-} ]] || args+=(--json $FB_JSON)
+    cd $TREE; timeout 2000 $FL -w 300 $LOCK timeout 1800 $PY tools/depth_ab.py --depths ${FB_DEPTHS:-524288,983040} "${args[@]}" ;;
+  flags)
+    /usr/bin/python3 -I $HOME/kmlx-wave1/scratch/flagreset.py "$@" ;;
+  status)
+    $LC status; [[ -e $LANE/no_kvdisk ]] && echo "no_kvdisk marker present"
+    for d in $LANE/kvdisk_chk0/*(/N); do print -- "${d:t} files $(ls $d | /usr/bin/grep -c safetensors) pins $(cat $d/pins.json 2>/dev/null || echo none)"; done
+    tail -3 $LANE/lanectl.log ;;
+  *) sed -n 2,7p $0; exit 2 ;;
+esac

@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+results/
+tools/cbcount/*.dylib
+tools/commitgate/*.dylib
+replay/build/
+tools/rowread/*.dylib
+tools/rowread/*.tmp

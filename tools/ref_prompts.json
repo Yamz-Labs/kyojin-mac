@@ -1,0 +1,5 @@
+[
+  {"name": "sky", "messages": [{"role": "user", "content": "Explain in detail why the sky is blue during the day and why sunsets are red."}]},
+  {"name": "code", "messages": [{"role": "user", "content": "Write a Python function is_palindrome(s) with a docstring, then show three usage examples as comments."}]},
+  {"name": "fr", "messages": [{"role": "user", "content": "Donne cinq conseils pour bien dormir, avec une phrase d'explication pour chacun. Réponds en français."}]}
+]

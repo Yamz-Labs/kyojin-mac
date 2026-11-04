@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kyojin-mlx"
+version = "1.8.9"
+description = "Kyojin for Apple Silicon: MLX and Metal kernels, OpenAI-compatible server for GGUF, EXL3 and MLX models"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+  "mlx>=0.32.4",
+  "mlx-lm>=0.32.2",
+  "mlx-vlm==0.7.10",
+  "numpy",
+  "jinja2",
+  "safetensors",
+  "tokenizers",
+  "transformers",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["kyojin_mlx*"]
+
+[tool.setuptools.package-data]
+kyojin_mlx = ["assets/*", "**/*.metal", "**/*.jinja"]

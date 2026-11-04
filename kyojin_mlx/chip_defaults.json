@@ -1,0 +1,5 @@
+{
+ "Apple M5": {"cores": 10, "mma_max": 8, "nax_ks_tgs": 128, "nax_ks_few": 32, "nax_ks_weights": 16000000, "dense_fused_max": 512,
+             "sdpa_tpc": 2, "sdpa_min_n": {"128": 1024, "256": 4096}, "sdpa_min_n1": {"128": 4096, "256": 24576},
+             "step_regions_wide": 0}
+}
