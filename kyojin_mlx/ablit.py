@@ -23,6 +23,8 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 
+from . import ablate as AZ
+
 ENV = "KYOJIN_ABLIT_SPEC"
 _OFF = ("", "off", "0", "false", "no", "none")
 
@@ -89,11 +91,81 @@ def _project_affine(y: mx.array, w: mx.array, R: mx.array, mu: mx.array) -> mx.a
 _project_c = mx.compile(_project, shapeless=True)
 _project_affine_c = mx.compile(_project_affine, shapeless=True)
 
+# Flag ablit_fused (KYOJIN_ABLIT_FUSED, runtime): the whole projection of a row in ONE launch. The stock path is ~7 launches per call
+# (fp16 clip = maximum + minimum, the fp32 cast the matmul reads, R y, (R y - mu) R, the fused update), and a decensored DS4.1 step makes
+# ~58 calls: ~350 of its ~2080 dispatches. Same math in fp32 and the same association as _project_affine; only the summation order of
+# the K dot products differs (one threadgroup per row: per-thread partial sums, simd_sum, then the simdgroup partials in order).
+FUSED = os.environ.get("KYOJIN_ABLIT_FUSED", "1") not in ("0", "")
+_TG = 256                                                                      # threads per row: 20 columns each at hidden 5120
+_SRC = """
+    const uint row = threadgroup_position_in_grid.x;
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint tg = threads_per_threadgroup.x;
+    const ulong base = ulong(row) * H;
+    float s[K];
+    for (int k = 0; k < K; ++k) { s[k] = 0.0f; }
+    for (uint h = tid; h < uint(H); h += tg) {
+        float v = static_cast<float>(y[base + h]);
+        if (is_same<T, half>::value) { v = clamp(v, -65504.0f, 65504.0f); }   // an inf column would give inf - inf = NaN
+        for (int k = 0; k < K; ++k) { s[k] += v * R[ulong(k) * H + h]; }
+    }
+    threadgroup float part[K * 32];
+    for (int k = 0; k < K; ++k) {
+        const float t = simd_sum(s[k]);
+        if (thread_index_in_simdgroup == 0) { part[k * 32 + simdgroup_index_in_threadgroup] = t; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint nsg = (tg + 31) / 32;
+    float c[K];
+    for (int k = 0; k < K; ++k) {
+        float t = 0.0f;
+        for (uint i = 0; i < nsg; ++i) { t += part[k * 32 + i]; }
+        c[k] = t - mu[k];
+    }
+    const float wv = w[0];
+    for (uint h = tid; h < uint(H); h += tg) {
+        float v = static_cast<float>(y[base + h]);
+        if (is_same<T, half>::value) { v = clamp(v, -65504.0f, 65504.0f); }
+        float p = 0.0f;
+        for (int k = 0; k < K; ++k) { p += c[k] * R[ulong(k) * H + h]; }
+        out[base + h] = static_cast<T>(v - wv * p);
+    }
+"""
+_kern = None
+_consts: dict = {}                                                             # (w,) / ("mu0", K) -> small fp32 arrays, built once
+
+
+def _const(key, make):
+    a = _consts.get(key)
+    if a is None:
+        a = _consts[key] = make()
+    return a
+
+
+def _project_fused(y: mx.array, w: float, R: mx.array, mu: mx.array | None) -> mx.array:
+    global _kern
+    if _kern is None:
+        _kern = mx.fast.metal_kernel(name="kyojin_ablit_project", input_names=["y", "R", "mu", "w"], output_names=["out"], source=_SRC)
+    K, H = R.shape
+    if R.dtype != mx.float32:
+        R = R.astype(mx.float32)
+    if mu is None:
+        mu = _const(("mu0", K), lambda: mx.zeros((K,), dtype=mx.float32))
+    wa = _const(("w", float(w)), lambda: mx.array([w], dtype=mx.float32))
+    rows = y.size // H
+    return _kern(inputs=[y, R, mu, wa], template=[("T", y.dtype), ("K", K), ("H", H)], grid=(rows * _TG, 1, 1), threadgroup=(_TG, 1, 1),
+                 output_shapes=[y.shape], output_dtypes=[y.dtype])[0]
+
 
 def project(y: mx.array, w: float, R: mx.array, mu: mx.array | None = None) -> mx.array:
     """y - w * R^T (R y - mu) over the last axis, fp32 inside, y.dtype out. R [K, hidden] fp32. mu [K] (spec fields
     attn_mu / mlp_mu) = mean of R y on harmless text: the writer keeps its harmless level of the direction, which costs
     far less KL than pulling it to zero. Without mu this is the plain ablation."""
+    if AZ.ACTIVE and AZ.on("ablit"):                                           # ablate: the decensor projection is the identity (timing probe)
+        AZ.hit("ablit")
+        return y
+    if FUSED and R.ndim == 2 and y.shape[-1] == R.shape[1] and R.shape[0] <= 8 and y.size:
+        return _project_fused(y, w, R, mu)
     if y.dtype == mx.float16:                                                  # an inf row (fp16 overflow of the sub-layer) would give inf - inf = NaN
         y = mx.clip(y, -65504, 65504)
     if mu is not None:

@@ -43,6 +43,34 @@ class Rendered:
     images: list = field(default_factory=list)      # DS4.1: image records in prompt order, one placeholder each in `prompt`
 
 
+def split_resume(body: dict) -> tuple[dict, str | None]:
+    """Resume a reasoning block (body "continue_final_message": true): the last message is an assistant turn holding only `reasoning_content` (no
+    content, no tool calls). Returns (body without that turn, the reasoning prefix); (body, None) when the flag is off."""
+    if body.get("continue_final_message") is not True:
+        return body, None
+    msgs = body.get("messages")
+    last = msgs[-1] if isinstance(msgs, list) and msgs else None
+    if not isinstance(last, dict) or last.get("role") != "assistant":
+        raise ChatError("continue_final_message needs an assistant message last")
+    prefix = last.get("reasoning_content")
+    if not isinstance(prefix, str) or not prefix or last.get("content") or last.get("tool_calls"):
+        raise ChatError("continue_final_message: the last assistant message must hold only a non-empty reasoning_content")
+    return {**body, "messages": msgs[:-1]}, prefix
+
+
+def render_resume(family, body: dict) -> Rendered:
+    """family.render(body), or for a resume request the prompt of the conversation so far with the reasoning prefix right after the open think tag
+    (the reply streams the continuation only). The cut texts stay valid: they are prefixes of the prompt before the prefix."""
+    body, prefix = split_resume(body)
+    r = family.render(body)
+    if prefix is None:
+        return r
+    if not r.thinking_first or r.prompt.rstrip().endswith("</think>"):
+        raise ChatError("continue_final_message: this request does not end inside an open think block (thinking is off?)")
+    r.prompt += prefix
+    return r
+
+
 # ------------------------------------------------------------------------------------------------ templates (qwen, glm)
 def _template_env() -> Any:
     """Same environment as transformers' apply_chat_template (and the box servers)."""
@@ -465,6 +493,8 @@ class GlmFamily:
         effort = pick("reasoning_effort", self.defaults["reasoning_effort"])
         if effort is not None:
             kw["reasoning_effort"] = effort
+        if pick("effort_guidance", os.environ.get("KYOJIN_EFFORT_GUIDANCE") == "1"):   # opt-in medium guidance text, off by default
+            kw["effort_guidance"] = True
         prompt = render_jinja(self.template, body.get("messages"), tools, **kw)
         cuts = jinja_cut_texts(self.template, body.get("messages"), tools, prompt, **kw)
         return Rendered(prompt, prompt.rstrip().endswith("<think>"), parse_tools, tools, cut_texts=cuts)

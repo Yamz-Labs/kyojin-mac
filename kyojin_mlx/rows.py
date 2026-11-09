@@ -30,7 +30,7 @@ from . import headlast as HL, patch as P
 from .archs import ArchSpec
 from .exl3_linear import Exl3Linear
 from .rowinv import RowLinear, rowdot, rowmm
-from . import fired as FD, fuse as F
+from . import fired as FD, fuse as F, ablate as AZ, taps as TAPS
 
 # pf_route (KYOJIN_PF_ROUTE, default 0): the prompt-path router as the gate matmul + one selection launch (fuse.router_select), the
 # shape the decode path already runs; same ids, same weights. Read per call so POST /admin/flags switches it.
@@ -61,6 +61,9 @@ def _hc_block_mixes(self, orig, x, hc_fn, hc_scale, hc_base):
     """V4.1 block mHC coefficients (compiled in the stock model): the [B, 1, hc * hidden] x [24, hc * hidden] mix through rowdot."""
     if x.shape[1] != 1:
         return orig(self, x, hc_fn, hc_scale, hc_base)
+    if AZ.ACTIVE and AZ.on("mhc"):                       # ablate: constants of the mean / add stand-ins, no mix GEMV, no sinkhorn
+        AZ.hit("mhc")
+        return AZ.mhc_coeffs(x.shape[0], x.shape[2])
     from mlx_vlm.models.deepseek_v4.hyper_connection import hc_split_sinkhorn
     return hc_split_sinkhorn(mix_vector(self, x, hc_fn), hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
 
@@ -93,7 +96,14 @@ def _hc_branch_mix(self, orig, z):
 
 
 def _router_sqrtsoftplus(self, orig, x, image_mask=None):
-    """V4.1 router (sqrt(softplus) scores, correction bias for selection only)."""
+    """V4.1 router (sqrt(softplus) scores, correction bias for selection only). Flag router_tap: a decode call also hands its applied weights to the probe."""
+    out = _router_sqrtsoftplus_impl(self, orig, x, image_mask)
+    if TAPS.ROUTER and x.ndim == 3 and x.shape[1] == 1:
+        TAPS.router_tap(self, out[1])
+    return out
+
+
+def _router_sqrtsoftplus_impl(self, orig, x, image_mask=None):
     if PF_ROUTE and x.ndim == 3 and x.shape[1] != 1 and image_mask is None and F.ENABLED and F.ROUTER \
             and self.weight.dtype == mx.float32 and self.bias.dtype == mx.float32 and self.weight.shape[0] % 32 == 0 \
             and 0 < self.top_k < self.weight.shape[0]:
@@ -109,6 +119,9 @@ def _router_sqrtsoftplus(self, orig, x, image_mask=None):
         if PF_ROUTE and x.ndim == 3:
             FD.hit("pf_route_miss")                                   # PF_ROUTE on, a gate (image_mask / dtype / shape / fuse off) kept the stock chain
         return orig(self, x, image_mask)
+    if AZ.ACTIVE and AZ.on("router"):                                         # ablate: fixed ids / weights, no gate GEMV, no top-k
+        AZ.hit("router")
+        return AZ.fixed_route(x.shape[0], self.top_k, self.weight.shape[0], self.routed_scaling_factor)
     if F.ENABLED and F.ROUTER and (image_mask is None or image_mask.size == x.shape[0]) and self.weight.dtype == mx.float32 and self.bias.dtype == mx.float32 and x.dtype in (mx.float16, mx.bfloat16, mx.float32):
         # 2 launches instead of 14: rowdot reads x in its own dtype (the fp32 cast of the stock sequence is exact), one kernel selects and normalises
         from . import fuse_router as FR, launchcut as LC

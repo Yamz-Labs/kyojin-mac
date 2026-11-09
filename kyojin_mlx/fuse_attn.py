@@ -23,6 +23,7 @@ import os
 import mlx.core as mx
 from .modeldesc import KERNEL as KG
 from . import fired as FD
+from . import ablate as AZ
 from . import cdecpack as CD
 import numpy as np
 
@@ -576,6 +577,9 @@ def decode_ok(self, cache, batch: int, seq: int, dtype) -> bool:
 def core(self, L, cache, x, qr, q, kv):
     """Attention after the q / kv projections of one token: the compressor and indexer of the layer (stock modules), the ring write and the attention
     kernel. Returns (o, None) with o [1, G, 1, (H / G) * D] to feed wo_a, or (None, out) with the stock tail's output (after wo_b) in the rare cases."""
+    if AZ.ACTIVE and AZ.on("attn"):                                           # ablate: zeros of the core's output, ring / pool / compressor untouched
+        AZ.hit("attn")
+        return AZ.zeros_like_shape((1, self.o_groups, 1, (self.n_heads // self.o_groups) * self.head_dim), x.dtype), None
     start_pos = cache.offset
     comp = getattr(cache, "compress", None)
     lazy = PACKED_ATTEND and MMA and hasattr(comp, "lazy") and type(comp).BLOCK == 16

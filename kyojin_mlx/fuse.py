@@ -19,6 +19,8 @@ import os
 
 import mlx.core as mx
 
+from . import ablate as AZ                                                     # probe stand-ins (KYOJIN_ABLATE), off = one attribute test
+
 ENABLED = os.environ.get("KYOJIN_FUSE", "1") != "0"
 ROUTER = True
 MHC = True
@@ -297,6 +299,9 @@ def _impl_mhc_expand(orig):
     from . import pf_glue as PG
     def expand(x, residual, post, comb):
         global _last
+        if AZ.ACTIVE and AZ.on("mhc") and x.ndim == 3 and x.shape[1] == 1 and residual.ndim == 4:      # ablate: plain add (the hc mixes are constants)
+            _last = (None, None)
+            return AZ.mhc_expand(x, residual)
         if ENABLED and MHC and x.ndim == 3 and x.shape[1] == 1 and residual.ndim == 4 and residual.shape[2] == 4 and post.dtype == mx.float32 \
                 and comb.dtype == mx.float32 and x.dtype in (mx.float16, mx.bfloat16):
             y, y32 = mhc_expand(x, residual, post, comb)
@@ -318,6 +323,8 @@ def _impl_mhc_expand(orig):
 
 def _impl_mhc_pre(orig):
     def pre(x, pre_mix):
+        if AZ.ACTIVE and AZ.on("mhc") and x.ndim == 4 and x.shape[1] == 1:                           # ablate: the stream mean
+            return AZ.mhc_pre(x)
         if ENABLED and MHC and x.ndim == 4 and x.shape[1] == 1 and x.shape[2] == 4 and pre_mix.dtype == mx.float32 and x.dtype in (mx.float16, mx.bfloat16):
             return mhc_pre(x, pre_mix)
         if ENABLED and MHC and x.ndim == 4 and x.shape[0] == 1 and x.shape[1] > 1 and x.shape[2] == 4 and pre_mix.dtype == mx.float32 and x.dtype in (mx.float16, mx.bfloat16):

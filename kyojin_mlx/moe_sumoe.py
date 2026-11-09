@@ -21,6 +21,7 @@ import numpy as np
 from . import metal_src as S
 from . import moe as M
 from . import fired as FD
+from . import ablate as AZ
 
 SUMOE = os.environ.get("KYOJIN_PORT_SUMOE", "0") == "1"
 
@@ -86,6 +87,9 @@ class MoeSharedFused(M.MoeGather):
                     output_shapes=[(2 * P["npairs"], kd), (P["npairs"],), (P["npairs"],)], output_dtypes=[mx.float32, mx.int32, mx.float32])
 
     def mid_sh(self, part: mx.array, ids2: mx.array, wts2: mx.array, rows: int) -> mx.array:
+        if AZ.ACTIVE and AZ.on("moe_glue"):                                  # ablate (the routing prologue rot_sh stays: it builds the extended ids / weights)
+            AZ.hit("moe_glue")
+            return AZ.zeros_like_shape((rows * self.topk, self.g.nout), mx.float32)
         P = self._extra(rows)
         kern = self._kern("midsh", 0, f"kyojin_midsh_{int(self.wpre)}{int(self.fq)}", ["part", "ids", "wts", "svh0", "svh1", "suhd", "params"], ["xh2"],
                           lambda: S.mid_sh_source(self.limit, self.wpre, self.fq, self.alpha, self.beta))
@@ -97,6 +101,9 @@ class MoeSharedFused(M.MoeGather):
                     output_shapes=[(P["npairs"], self.g.nout)], output_dtypes=[mx.float32])[0]
 
     def final_sh(self, part: mx.array, ids2: mx.array, wts2: mx.array, rows: int) -> mx.array:
+        if AZ.ACTIVE and AZ.on("moe_glue"):
+            AZ.hit("moe_glue")
+            return AZ.zeros_like_shape((rows, self.d.nout), mx.float32)
         if M.FINPAR:
             y = self.final_par(part, ids2, wts2, rows, bf16_last=True)
             if y is not None:
@@ -117,6 +124,10 @@ class MoeSharedFused(M.MoeGather):
         ids, wts = ids.reshape(-1).astype(mx.int32), wts.reshape(-1).astype(mx.float32)
         FD.hit("port_sumoe")                                          # per call of the fused routed + shared launches
         xh, ids2, wts2 = self.rot_sh(x, ids, wts, fq8)
+        if self.chain_ok():
+            FD.hit("moe_chain")
+            xh2 = self.chain_gu(xh, ids2, wts2, rows, 0xFFFFFFFF if self.shared_fq else self.esh)[1]
+            return self.chain_dn(xh2, ids2, wts2, rows, bf16_last=True)
         part = self.gemv_gu(xh, ids2, rows)
         xh2 = self.mid_sh(part, ids2, wts2, rows)
         part2 = self.gemv_dn(xh2, ids2, rows)

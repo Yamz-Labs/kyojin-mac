@@ -27,6 +27,7 @@ from mlx.utils import tree_flatten
 
 from . import moe_sumoe as SU, exl3_linear as EL, headlast as HL, fqfuse as FQF, kernels as KN, metal_nax as NX, moe as M, tuning as TN
 from . import fired as FD
+from . import ablate as AZ
 from . import archs as _AR
 from .archs import ArchSpec, FUSED, FUSED_ORDER, activate, arch_of, package, target
 from .exl3_linear import Exl3Linear, GEMV_MAX_ROWS
@@ -160,7 +161,20 @@ def _routed(self, x, ids, wts, src):
     k, h = ids.shape[-1], x.shape[-1]
     x2, ids2, w2 = x.reshape(-1, h), ids.reshape(-1, k), wts.reshape(-1, k)
     s2 = None if src is None else src.reshape(-1, h)
-    if self.msh is not None and self.sumoe_takes(x2.shape[0]):
+    sumoe = self.msh is not None and self.sumoe_takes(x2.shape[0])
+    if AZ.ACTIVE and x.ndim >= 2 and x.shape[-2] == 1 and (AZ.on("moe_routed") or (sumoe and AZ.on("moe_shared"))):
+        # ablate (decode rows): moe_routed = zeros of the routed output (sumoe rows: the shared expert still runs, on its own dense chain);
+        # moe_shared on a sumoe row = the routed-only launches (the shared slot rides no launch)
+        if AZ.on("moe_routed"):
+            AZ.hit("moe_routed")
+            z = AZ.zeros_like_shape((x2.shape[0], h), mx.float32)
+            stub = self.__dict__.get("_shared_stub")
+            if sumoe and stub is not None and not AZ.on("moe_shared"):
+                return z + stub.dense(x).reshape(-1, h).astype(mx.float32)
+            return z
+        AZ.hit("moe_shared")
+        return _moe_rows(self.moe, x2, ids2, w2, s2)
+    if sumoe:
         return self.msh(x2 if s2 is None else s2, ids2, w2, fq8=s2 is not None)
     return _moe_rows(self.moe, x2, ids2, w2, s2)
 
@@ -405,6 +419,7 @@ def build_moe(old, moe_parent, st: dict, mspec, materialize: bool = True, rep: d
             new_moe.msh = SU.MoeSharedFused(*ext, topk, **kw)
             stub = SU.SharedStub(moe_parent.shared_experts, mspec.convention == "combine")
             stub.takes = new_moe.sumoe_takes
+            object.__setattr__(new_moe, "_shared_stub", stub)            # ablate (moe_routed on a sumoe row): the dense shared chain; kept out of the module tree
             moe_parent.shared_experts = stub
             if rep is not None:
                 rep["sumoe_layers"] = rep.get("sumoe_layers", 0) + 1

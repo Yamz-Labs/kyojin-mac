@@ -87,6 +87,7 @@ def test_rows_ugrouped_switch(layer, monkeypatch):
     """KYOJIN_ROWS_UGROUPED = N: a pass of 2..N rows takes the per-pair split-K gather GEMV (the 1-row kernel) and keeps the grouped path's bits;
     N below the row count keeps the grouped GEMV. rows = 1 is untouched."""
     g, u, d = layer
+    monkeypatch.setattr(M, "CHAIN", False)                                  # this test counts the gather GEMV calls: the moe_chain path (test_moe_chain) launches its own kernels
     mo = M.MoeGather(g, u, d, TOPK, grouped=True, tgk_gu=2, tgk_dn=2, pin_rows=1, hotk=0)
     ids, w = route(3, "partial", 123)
     x = _x(3, g.kin, 5)

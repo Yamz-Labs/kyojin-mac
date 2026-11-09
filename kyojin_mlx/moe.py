@@ -15,6 +15,7 @@ from . import kernels as KN
 from . import metal_nax as NX
 from . import metal_src as S
 from . import fired as FD
+from . import ablate as AZ
 
 MAX_PAIRS = 256
 TAIL_GRP = os.environ.get("KYOJIN_PF_TAIL_GRP", "0") == "1"            # prefill: rows between one decode chunk and the S3 floor run as ONE grouped MoE call per layer (one trellis decode per distinct expert) instead of ceil(rows / 4) four-row calls; pf_tail_grp, default 0
@@ -34,6 +35,9 @@ HOT_BKS = int(os.environ.get("KYOJIN_HOT_BKS", "0"))                  # k step o
 TGT = int(os.environ.get("KYOJIN_MOE_TGT", "0"))                       # threadgroup target of the routed decode GEMV grid (pick_tgk): 0 = 480; any other value k-splits until blocks * tgk * pairs reach it. Another split adds the f32 partials in another order (1e-7 relative)
 KSPLIT = int(os.environ.get("KYOJIN_MOE_KSPLIT", "0"))                 # per-bitrate k-split of the per-pair gather GEMV (rows = 1): 1 = the lower bitrates split less (same grid), 2 = the higher bitrates split more (taller grid); equal bytes per threadgroup; f32 partials added in another order
 FINPAR = os.environ.get("KYOJIN_MOE_FINPAR", "0") == "1"               # combine launch (final): one simdgroup per routed pair, the pair terms added in order j by simdgroup 0 instead of one serial loop over the pairs; bit-identical
+CHAIN = os.environ.get("KYOJIN_MOE_CHAIN", "1") == "1"               # routed decode chain in 3 launches: mid rides the tail of the gate/up gather GEMV, the combine the tail of the down gather GEMV (last-arriving threadgroup of a 128-column block, metal_src.chain_*); per-pair gather path only (no union, no KSPLIT); bit-identical
+GATHER_ROOF = os.environ.get("KYOJIN_GATHER_ROOF", "0") == "1"       # routed decode gate/up gather GEMV at rows = 1 launched as 128-thread threadgroups (one column half each): finer threadgroups, shorter tail wave; same partials bit for bit (metal_src.gather_half_tg)
+ROUTED_FX = os.environ.get("KYOJIN_ROUTED_FX", "0") == "1"           # routed decode chain: the rot folded into the prologue of the gate/up gather GEMV (2 launches per layer); per-pair gather chain only, falls back to the 3-launch chain when the k slice does not fit; bit-identical
 HOTK = int(os.environ.get("KYOJIN_GROUP_HOTK", "4")) if os.environ.get("KYOJIN_ROWS_GROUPED", "1") == "nax" else 0     # "nax": groups of >= HOTK rows through metal_nax
 
 
@@ -233,6 +237,9 @@ class MoeGather:
     def rot_gu(self, x: mx.array, ids: mx.array, fq8: bool = False, half: bool = False) -> mx.array:
         """fq8: x (fp16) is the input of the fp8 fake quant of the routed experts' input, applied inside the rot."""
         rows, kd = x.shape
+        if AZ.ACTIVE and AZ.on("moe_glue"):                                  # ablate: the rotated input as a zero buffer of its shape (the GEMVs still read it)
+            AZ.hit("moe_glue")
+            return AZ.zeros_like_shape((2 * rows * self.topk, kd), mx.float16 if half else mx.float32)
         P = self._params(rows)
         ih = x.dtype == mx.float16
         kern = self._kern("rotg", (ih, fq8, half), f"kyojin_rotg2_{'h' if ih else 'f'}{'_fq' if fq8 else ''}{'_hx' if half else ''}", ["x", "ids", "suh0", "suh1", "params"], ["xh"],
@@ -255,17 +262,20 @@ class MoeGather:
         if pf and not union:
             FD.hit("moeroof_pf")                                      # per-pair gather GEMV call with the prefetch kernel
         ksp = not union and int(params.size) == 4 + len(ks)                  # KYOJIN_MOE_KSPLIT: _params appended one active k-block count per bitrate
-        key = ("ug", ks, nproj, cbu, mm) if union else ("gg", ks, nproj, cbf, pf, pf2) + (("ks",) if ksp else ())
+        t128 = GATHER_ROOF and not union and not ksp and nproj == 2 and npairs <= self.topk      # KYOJIN_GATHER_ROOF: rows = 1 gate/up, 128-thread threadgroups
+        if t128:
+            FD.hit("gather_roof")
+        key = ("ug", ks, nproj, cbu, mm) if union else ("gg", ks, nproj, cbf, pf, pf2) + (("ks",) if ksp else ()) + (("t128",) if t128 else ())
         kern = self._kn.get(("gemv", key))
         if kern is None:
             names = ["xh", "ids", "tr0"] + (["tr1"] if nproj == 2 else []) + ["off0"] + (["off1"] if nproj == 2 else []) + \
                     ["kk0"] + (["kk1"] if nproj == 2 else []) + ["params"]
             kern = self._kn[("gemv", key)] = _kernel(key, name=f"kyojin_{'ug' if union else 'gg'}_{cbu if union else cbf}_{'_'.join(map(str, ks))}_p{nproj}" + (f"_m{mm}" if union else "") + ("_pf" if pf and not union else "") + ("_p2" if pf2 else "") + ("_ks" if ksp else ""),
                                                      input_names=names, output_names=["part"],
-                                                     source=(lambda: S.union_gemv_source(ks, nproj, cbu, mm)) if union else (lambda: S.gather_gemv_source(ks, nproj, cbf, pf, ksp, pf2)))
+                                                     source=(lambda: S.union_gemv_source(ks, nproj, cbu, mm)) if union else (lambda: S.gather_gemv_source(ks, nproj, cbf, pf, ksp, pf2, t128)))
         ins = [xh, ids, s0.bound] + ([s1.bound] if nproj == 2 else []) + [s0.offset] + ([s1.offset] if nproj == 2 else []) + \
               [s0.k] + ([s1.k] if nproj == 2 else []) + [params]
-        return kern(inputs=ins, grid=(s0.blocks * 256, tgk, nproj * npairs), threadgroup=(256, 1, 1),
+        return kern(inputs=ins, grid=(s0.blocks * 256, tgk, nproj * npairs), threadgroup=(128 if t128 else 256, 1, 1),
                     output_shapes=[(nproj * npairs, tgk, s0.nout)], output_dtypes=[mx.float32])[0]
 
     def plan(self, ids: mx.array, rows: int):
@@ -415,6 +425,9 @@ class MoeGather:
         return self.gemv((self.g, self.u), xh, ids, P["gemv_gu"], P["tgu"], self.ks_gu)
 
     def mid(self, part: mx.array, ids: mx.array, wts: mx.array, rows: int, half: bool = False, sg: bool = False) -> mx.array:
+        if AZ.ACTIVE and AZ.on("moe_glue"):                                  # ablate: no swiglu / routing weight / down-side rotation, a zero buffer for the down GEMV
+            AZ.hit("moe_glue")
+            return AZ.zeros_like_shape((rows * self.topk, self.g.nout), mx.float16 if half else mx.float32)
         P = self._params(rows)
         kern = self._kn.get(("mid", half))
         if kern is None:
@@ -434,6 +447,9 @@ class MoeGather:
 
     def final_par(self, part: mx.array, ids: mx.array, wts: mx.array, rows: int, bf16_last: bool = False) -> mx.array | None:
         """KYOJIN_MOE_FINPAR: the combine launch with the pairs side by side (None: more than 32 pairs per row, the serial launch runs)."""
+        if AZ.ACTIVE and AZ.on("moe_glue"):
+            AZ.hit("moe_glue")
+            return AZ.zeros_like_shape((rows, self.d.nout), mx.float32)
         nj = self.topk
         if nj > 32:
             return None
@@ -446,6 +462,9 @@ class MoeGather:
                     output_shapes=[(rows, self.d.nout)], output_dtypes=[mx.float32])[0]
 
     def final(self, part: mx.array, ids: mx.array, wts: mx.array, rows: int, sg: bool = False) -> mx.array:
+        if AZ.ACTIVE and AZ.on("moe_glue"):                                  # ablate: no inverse rotation, gather or combine: a zero [rows, hidden] fp32
+            AZ.hit("moe_glue")
+            return AZ.zeros_like_shape((rows, self.d.nout), mx.float32)
         if FINPAR and not sg:                                   # moe_finpar reads the plain `fin` params; moe_sgred (sg) keeps its own
             y = self.final_par(part, ids, wts, rows)
             if y is not None:
@@ -462,6 +481,76 @@ class MoeGather:
         return kern(inputs=[part, ids, wts, self.d.svh, P["fin_sg" if sg else "fin"]], grid=grid, threadgroup=tg,
                     output_shapes=[(rows, self.d.nout)], output_dtypes=[mx.float32])[0]
 
+    # ---- moe_chain: mid in the tail of the gate/up GEMV, the combine in the tail of the down GEMV (bit-identical, 3 launches per layer)
+    def chain_ok(self) -> bool:
+        return CHAIN and not self.union and not KSPLIT and self.topk <= 8 and self.cbg == self.cb      # verified codebooks only (not the affine fold mul1af)
+
+    def _chain_ctr(self, rows: int):
+        P = self._params(rows)
+        c = P.get("chain_ctr")
+        if c is None:
+            c = P["chain_ctr"] = (mx.zeros((max(16, P["npairs"] * self.g.blocks),), dtype=mx.uint32), mx.zeros((max(16, rows * self.d.blocks),), dtype=mx.uint32))   # >= 16: MLX binds arrays under 8 elements as `constant`
+            mx.eval(*c)
+        return c
+
+    def _chain_kern(self, tag, st_list, ks, nproj, outs, extra, make_source, key_extra=()):
+        pf = ROOF and ROOF_PF
+        pf2 = bool(pf and S.PF2)
+        cbf = self.cbf
+        s1 = st_list[-1]
+        names = ["xh", "ids", "tr0"] + (["tr1"] if nproj == 2 else []) + ["off0"] + (["off1"] if nproj == 2 else []) + \
+                ["kk0"] + (["kk1"] if nproj == 2 else []) + ["params"] + extra
+        key = (tag, ks, cbf, pf, pf2) + key_extra
+        kern = self._kn.get(("chain", key))
+        if kern is None:
+            kern = self._kn[("chain", key)] = _kernel(("chain", key, self.limit, self.wpre, self.fq, self.alpha, self.beta, self.cb, self.topk), name=f"kyojin_ch{tag}_{cbf}_{'_'.join(map(str, ks))}_{abs(hash(key)) % 10**8}",
+                                                      input_names=names, output_names=outs, source=lambda: make_source(pf, pf2, cbf))
+        return kern
+
+    def chain_gu(self, xh: mx.array, ids: mx.array, wts: mx.array, rows: int, shared_skip: int | None = None):
+        """gemv_gu + mid in one launch: (part, xh2). shared_skip: moe_sumoe's shared expert id for the fake-quant skip (0xFFFFFFFF = none), None = plain mid."""
+        P = self._params(rows)
+        s0, s1 = self.g, self.u
+        npairs = P["npairs"]
+        t128 = GATHER_ROOF and npairs <= self.topk                      # KYOJIN_GATHER_ROOF: rows = 1, 128-thread threadgroups (two per 128-column block)
+        if t128:
+            FD.hit("gather_roof")
+        kern = self._chain_kern("gu", (self.g, self.u), self.ks_gu, 2, ["part", "xh2"], ["wts", "svh0", "svh1", "suhd", "ctr"],
+                                lambda pf, pf2, cbf: S.chain_gu_source(self.ks_gu, cbf, pf, pf2, self.g.blocks, self.limit, self.wpre, self.fq, self.alpha, self.beta, shared_skip, t128),
+                                (shared_skip,) + (("t128",) if t128 else ()))
+        ins = [xh, ids, s0.bound, s1.bound, s0.offset, s1.offset, s0.k, s1.k, P["gemv_gu"], wts, self.g.svh, self.u.svh, self.d.suh, self._chain_ctr(rows)[0]]
+        return kern(inputs=ins, grid=(s0.blocks * 256, P["tgu"], 2 * npairs), threadgroup=(128 if t128 else 256, 1, 1),
+                    output_shapes=[(2 * npairs, P["tgu"], s0.nout), (npairs, self.g.nout)], output_dtypes=[mx.float32, mx.float32])
+
+    def fx_ok(self, x: mx.array, rows: int, fq8: bool) -> bool:
+        """routed_fx applies: fp16 input (the fp8 fold needs it), plain mid, and a k slice that starts on a 128-block."""
+        return ROUTED_FX and x.dtype == mx.float16 and S.fx_ok(self.g.kt, self._params(rows)["tgu"]) and not (AZ.ACTIVE and AZ.on("moe_glue"))
+
+    def chain_gu_fx(self, x: mx.array, ids: mx.array, wts: mx.array, rows: int, fq8: bool):
+        """rot_gu + chain_gu in one launch: x is the fp16 activation [rows, hidden]; returns (part, xh2) as chain_gu."""
+        P = self._params(rows)
+        s0, s1 = self.g, self.u
+        tgu = P["tgu"]
+        kern = self._chain_kern("guf", (self.g, self.u), self.ks_gu, 2, ["part", "xh2"], ["wts", "svh0", "svh1", "suhd", "ctr", "suh0", "suh1"],
+                                lambda pf, pf2, cbf: S.chain_gu_fx_source(self.ks_gu, cbf, pf, pf2, self.g.blocks, self.limit, self.wpre, self.fq, self.alpha, self.beta, None,
+                                                                          self.g.kt, tgu, self.topk, fq8), (fq8, self.g.kt, tgu, self.topk))
+        npairs = P["npairs"]
+        ins = [x, ids, s0.bound, s1.bound, s0.offset, s1.offset, s0.k, s1.k, P["gemv_gu"], wts, self.g.svh, self.u.svh, self.d.suh, self._chain_ctr(rows)[0], self.g.suh, self.u.suh]
+        return kern(inputs=ins, grid=(s0.blocks * 256, tgu, 2 * npairs), threadgroup=(256, 1, 1),
+                    output_shapes=[(2 * npairs, tgu, s0.nout), (npairs, self.g.nout)],
+                    output_dtypes=[mx.float32, mx.float32])
+
+    def chain_dn(self, xh2: mx.array, ids: mx.array, wts: mx.array, rows: int, bf16_last: bool = False) -> mx.array:
+        """gemv_dn + combine in one launch: y [rows, hidden] f32."""
+        P = self._params(rows)
+        s0 = self.d
+        kern = self._chain_kern("dn", (self.d,), self.ks_dn, 1, ["part", "y"], ["wts", "svh", "ctr"],
+                                lambda pf, pf2, cbf: S.chain_dn_source(self.ks_dn, cbf, pf, pf2, self.d.blocks, self.topk, not self.wpre, bf16_last), (bf16_last,))
+        npairs = P["npairs"]
+        ins = [xh2, ids, s0.bound, s0.offset, s0.k, P["gemv_dn"], wts, self.d.svh, self._chain_ctr(rows)[1]]
+        return kern(inputs=ins, grid=(s0.blocks * 256, P["tdn"], npairs), threadgroup=(256, 1, 1),
+                    output_shapes=[(npairs, P["tdn"], s0.nout), (rows, s0.nout)], output_dtypes=[mx.float32, mx.float32])[1]
+
     def prefill(self, x: mx.array, ids: mx.array, wts: mx.array) -> mx.array:
         """Many rows (prompt chunk): S3 path of kyojin_mlx.moe_prefill, same contract as __call__."""
         if self._pf is None:
@@ -475,7 +564,7 @@ class MoeGather:
         assert rows * self.topk <= (MAX_PAIRS if max_pairs is None else max_pairs) and ids.shape == (rows, self.topk) and wts.shape == (rows, self.topk)
         ids, wts = ids.reshape(-1).astype(mx.int32), wts.reshape(-1).astype(mx.float32)
         from . import moe_fused as MF
-        if MF.MOEFUSE and not getattr(self, "_is_fused_inner", False) and not self.hotk and self.cbg == self.cb:
+        if MF.MOEFUSE and not getattr(self, "_is_fused_inner", False) and not self.hotk and self.cbg == self.cb and not (AZ.ACTIVE and AZ.on("moe_glue")):
             FD.hit("moefuse")
             if self._mf is None:
                 self._mf = MF.MoeFused(self)
@@ -486,7 +575,13 @@ class MoeGather:
             return self._call_grouped(x, ids, wts, rows, fq8)
         if self.grouped and UGROUPED and 1 < rows <= UGROUPED:
             FD.hit("rows_ugrouped")                                   # routed MoE calls that took the per-pair split-K gather for a rows pass
+        if self.chain_ok() and self.fx_ok(x, rows, fq8):
+            FD.hit("routed_fx")
+            return self.chain_dn(self.chain_gu_fx(x, ids, wts, rows, fq8)[1], ids, wts, rows)
         xh = self.rot_gu(x, ids, fq8)
+        if self.chain_ok():
+            FD.hit("moe_chain")
+            return self.chain_dn(self.chain_gu(xh, ids, wts, rows)[1], ids, wts, rows)
         part = self.gemv_gu(xh, ids, rows)
         xh2 = self.mid(part, ids, wts, rows)
         part2 = self.gemv_dn(xh2, ids, rows)

@@ -17,6 +17,7 @@ so their tokens are unchanged. `decide` is what tests/test_specsam.py checks aga
 from __future__ import annotations
 
 import mlx.core as mx
+import numpy as np
 
 NEG = -float("inf")
 TINY = 1e-30
@@ -39,6 +40,57 @@ def logp(row: mx.array, sampling) -> mx.array:
     """One target logits row [V] -> log p, the plain sampling distribution (the filters of kyojin_mlx.serve.sampling, then the temperature)."""
     from .serve.sampling import _filtered
     return _norm(_filtered(row, sampling) * (1.0 / max(float(sampling.temperature), 1e-6)))
+
+
+def typical_mask(rows: mx.array, drafts: mx.array, eq: mx.array, sampling, eps: float, delta: float, hmax: float | None = None) -> mx.array:
+    """Relaxed ("typical", Medusa) acceptance of one sampled session's draft rows, lazy and on device. rows [m, V] the target logits of the m draft
+    positions, drafts [m] the proposals, eq [m] bool = the verify sample of the row equals the draft. Row j is accepted when eq[j] or
+    p_j >= min(eps, delta * exp(-H_j)), p_j the draft's probability and H_j the entropy of the row under the exact sampling distribution
+    (logp: the top_k / top_p / min_p cuts, then the temperature). A token the filters cut has p = 0 and is never accepted by the rule.
+    hmax (nats; None = off, today's rule): the rule only applies to rows with H <= hmax; at a high-entropy row (a real choice point) a draft is accepted by
+    equality only. The gate is part of the same device mask, no host sync."""
+    m = int(rows.shape[0])
+    ok = []
+    for j in range(m):
+        lp = logp(rows[j], sampling)
+        p = mx.exp(lp)
+        ent = -mx.sum(mx.where(p > 0, p * lp, 0.0))
+        pj = mx.exp(lp[drafts[j].astype(mx.int32)])
+        r = (pj > 0) & (pj >= mx.minimum(eps, delta * mx.exp(-ent)))
+        ok.append(r & (ent <= hmax) if hmax is not None else r)
+    return mx.stack(ok) | eq
+
+
+REP_N, REP_W, REP_TIMES = 12, 2048, 2                                   # flag spec_typical_lookup=rep: n-gram length, window (tokens), prior occurrences that refuse
+
+
+def repeats(hist, tok: int, n: int = REP_N, w: int = REP_W, times: int = REP_TIMES) -> bool:
+    """True when `tok` after the generated tokens `hist` would complete an n-gram that already occurs `times` or more times in the last `w` of them
+    (the session is repeating its own output). Host side, numpy over at most w + n ids; hist is the session's OWN generated tokens only, so a span
+    copied from the prompt or a tool result never counts."""
+    h = np.asarray(hist[-(w + n):], dtype=np.int64)
+    m = int(h.shape[0])
+    if m < n:
+        return False
+    ok = h[n - 1:] == tok                                                 # an occurrence starting at i ends at i + n - 1, i in [0, m - n]
+    for d in range(n - 1):
+        ok = ok & (h[d:m - n + 1 + d] == h[m - n + 1 + d])
+    return int(ok.sum()) >= times
+
+
+def first_repeat(hist, tok: int, n: int = REP_N, w: int = REP_W) -> int:
+    """Index in `hist` of the start of the FIRST occurrence (within the last w + n ids) of the n-gram that `tok` would complete after `hist`
+    (the same test as `repeats`); -1 when there is none."""
+    base = max(0, len(hist) - (w + n))
+    h = np.asarray(hist[base:], dtype=np.int64)
+    m = int(h.shape[0])
+    if m < n:
+        return -1
+    ok = h[n - 1:] == tok
+    for d in range(n - 1):
+        ok = ok & (h[d:m - n + 1 + d] == h[m - n + 1 + d])
+    idx = np.flatnonzero(ok)
+    return base + int(idx[0]) if idx.size else -1
 
 
 def draw(lq: mx.array, keys: list) -> mx.array:

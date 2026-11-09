@@ -85,7 +85,8 @@ def exl3ify(model):
             a.compressor.wkv = exl3(a.compressor.wkv)
         if a.indexer is not None:
             a.indexer.wq_b = exl3(a.indexer.wq_b)
-            a.indexer.wk = exl3(a.indexer.wk)
+            if hasattr(a.indexer, "wk"):
+                a.indexer.wk = exl3(a.indexer.wk)
         g = stack(cfg.n_routed_experts, cfg.hidden_size, cfg.moe_intermediate_size, 7)
         u = stack(cfg.n_routed_experts, cfg.hidden_size, cfg.moe_intermediate_size, 8)
         d = stack(cfg.n_routed_experts, cfg.moe_intermediate_size, cfg.hidden_size, 9)

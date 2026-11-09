@@ -82,6 +82,12 @@ class EngramAhead:
         self.mute = False                                                 # set by a caller that starts the jobs itself on the joined hashes
         self.waits: dict = {}                                             # prefill: host seconds per Engram layer in its call (row wait + build)
         self.late = None                                                  # verify_prestart: the hash ids of a lazy-draft pass whose host read waits for the first Engram layer
+        self.adopt_pending: dict = {}                                     # flag engram_adopt: session id -> _Adopt (the first chunk's row jobs, submitted at admission)
+        self.adopt_cur = None                                             # the entry the chunk about to run may adopt (set by adopt_select)
+        self.adopt_hit = self.adopt_miss = self.adopt_made = 0
+        self.last_adopted = False                                         # the last prefill-sized start() adopted (stats: wait of an adopted vs a cold first chunk)
+        self.adopt_debug = os.environ.get("KYOJIN_ENGRAM_ADOPT_DEBUG", "0") not in ("0", "")
+        self._rm = None                                                   # RowMap of the admission worker (one thread only)
 
     def start(self, hashes) -> None:
         if self.mute:
@@ -95,6 +101,14 @@ class EngramAhead:
             return
         self.started += 1
         small = ER.DEC_QUEUE and h.shape[0] * h.shape[1] < self.MIN_ROWS      # a decode pass: its queue, not behind a prefill chunk's reads and its warm job
+        if self.adopt_cur is not None and h.shape[1] >= self.MIN_ROWS:
+            got = self._adopt(h)                                          # flag engram_adopt: the jobs submitted at admission, if they are this chunk's own
+            if got is not None:
+                self.jobs = got
+                if self._warm is not None:
+                    self.tables._pre.submit(self._warm_job, *self._warm)
+                    self._warm = None
+                return
         ex = self.tables._pre_small if small else self.tables._pre
         for p in range(h.shape[2]):
             hp = h[:, :, p, :]
@@ -167,6 +181,77 @@ class EngramAhead:
         self.tables._pre_warm.submit(self._warm_job, list(ids[a:b]), 0)
         self.warmed_first += 1
         return True
+
+    # ---- flag engram_adopt: the first chunk's row jobs, submitted when the request is admitted
+    def adopt_first(self, sid, ids, a: int, b: int) -> bool:
+        """Flag engram_adopt: at admission, hash the prompt positions [a, b) on the host (RowMap, history = the tokens before `a`, as the GPU hash reads it from the cache)
+        and submit the REAL row jobs `start` would submit for that chunk, on the chunk's own queue. The chunk adopts them (`_adopt`) when its device hashes are equal.
+        The hashing and the submits run on a worker (`_pre_warm`), never on the engine thread. False when nothing was submitted (no token map, a decode-sized chunk)."""
+        if self.token_map is None or b - a < self.MIN_ROWS or a < 0:
+            return False
+        self.adopt_drop(sid)
+        while len(self.adopt_pending) >= 4:                               # a queue of admitted prompts: the oldest entry goes (its rows are a page-cache hint then)
+            self.adopt_pending.pop(next(iter(self.adopt_pending)))
+            self.adopt_miss += 1
+        lo = max(0, a - self.tables.spec.max_ngram_size + 1)
+        seg, skip = list(ids[lo:b]), a - lo
+        ent = types.SimpleNamespace(a=a, b=b, fut=self.tables._pre_warm.submit(self._adopt_job, seg, skip), t=time.perf_counter())
+        self.adopt_pending[sid] = ent
+        self.adopt_made += 1
+        return True
+
+    def _adopt_job(self, seg, skip):
+        if self._rm is None:
+            self._rm = ER.RowMap(self.tables.spec, self.token_map)
+        self._rm.reset()
+        h = self._rm(seg)[skip:]                                          # [L, n_layers, n_cols] int64: the device hash's values
+        jobs = {}
+        for p in range(h.shape[1]):
+            hp = np.ascontiguousarray(h[None, :, p, :])                   # [1, L, n_cols], the shape start() gives its jobs
+            jobs[p] = (hp.shape, self.tables._pre.submit(self._job, p, hp))
+        return h, jobs
+
+    def adopt_drop(self, sid) -> None:
+        if self.adopt_pending.pop(sid, None) is not None:
+            self.adopt_miss += 1
+        if self.adopt_cur is not None and getattr(self.adopt_cur, "sid", None) == sid:
+            self.adopt_cur = None
+
+    def adopt_select(self, sid, a: int, b: int) -> None:
+        """The engine knows the real first chunk [a, b) (after lookup / restore): the entry of `sid` is armed when it is the same chunk, else dropped (a miss)."""
+        ent = self.adopt_pending.pop(sid, None)
+        self.adopt_cur = None
+        if ent is None:
+            return
+        if (ent.a, ent.b) != (a, b):
+            self.adopt_miss += 1                                          # another cache hit than the peek, or another chunk bounds
+            return
+        ent.sid = sid
+        self.adopt_cur = ent
+
+    def _adopt(self, h: np.ndarray):
+        """The jobs of the armed entry as `start` would have submitted them, or None (fallback to today's path) unless its hashes equal the device's bit for bit."""
+        ent, self.adopt_cur = self.adopt_cur, None
+        self.last_adopted = False
+        try:
+            if not ent.fut.done():                                        # the worker has not finished the hashes: do not wait for it on the chunk's clock
+                self.adopt_miss += 1
+                return None
+            hh, jobs = ent.fut.result()
+            if h.shape[0] != 1 or h.shape[1:] != (hh.shape[0], hh.shape[1], hh.shape[2]) or not np.array_equal(h[0], hh):
+                self.adopt_miss += 1
+                return None
+        except Exception:
+            self.adopt_miss += 1
+            return None
+        if self.adopt_debug:                                              # the adopted rows against a fresh job from the device hashes
+            for p in range(h.shape[2]):
+                want = self._job(p, h[:, :, p, :])
+                got = jobs[p][1].result()
+                assert all(np.array_equal(x, y) for x, y in zip(want, got)), f"engram_adopt: layer {p} rows differ"
+        self.adopt_hit += 1
+        self.last_adopted = True
+        return jobs
 
     def take(self, pos: int, shape):
         job = self.jobs.pop(pos, None)

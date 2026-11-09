@@ -7,8 +7,10 @@ next call. Not switchable at runtime (listed in docs/cloud/LEVERS.md): the Engra
 Qwen step regions (built once at install) and KYOJIN_VERIFY_REPLAY (recorded command buffers)."""
 from __future__ import annotations
 
+import contextlib
 import importlib
 import os
+import threading
 from dataclasses import dataclass, field
 
 GEN = 0          # bumped by every set(): compiled regions compare it with the value they were traced at
@@ -21,7 +23,8 @@ class Flag:
     doc: str
     runtime: bool = True
     reason: str = ""                       # why not runtime
-    kind: str = "bool"                     # "bool" ("0" / "1") or "int"
+    kind: str = "bool"                     # "bool" ("0" / "1"), "int", "float", or "str" (free text the flag's own parser validates, "" = off), or "mode" (one of the words in `choices`)
+    choices: tuple = ()                    # kind "mode": the accepted values
     attrs: tuple = field(default_factory=tuple)      # (module, attribute, fn(value str) -> attribute value)
 
 
@@ -40,6 +43,11 @@ def _bind(fn: str):
         from . import archs as A
         return getattr(A, fn)(v)
     return pin
+
+
+def _ablate(v: str):
+    from . import ablate
+    return ablate.configure(v)
 
 
 def _tail_reads(v: str):
@@ -141,6 +149,9 @@ FLAGS: dict[str, Flag] = {
                           attrs=(("dsv4_core", "STATE_NOCOPY", _on),)),
     "ropefuse": Flag("KYOJIN_ROPE_FUSE", "1", "DS4.1 batched core: q rope in the attention kernel's q load, inverse rope in kyojin_dsv4_attn_merge (dsv4_core). Bit-identical to the stock ops only with rope_fma 1 or 3 (default 3); NOT at rope_fma=0",
                      attrs=(("dsv4_core", "ROPE_FUSE", _on),)),
+    "attn_merge_tail": Flag("KYOJIN_ATTN_MERGE_TAIL", "0", "DS4.1 split decode attention: the merge (sink + inverse rope) rides in the tail of kyojin_dsv4_attn_part (the last threadgroup of a (row, head group) merges, "
+                            "arrival counter reset by it): one launch instead of two, bit-identical (dsv4_core.merge_tail_source)",
+                            attrs=(("dsv4_core", "ATTN_MERGE_TAIL", _on),)),
     "rope_fma": Flag("KYOJIN_ROPE_FMA", "3", "kvchain / ropefuse / dec_qkv kernels: rope-tail products as fma instead of two roundings. The fused kernels run under fp contract(off); the shipped "
                      "mx.fast.rope is contracted (its AIR: fmuladd(x1, c, (-s) * x2), fmuladd(x1, s, c * x2)). 0 = plain products (the old text, drifts from the stock op in the last "
                      "fp32 bit); 1 = first product fused = the stock form (bit-equal to mx.fast.rope); 2 = second product fused (probe only); 3 = auto: the form the stock op is measured to use "
@@ -274,6 +285,15 @@ FLAGS: dict[str, Flag] = {
                     attrs=(("moe", "TGT", int),)),
     "moe_ksplit": Flag("KYOJIN_MOE_KSPLIT", "0", "per-pair gather GEMV (rows = 1) splits k by the expert's bitrate, equal bytes per threadgroup: 1 = lower bitrates split less, 2 = higher bitrates split more (moe)", kind="int",
                        attrs=(("moe", "KSPLIT", int),)),
+    "moe_chain": Flag("KYOJIN_MOE_CHAIN", "1", "routed MoE decode chain in 3 launches per layer: mid rides the tail of the gate/up gather GEMV and the combine the tail of the down gather GEMV "
+                      "(last-arriving threadgroup of a 128-column block runs the stand-alone mid / final statements; per-pair gather path, no union / KSPLIT); bit-identical (moe, moe_sumoe)",
+                      attrs=(("moe", "CHAIN", lambda v: v == "1"),)),
+    "gather_roof": Flag("KYOJIN_GATHER_ROOF", "0", "routed MoE decode gate/up gather GEMV at rows = 1 as 128-thread threadgroups (one column half each, 2x the threadgroups): the decode is ALU-bound and the 256-thread launch "
+                        "loses ~7 % to its tail wave; same partials bit for bit (moe)",
+                        attrs=(("moe", "GATHER_ROOF", lambda v: v == "1"),)),
+    "routed_fx": Flag("KYOJIN_ROUTED_FX", "0", "routed MoE decode chain in 2 launches per layer: the rot (sign, 128-Hadamard, fp8 fake quant) runs in the prologue of the gate/up gather GEMV, each threadgroup rotating its own k slice into threadgroup memory; "
+                      "falls back to the 3-launch chain when the slice does not start on a 128-block; bit-identical (moe)",
+                      attrs=(("moe", "ROUTED_FX", lambda v: v == "1"),)),
     "moe_finpar": Flag("KYOJIN_MOE_FINPAR", "0", "routed MoE combine launch: one simdgroup per routed pair (threadgroup per 128-block), pair terms added in order j by simdgroup 0; bit-identical to the serial loop (moe, moe_sumoe)",
                        attrs=(("moe", "FINPAR", lambda v: v == "1"),)),
     "dense_fast": Flag("KYOJIN_DENSE_FAST", "1", "fused dense tail reads one float4 per k-split",
@@ -330,6 +350,10 @@ FLAGS: dict[str, Flag] = {
     "pf_warm0": Flag("KYOJIN_PF_WARM0", "0", "serve engine, Engram prefill: the rows of the FIRST chunk of a prompt are read into the page cache when the request is admitted (own worker), "
                      "as the chunk-to-chunk warm already does for chunks 1+. Chunk 0 reads its distinct hashed rows cold (content dependent: a repeated passage touches few rows, "
                      "a real document or random ids up to ~196k per layer at 8192 rows); hint only, same bytes. 0 = today"),
+    "engram_adopt": Flag("KYOJIN_ENGRAM_ADOPT", "0", "serve engine, Engram prefill: when a request is admitted, the rows of its FIRST chunk (after the cached prefix) are hashed on the host (RowMap, "
+                         "history = the cached tokens before the cut) and the real row jobs are submitted at once, on a worker; the chunk adopts them when its device hashes "
+                         "equal the host's bit for bit (no second read, no hint), else it reads as before (other cache hit, image tokens, other chunk bounds). Replaces pf_warm0 "
+                         "(a hint that competed with the chunk's own reads). Stats engram_adopt_hit / _miss / _made, t_pf_eng0_first_adopt|cold. KYOJIN_ENGRAM_ADOPT_DEBUG=1 re-reads and asserts. 0 = today"),
     "pf_dec": Flag("KYOJIN_PF_DEC", "2", "prefill NAX GEMMs (routed experts, gate/up epilogue, dense shared stacks) of an exact mul1 pack: 1 = trellis decode by dec_mul1r1 "
                   "(lane sum by one imad), 2 = dec_mul1r2 (also the byte pairs by a subtract-imad); the same fp16 weight bit for bit, fewer integer ops per decoded weight "
                   "(read at kernel build)", kind="int", attrs=(("metal_nax", "PF_DEC", int),)),
@@ -396,6 +420,46 @@ FLAGS: dict[str, Flag] = {
                      "policy's tokens per cap round and per-position acceptance then see every verified row (read per round)"),
     "spec_rs": Flag("KYOJIN_SPEC_RS", "0", "sampled sessions: draw the drafts from a tempered top-k draft q and accept with min(1, p/q), a rejected row emits from the "
                      "residual max(0, p - q) (kyojin_mlx.specsam; exact target distribution, acceptance 1 - TV(p, q); greedy sessions unchanged; read per round)"),
+    "spec_typical": Flag("KYOJIN_SPEC_TYPICAL", "0", "sampled sessions, MTP / lookup drafts (not spec_rs): a draft row is also accepted when its target probability p >= "
+                         "min(spec_typical_eps, spec_typical_delta * exp(-H)), H the row's entropy under the sampling distribution (relaxed 'typical' acceptance, Medusa; "
+                         "NOT the exact target distribution; greedy sessions unchanged; the mask is built on device in the sampling graph; read per round)"),
+    "spec_typical_eps": Flag("KYOJIN_SPEC_TYPICAL_EPS", "0.09", "spec_typical: absolute probability bound of the rule (read per round)", kind="float"),
+    "spec_typical_delta": Flag("KYOJIN_SPEC_TYPICAL_DELTA", "0.3", "spec_typical: entropy-scaled bound delta * exp(-H) of the rule (read per round)", kind="float"),
+    "spec_typical_lookup": Flag("KYOJIN_SPEC_TYPICAL_LOOKUP", "rep", "spec_typical, repetition control (read per round): rep = the relaxed rule applies to MTP drafts and to lookup drafts, but a draft token that "
+                                 "would complete a 12-gram already seen twice in the last 2048 tokens of the session's OWN output is accepted by exact equality only (copies of the prompt "
+                                 "and of tool results stay relaxed; stat spec_typical_rep_refused counts the refusals); 0 = lookup rounds accept by equality only (measurement arm); "
+                                 "1 = the relaxed rule everywhere with no repetition check (measurement arm)", kind="mode", choices=("rep", "0", "1")),
+    "spec_typical_hmax": Flag("KYOJIN_SPEC_TYPICAL_HMAX", "", "spec_typical, entropy gate (read per round): when set (nats), the relaxed rule applies only to rows whose entropy H under the sampling distribution is <= hmax; "
+                              "at a higher-entropy row (a real choice point) a draft is accepted by exact equality only. Empty or inf = off (the plain rule)", kind="float"),
+    "spec_typical_phase": Flag("KYOJIN_SPEC_TYPICAL_PHASE", "all", "spec_typical (read per round): answer = the relaxed rule (and its repetition check) applies only to tokens generated outside an open think block "
+                               "(the answer, tool calls, code after the reasoning); inside thinking a draft is accepted by exact equality with the verify sample (the normal sampled path). "
+                               "The phase is tracked per session from the prompt's last think tag and the committed tokens (O(1) per round); a model without a think block is always in the answer. "
+                               "all (default) = the relaxed rule everywhere. Stat spec_typical_think_skipped counts the relaxed rounds withheld because of thinking", kind="mode", choices=("answer", "all")),
+    "think_temperature": Flag("KYOJIN_THINK_TEMPERATURE", "", "sampled sessions (read per round; empty = off): tokens generated inside an open think block (the phase of spec_typical_phase) are sampled at this "
+                              "temperature instead of the request's; top_p / top_k / min_p unchanged, the answer keeps the request sampling. Applied to every logits-to-token point of the session: plain "
+                              "and verify sampling, the spec_rs q / rejection rule and the relaxed spec_typical acceptance, so drafts are verified against the same tempered distribution. "
+                              "Greedy sessions unchanged. The phase is read at the start of the step / round", kind="float"),
+    "spec_typical_cooldown": Flag("KYOJIN_SPEC_TYPICAL_COOLDOWN", "512", "spec_typical, adaptive loop control (read per round; tokens, 0 = off): when a session shows an early loop signal (a text line of >= 40 non-space chars, "
+                                  "outside code fences, seen a 2nd time in the last 16K chars of its output; or a refused repetition 12-gram of spec_typical_lookup=rep) it accepts by exact equality "
+                                  "(no relaxed rule, MTP and lookup alike) for the next cooldown generated tokens, then relaxes again; a re-trigger while armed or within the next window doubles "
+                                  "the window (cap 16384). Stats spec_typical_cooldown_triggers / spec_typical_cooldown_tokens. The hard loop guard is unchanged", kind="int"),
+    "spec_typical_rewind": Flag("KYOJIN_SPEC_TYPICAL_REWIND", "3", "spec_typical_cooldown, rewind on trigger (read per round; int = max rewinds per reply, 0 = off = cooldown only): when the loop signal fires "
+                                "while the session is inside an open think block, the session is rolled back to just before the FIRST copy of the repeated span (the line, or the refused 12-gram): "
+                                "those committed tokens are dropped from the model context, the KV cache is rebuilt (prompt prefix + replay of the kept output, the dropped-cache path), the sampling key "
+                                "advances, and the exact-acceptance cooldown window runs from there. After the cap no more rewinds (the hard loop guard handles it). Never in the answer or a tool "
+                                "call, never across a think tag. Tokens already streamed stay visible to the client (stored text = streamed text); completion_tokens counts every token generated. "
+                                "Stats spec_typical_rewinds / spec_typical_rewound_tokens", kind="int"),
+    "replay_pipe": Flag("KYOJIN_REPLAY_PIPE", "1", "cache rebuild by replay (after a spec_typical_rewind or a KV drop; read per call): the groups of 8 teacher-forced tokens are queued with async_eval so the host builds group n+1 while the GPU runs group n "
+                        "(one group in flight behind it) instead of building and waiting group by group. Same ops, same order, same stream: the cache bits are those of the synchronous loop. 0 = evaluate each group before building the next"),
+    "loop_guard": Flag("KYOJIN_LOOP_GUARD", "1", "chat replies (kyojin_mlx.serve.loopguard; read per request): a thinking block that loops (token period <= 64, repeated text, or a line of >= 40 non-space "
+                       "chars seen 3 times) is closed with the template's close tag and the model writes its answer in a continuation request, once per reply; a second loop ends "
+                       "the reply (finish_reason stop, text so far). A stop token inside an open think block gets the same single recovery. 0 = off (answers are never watched)"),
+    "spec_ptap": Flag("KYOJIN_SPEC_PTAP", "0", "probe (log only, read per round): one JSON line per sampled session and speculative round to KYOJIN_SPEC_PTAP_OUT (a jsonl path; no path = off): "
+                      "draft source, temperature / top_p / top_k, and per draft position the target probability of the draft token under the exact sampling distribution, "
+                      "its entropy, whether the verify sample equalled the draft, and the number accepted (kyojin_mlx.taps). Never changes a token"),
+    "router_tap": Flag("KYOJIN_ROUTER_TAP", "0", "probe: the routing weights of decoded rows (plain and verify) per MoE layer, as the engine applies them, sorted by rank: per rank sum and "
+                       "sum of squares of the weight share and counts of rows with a share < 0.02 / 0.05 / 0.10 / 0.15, in /v1/stats router_tap (kyojin_mlx.taps). Never changes a routing",
+                       attrs=(("taps", "ROUTER", _on),)),
     "gate_adapt": Flag("KYOJIN_GATE_ADAPT", "0", "served MTP round: the confidence-gate threshold from the round's own measured reward instead of the fixed 50 %. "
                        "Every candidate threshold (30..80 %) is priced on the round that just ran: its leading run of raw confidences says how many rows it would "
                        "have proposed, min(accepted, kept) drafts are its yield, and the measured round ms less the fitted per-row cost of the rows it would not "
@@ -554,6 +618,9 @@ FLAGS: dict[str, Flag] = {
                    "(metal_src.gemv_rg_source half=True builds the same half4 x groups the fused prologue stages). A row's bits are then the fused launch's bits at the same row count "
                    "(the same class as shipped half_rows, so the same one-fp16-ulp drift, KL-gated); rows <= GEMV_MAX_ROWS untouched",
                    attrs=(("exl3_linear", "RG_HALF", _on),)),
+    "shared_glu": Flag("KYOJIN_SHARED_GLU", "0", "decode rows of the shared expert (pf_glue._impl_shared_mlp): silu(min(gate, L)) * clip(up, -L, L), its cast to fp16 and the fp8 round trip run in the prologue of the "
+                       "down EXL3 GEMV (kernels.Mul1Gemv.fused_glu) instead of their own compiled launch: one launch fewer per MoE layer; same arithmetic and rounding points, bit-identical",
+                       attrs=(("pf_glue", "SHARED_GLU", _on),)),
     "half_rows": Flag("KYOJIN_HALF_ROWS", "4", "fused dense GEMV and MoE grouped GEMV of that many rows or more: packed-fp16 row FMAs (0 = fp32 FMAs; real-text NLL vs fp32 rows +0.002 nats, within noise)", kind="int",
                       attrs=(("metal_src", "HALF_ROWS", int),)),
     "pfroof2": Flag("KYOJIN_PFROOF2", "0", "prefill indexer: each query block scores only its causal columns, exact radix top-k (pfroof2; identical output)"),
@@ -636,6 +703,18 @@ FLAGS: dict[str, Flag] = {
                      "(sum of all buffer spans) / gpu_kb1_r<rows> (buffers with exactly one dispatch, exact) / gpu_kmix_r<rows> (split evenly). "
                      "MLX_MAX_OPS_PER_BUFFER=1 makes every buffer single-dispatch",
                      attrs=(("gpuspan", "KERN", _on),)),
+    "ablit_fused": Flag("KYOJIN_ABLIT_FUSED", "1", "decensor projection (ablit.project): clamp, the K dot products and the update of a row in ONE launch instead of ~7 "
+                        "(fp16 clip pair, fp32 cast, two small fp32 matmuls, fused update); fp32 inside like the stock path, only the dot product's "
+                        "summation order differs", attrs=(("ablit", "FUSED", _on),)),
+    "attn_core_fuse": Flag("KYOJIN_ATTN_CORE_FUSE", "0", "DS4.1 plain decode attention core: the kv chain also writes the stacked window buffer the commit keeps, so the commit's slot scatter launch is gone "
+                           "(bit-identical outputs and cache state; applies when the stack has spare slots or a non-identity slot map; 0 = the old path)",
+                           attrs=(("dsv4_core", "ATTN_CORE_FUSE", _on),)),
+    "ablate": Flag("KYOJIN_ABLATE", "", "serve probe (timing only, outputs become garbage): comma list of op classes of the DS4.1 decode step (1-row plain step and verify rows) "
+                   "each replaced by the cheapest stand-in that keeps shapes and dtypes, to read its exposed cost as a round-time difference. Classes: moe_routed (routed experts -> zeros), "
+                   "moe_shared (shared expert -> zeros), router (logits + top-k -> fixed ids / weights), moe_glue (routed GEMVs kept, rot / mid / final -> zero buffers), "
+                   "mhc (mixes + sinkhorn -> constants, pre -> stream mean, expand -> add; block runs the stock chain), norm (RMSNorm -> identity; block runs the stock chain), "
+                   "attn (attention core -> zeros, cache untouched), idx (indexer -> fixed first-k), ablit (decensor projection -> identity). \"\" = off, bit-identical",
+                   kind="str", attrs=(("ablate", "ACTIVE", _ablate),)),
     "host_sample": Flag("KYOJIN_HOST_SAMPLE", "0", "serve probe: sample the engine thread's own Python stack every N microseconds (0 = off, read per loop "
                       "iteration) and dump the wall attribution per file:line to KYOJIN_HOST_SAMPLE_OUT (default ./pysample.txt) when the lever goes back to 0; "
                       "`gil_held` per site is the part of it the engine thread spent holding the GIL (MLX waits for the GPU with it), the rest of the off-CPU "
@@ -780,6 +859,10 @@ FLAGS: dict[str, Flag] = {
     "pf_share": Flag("KYOJIN_PF_SHARE", "0", "serve engine, sub-agents on a shared prefix: a session that has not started takes the cache of a prefilling session at the last chunk end both prompts "
                      "reach by the same chunk path (the leader's real path equals the child's own grid there; a view of the cache, kept outside the prefix-cache budget but inside kv_budget, "
                      "one Seed for all takers), instead of prefilling from the last block snapshot or from 0. 0 = today"),
+    "pf_cut_merge": Flag("KYOJIN_PF_CUT_MERGE", "0", "serve engine, DS4.1: the chunk that ends at the LAST chat cut runs on to the end of the prompt (the generation prompt, <= 64 tokens) as ONE pass "
+                         "and the cut snapshot (memory and disk, same keys and digests) is built from the state the pass captured at the cut (the attention of each layer runs in two segments, "
+                         "the MoE once over all rows: the fixed expert-decode cost is paid once). 1 = passes that are not CED passes, 2 = also CED passes (run exact), 3 = also CED passes kept CED (decoder skip kept: the decoder half runs tail + the rows past the cut, captured in two segments). Falls back to the split "
+                         "path: CED pass in mode 1, TurboQuant cache, images, rebuilt session, tail > 64, a chunk end in between, a pf_share taker at the cut. 0 = today", kind="int"),
     "pf_path": Flag("KYOJIN_PF_PATH", "0", "serve engine, prefix cache: a memory snapshot carries the chunk ends that built it and is used only by a prompt whose own grid has that path "
                     "(a snapshot taken after another prompt's cut would leave other bits than the asking prompt's solo prefill; a disk checkpoint has no path: position on the grid "
                     "only). Costs reuse: the chat layer's cut at the end of a conversation is not a cut of the next turn, so the next turn restarts from an earlier snapshot. 0 = today"),
@@ -897,6 +980,20 @@ def _norm(f: Flag, v) -> str:
     if f.kind == "int":
         int(s)                                                   # ValueError on a non-integer
         return s
+    if f.kind == "float":
+        if f.default == "" and s.lower() in ("", "inf"):         # an optional bound: empty / inf = off
+            return s
+        x = float(s)
+        if not 0.0 <= x < float("inf"):
+            raise ValueError(f"{f.env}: expected a float >= 0, got {v!r}")
+        return s
+    if f.kind == "mode":
+        if s not in f.choices:
+            raise ValueError(f"{f.env}: expected one of {'/'.join(f.choices)}, got {v!r}")
+        return s
+    if f.kind == "str":
+        from . import ablate
+        return ablate.normalize(s)                               # the one str flag: validated class names in table order ("" = off)
     if s.lower() in ("1", "true", "on"):
         return "1"
     if s.lower() in ("0", "false", "off", ""):
@@ -939,3 +1036,53 @@ def set_many(values: dict) -> dict:
 
 def set(name: str, v) -> dict:  # noqa: A001  (module API: flags.set)
     return set_many({name: v})
+
+
+# ------------------------------------------------------------------------------------------------ per-request override
+# A request body may carry {"kyojin_flags": {"spec_typical": 0, "spec_lookup": 0}}: these levers are set for the duration of that request and put back
+# afterwards (POST /admin/flags stays the persistent switch). Only levers the engine reads per round and that do not touch the KV content are accepted,
+# so the prefix cache is kept and no compiled region retraces (GEN is not bumped).
+REQUEST_FLAGS = ("spec_typical", "spec_lookup")
+_lease_lock = threading.Lock()
+_lease_users = 0
+_lease_saved: dict = {}
+
+
+def check_request_flags(values) -> dict:
+    """{name: normalised value} of a body's kyojin_flags; ValueError for anything but a dict of whitelisted levers (HTTP 400)."""
+    if values is None:
+        return {}
+    if not isinstance(values, dict):
+        raise ValueError("kyojin_flags must be an object")
+    out = {}
+    for n, v in values.items():
+        if n not in REQUEST_FLAGS:
+            raise ValueError(f"kyojin_flags: {n!r} is not a per-request flag (allowed: {', '.join(REQUEST_FLAGS)})")
+        out[n] = _norm(FLAGS[n], v)
+    return out
+
+
+@contextlib.contextmanager
+def request_override(values: dict):
+    """Hold `values` (from check_request_flags) while the block runs; the first holder saves the baseline, the last one restores it."""
+    global _lease_users, GEN
+    if not values:
+        yield
+        return
+    with _lease_lock:
+        if _lease_users == 0:
+            _lease_saved.clear()
+            _lease_saved.update({n: value(n) for n in REQUEST_FLAGS})
+        _lease_users += 1
+        gen = GEN
+        set_many(values)
+        GEN = gen
+    try:
+        yield
+    finally:
+        with _lease_lock:
+            _lease_users -= 1
+            if _lease_users == 0:
+                gen = GEN
+                set_many(dict(_lease_saved))
+                GEN = gen
