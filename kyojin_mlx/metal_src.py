@@ -247,6 +247,33 @@ _FQ8_ELEM = r"""    { const float q = metal::clamp(xr.C * fq_inv, -448.0f, 448.0
 """
 
 
+_GLU_XR = r"""
+    // shared_glu: xr = half(silu(min(g, L)) * clip(u, -L, L)), the rounding points of the stock chain (fp32 inside, one cast to the stream dtype), g / u = the gate / up outputs.
+    float4 xr;
+    {
+        const float4 gx = float4(*((const device half4*)(x + o))), ux = float4(*((const device half4*)(u + o)));
+        const float4 g4 = CLAMPG, u4 = CLAMPU;
+        float4 sg;
+        for (int i = 0; i < 4; ++i) {                                 // mlx sigmoid: y = 1 / (1 + exp(|x|)); x < 0 ? y : 1 - y
+            const float xs = g4[i];
+            const float ys = 1.0f / (1.0f + metal::precise::exp(abs(xs)));
+            sg[i] = (xs < 0.0f) ? ys : 1.0f - ys;
+        }
+        xr = float4(half4((g4 * sg) * u4));
+    }
+"""
+_FQ8_LOAD = "const float4 xr = float4(*((const device half4*)(x + o)));"
+
+
+def with_glu(src: str, limit: float) -> str:
+    """`src` (a fused kernel body whose fq8 block loads xr from x, see with_fq8) with xr = the clamped SwiGLU of x (gate) and u (up) instead: the shared expert's
+    activation inside the down projection's prologue. Needs the kernel input `u` (same layout as x)."""
+    assert src.count(_FQ8_LOAD) == 1, "fq8 block template changed"
+    lim = repr(float(limit)) + "f"
+    block = _GLU_XR.replace("CLAMPG", f"min(gx, float4({lim}))" if limit > 0 else "gx").replace("CLAMPU", f"clamp(ux, float4(-{lim}), float4({lim}))" if limit > 0 else "ux")
+    return src.replace(_FQ8_LOAD, block.strip("\n"))
+
+
 def with_fq8(src: str) -> str:
     """`src` (a rot / rot_gather kernel body that loads its input with _XV_LOAD, fp16 input) with the fp8 round trip of that input folded into the load:
     one launch fewer than a separate fake-quant kernel in front, same bits."""
@@ -640,7 +667,7 @@ def fused_dims(kt: int, tgk: int) -> int:
 
 def fuse_gemv(s: str, mr: int, xsr: int, in_half: bool, fq8: bool, *, xo: str, suh: str, ctri: str, pb: str, ks: str, svh: str, yout: str,
               tail_pre: str = "", xp_old: str = "    const device float4* xp = (const device float4*)(xh + ks0 * 16);\n", prologue: bool = True,
-              sync: str = TAIL_SC, arrive: str = "TGK", warps: int = 8, reads: str = TAIL_ATOM) -> str:
+              sync: str = TAIL_SC, arrive: str = "TGK", warps: int = 8, reads: str = TAIL_ATOM, glu: float | None = None) -> str:
     """`s` (a gemv_source or a derivative: same-input group, grouped) as a one-launch rot + GEMV + finalize kernel. Expressions (C++ text, in the scope of the
     kernel body): xo = element offset of x for row rr / block bb (rr, bb, lane, KD), suh = pointer of the half4 suh, ctri = counter index, pb = element offset of the
     partial (k-split 0) of row `warp` at this lane's 4 columns, ks = element stride of a k-split, svh = pointer of the half4 svh, yout = pointer of the 4 outputs
@@ -660,8 +687,11 @@ def fuse_gemv(s: str, mr: int, xsr: int, in_half: bool, fq8: bool, *, xo: str, s
         pro = stage_half(pro)
         s = s.replace("xhp[", "xp[")
     assert not fq8 or in_half
+    assert glu is None or fq8
     if fq8:
         pro = with_fq8(pro)
+        if glu is not None:
+            pro = with_glu(pro, glu)
     pro = pro.replace("SMN", str(smn)).replace("XSR", str(xsr)).replace("XO", xo).replace("SUH", suh)
     tail = _FUSED_TAIL.replace("BUTTERFLY", _BUTTERFLY).replace("RSQRT", RSQRT_HAD).replace("TAIL_PRE", tail_pre)
     tail = tail_reads(tail, reads)
@@ -690,11 +720,11 @@ def fuse_gemv(s: str, mr: int, xsr: int, in_half: bool, fq8: bool, *, xo: str, s
 
 @functools.lru_cache(maxsize=None)
 def fused_source(K: int, mr: int, cb: str, in_half: bool, fq8: bool, xsr: int, prefetch: bool = True, prologue: bool = True, half: bool = False,
-                 sync: str = TAIL_SC, reads: str = TAIL_ATOM) -> str:
+                 sync: str = TAIL_SC, reads: str = TAIL_ATOM, glu: float | None = None) -> str:
     """The fused single linear. Inputs x, suh (fp16), svh (fp16), trellis, params u32 [KT, NT, TGK, counter base], ctr (u32); outputs part (scratch), y.
     prologue=False: GEMV + finalize only, inputs xh (rotated, fp32) instead of x / suh. sync / reads: ordering of the arrival block and the finalize's partial
     reads (metal_src.tail_sync / tail_reads; both bit-identical to the defaults)."""
-    return fuse_gemv(gemv_source(K, mr, prefetch, cb, half=half and prologue and NACC == 1), mr, xsr, in_half, fq8, prologue=prologue, sync=sync, reads=reads,
+    return fuse_gemv(gemv_source(K, mr, prefetch, cb, half=half and prologue and NACC == 1), mr, xsr, in_half, fq8, prologue=prologue, sync=sync, reads=reads, glu=glu,
                      xo="ulong(rr) * KD + bb * 128 + lane * 4", suh="suh + bb * 128 + lane * 4", ctri="params[3] + blk",
                      pb="ulong(warp) * N + blk * 128 + lane * 4", ks="ulong(MR) * N", svh="svh + blk * 128 + lane * 4",
                      yout="y + ulong(warp) * N + blk * 128 + lane * 4")
@@ -953,7 +983,22 @@ _GATHER_BODY_PF2 = r"""{
     }"""
 
 
-def gather_gemv_source(Ks: tuple[int, ...], nproj: int, cb: str = "mul1", pf: bool = False, ksplit: bool = False, pf2: bool = False) -> str:
+_T128_SUBS = (("const uint blk = threadgroup_position_in_grid.x;", "const uint blk = threadgroup_position_in_grid.x >> 1;"),
+              ("const uint half_ = warp & 1u, split = warp >> 1;", "const uint half_ = threadgroup_position_in_grid.x & 1u, split = warp;"),
+              ("for (uint idx = tid; idx < 128; idx += 256) {\n        const uint c = idx;", "for (uint idx = tid; idx < 64; idx += 128) {\n        const uint c = half_ * 64 + idx;"))
+
+
+def gather_half_tg(src: str) -> str:
+    """KYOJIN_GATHER_ROOF: the gather GEMV as threadgroups of 128 threads (4 simdgroups = the 4 k-splits of ONE column half) instead of 256 (8 simdgroups, both halves):
+    the grid x is (2 * blocks) threadgroups, x >> 1 the 128-column block, x & 1 the half. Every simdgroup runs the very same tile chain and the 4 splits reduce in the same order j = 0..3,
+    so the partials are bit for bit those of the 256-thread launch; only the threadgroups are finer (shorter tail wave). Launch with threadgroup (128, 1, 1) and the same grid."""
+    for a, b in _T128_SUBS:
+        assert src.count(a) == 1, a
+        src = src.replace(a, b)
+    return src
+
+
+def gather_gemv_source(Ks: tuple[int, ...], nproj: int, cb: str = "mul1", pf: bool = False, ksplit: bool = False, pf2: bool = False, t128: bool = False) -> str:
     """Gather GEMV partial for the bit widths `Ks` (a runtime branch on the expert's K, uniform per threadgroup).
     Inputs: xh [NZ, KD] f32, ids [npairs] i32, trellis{0,1} u32, off{0,1} u32 [E+1], kk{0,1} u8 [E], params [KT, NT, TGK].
     Output part [NZ, TGK, N] f32 (NZ = npairs * nproj).
@@ -1000,7 +1045,8 @@ def gather_gemv_source(Ks: tuple[int, ...], nproj: int, cb: str = "mul1", pf: bo
         bodies.append(body.replace("X_DECL", "\n            ".join(xdecl)).replace("RUN_CODE", "\n            ".join(run)).replace("KV", str(K)))
     chain = " else ".join(f"if (K == {K}u) {b}" for K, b in zip(Ks, bodies))
     src = _GATHER_GEMV.replace("NPROJ", str(nproj)).replace("TRSEL", trsel).replace("BODIES", chain).replace("AFSTORE", afstore)
-    return ksplit_gather(src, Ks) if ksplit else src
+    assert not (t128 and ksplit)
+    return ksplit_gather(src, Ks) if ksplit else (gather_half_tg(src) if t128 else src)
 
 
 def ksplit_sel(Ks: tuple[int, ...]) -> str:
@@ -1851,3 +1897,166 @@ def final_gather_sh_source(wpost: bool) -> str:
     old = "        out = out + y4;"
     assert s.count(old) == 1
     return s.replace(old, _BF16_ROUND + "\n" + old)
+
+
+# ---------------------------------------------------------------------------------------------------------------- moe_chain
+# KYOJIN_MOE_CHAIN: the routed decode chain in three launches instead of five. mid rides the tail of the gate/up gather GEMV and final (the combine) rides the
+# tail of the down gather GEMV: the last threadgroup to finish a 128-column block (arrival counter, reset by that last arriver so the buffer is zero again for
+# the next launch) runs the very statements of the stand-alone mid / final on the partials the others stored. Same arithmetic in the same order: bit-identical.
+_CH_LDF4 = r"""
+#define LDF4(ptr) float4(as_type<float>(atomic_load_explicit((const device atomic_uint*)((ptr)), memory_order_relaxed)), as_type<float>(atomic_load_explicit((const device atomic_uint*)((ptr)) + 1, memory_order_relaxed)), \
+                         as_type<float>(atomic_load_explicit((const device atomic_uint*)((ptr)) + 2, memory_order_relaxed)), as_type<float>(atomic_load_explicit((const device atomic_uint*)((ptr)) + 3, memory_order_relaxed)))
+"""
+
+_CH_ARRIVE = r"""
+    threadgroup_barrier(mem_flags::mem_device);
+    const uint chain_tgk = threadgroups_per_grid.y, chain_blocks = threadgroups_per_grid.x;    // both read from the launch itself: nothing about the grid is baked into the source
+    threadgroup uint chain_last;
+    if (tid == 0) {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        const uint old = atomic_fetch_add_explicit(((device atomic_uint*)(ctr)) + CTRI, 1u, memory_order_relaxed);
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        const bool lst = (old + 1u) == ARRIVE;
+        if (lst) atomic_store_explicit(((device atomic_uint*)(ctr)) + CTRI, 0u, memory_order_relaxed);
+        chain_last = lst ? 1u : 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (chain_last == 0u) return;
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+"""
+
+_CH_MID_HEAD = ("    const uint lane = thread_index_in_simdgroup;\n"
+                "    const uint blk = threadgroup_position_in_grid.x * 4 + simdgroup_index_in_threadgroup;\n"
+                "    const uint p = threadgroup_position_in_grid.y;\n"
+                "    const uint TGK = params[0], N = params[1];\n"
+                "    if (blk * 128 >= N) return;\n"
+                "    const uint e = uint(ids[p]);\n")
+_CH_PART_LD = "acc += *((const device float4*)(part + (ulong(p * 2 + pj) * TGK + kb) * N + col));"
+
+
+def _chain_check(gemv: str, src: str) -> None:
+    """Refuse a GEMV template the arrival protocol was not verified on: no early `return` may precede the arrival (a threadgroup that leaves without arriving
+    would leave its block's counter short), the only returns are the non-last-arriver one in _CH_ARRIVE and the combine's own, and no grid size is baked."""
+    assert "return" not in gemv, "gather GEMV template has an early return before the arrival"
+    assert src.count("if (chain_last == 0u) return;") == 1 and src.index("atomic_fetch_add") > src.index(gemv[-40:])
+    assert "CTRI" not in src and "ARRIVE" not in src
+
+
+def chain_gu_source(Ks: tuple[int, ...], cb: str, pf: bool, pf2: bool, blocks: int, limit: float, wpre: bool, fq: bool, alpha: float, beta: float,
+                    shared_skip: int | None = None, t128: bool = False) -> str:
+    """gather_gemv_source (gate + up) with mid in its tail. Extra inputs after the GEMV's: wts, svh0, svh1, suhd, ctr. Outputs part, xh2 [npairs, N].
+    shared_skip: expert id whose down input skips the fp8 fake quant (moe_sumoe's shared slot; 0xFFFFFFFF = none) or None for the plain mid."""
+    gemv = gather_gemv_source(Ks, 2, cb, pf, False, pf2, t128)
+    mid = mid_source(limit, wpre, fq, alpha, beta) if shared_skip is None else mid_sh_source(limit, wpre, fq, alpha, beta)
+    assert mid.count(_CH_MID_HEAD) == 1 and mid.count(_CH_PART_LD) == 1, "mid template changed"
+    mid = mid.replace(_CH_MID_HEAD, "").replace(_CH_PART_LD, "acc += LDF4(part + (ulong(p * 2 + pj) * TGK + kb) * N + col);")
+    if shared_skip is not None:
+        mid = mid.replace("params[2]", f"{int(shared_skip)}u")
+    arrive = _CH_ARRIVE.replace("CTRI", "(p * chain_blocks + blk)").replace("ARRIVE", "(4u * chain_tgk)" if t128 else "(2u * chain_tgk)")
+    if t128:                                                        # two threadgroups (halves) per 128-column block and (pair, proj): 4 * tgk arrivals, the block count is half the grid x
+        assert arrive.count("chain_blocks = threadgroups_per_grid.x;") == 1
+        arrive = arrive.replace("chain_blocks = threadgroups_per_grid.x;", "chain_blocks = threadgroups_per_grid.x >> 1;")
+    out = _CH_LDF4 + gemv + arrive + "    if (warp == 0) {\n" + mid + "    }\n"
+    _chain_check(gemv, out)
+    return out
+
+
+def chain_dn_source(Ks: tuple[int, ...], cb: str, pf: bool, pf2: bool, blocks: int, topk: int, wpost: bool, bf16_last: bool = False) -> str:
+    """gather_gemv_source (down) with the combine (final_par's arithmetic) in its tail. Extra inputs after the GEMV's: ids is the GEMV's, then wts, svh, ctr.
+    Outputs part, y [rows, N]. One simdgroup per pair of the row computes its term, simdgroup 0 adds them in order j."""
+    assert topk <= 8
+    gemv = gather_gemv_source(Ks, 1, cb, pf, False, pf2)
+    arrive = _CH_ARRIVE.replace("CTRI", f"((zz / {topk}u) * chain_blocks + blk)").replace("ARRIVE", f"({topk}u * chain_tgk)")
+    tail = r"""
+    threadgroup float4 ys[TOPK][32];
+    if (warp < TOPK) {
+        const uint j = warp;
+        const uint r = zz / TOPK;
+        const ulong col = blk * 128 + lane * 4;
+        const uint pp = r * TOPK + j;
+        const uint e2 = uint(ids[pp]);
+        float4 acc = float4(0.0f);
+        for (uint kb = 0; kb < TGK; ++kb) acc += LDF4(part + (ulong(pp) * TGK + kb) * N + col);
+        float v0 = acc.x, v1 = acc.y, v2 = acc.z, v3 = acc.w;
+BUTTERFLY
+        const float4 sv = float4(*((const device half4*)(svh + ulong(e2) * N + col)));
+        float4 y4 = float4(v0, v1, v2, v3) * RSQRT * sv;
+        WPOST
+        BF16LAST
+        ys[j][lane] = y4;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (warp == 0) {
+        const uint r = zz / TOPK;
+        float4 out = float4(0.0f);
+        for (uint q = 0; q < TOPK; ++q) out = out + ys[q][lane];
+        *((device float4*)(y + ulong(r) * N + blk * 128 + lane * 4)) = out;
+    }
+"""
+    tail = (tail.replace("BUTTERFLY", _BUTTERFLY).replace("RSQRT", RSQRT_HAD)
+            .replace("WPOST", "y4 = y4 * wts[pp];" if wpost else "").replace("BF16LAST", _BF16_ROUND if bf16_last else "").replace("TOPK", str(topk)))
+    out = _CH_LDF4 + gemv + arrive + tail
+    _chain_check(gemv, out)
+    return out
+
+
+# KYOJIN_ROUTED_FX: the rot launch folded into the prologue of the gate/up gather GEMV. Every threadgroup rotates (sign, 128-Hadamard, fp8 fake quant: the very statements
+# of rot_gather_source) the 128-blocks of the k slice its four k-splits read, into threadgroup memory, and the GEMV reads x from there: one launch fewer per layer, same bits.
+_FX_PRO = r"""
+    threadgroup float4 rfx[RFX_NB * 32];
+    const uint rfx_a = kblock * WS * chunk * 16;                    // first k of this threadgroup's slice (a multiple of 128: chunk is even)
+RFX_SPLIT    {
+        const device half* rsp = ((zz & 1u) ? suh1 : suh0) + ulong(e) * KD;
+        for (uint bi = warp; bi < RFX_NB; bi += 8) {
+            const uint kb0 = rfx_a + bi * 128;
+            if (kb0 >= KD) break;
+            const ulong o = ulong(p / RFX_TOPK) * KD + kb0 + lane * 4;
+            RFX_XLOAD
+            const float4 sv = float4(*((const device half4*)(rsp + kb0 + lane * 4)));
+            float v0 = xv.x * sv.x, v1 = xv.y * sv.y, v2 = xv.z * sv.z, v3 = xv.w * sv.w;
+BUTTERFLY
+            rfx[bi * 32 + lane] = float4(v0, v1, v2, v3) * RSQRT;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+"""
+
+
+def fx_ok(kt: int, tgk: int, ws: int = 4, cap: int = 24) -> bool:
+    """The folded rot needs the threadgroup's k slice to start on a 128-block (even chunk) and to fit `cap` blocks of threadgroup memory."""
+    chunk = (kt + tgk * ws - 1) // (tgk * ws)
+    return chunk % 2 == 0 and (ws * chunk * 16 + 127) // 128 <= cap
+
+
+def chain_gu_fx_source(Ks, cb, pf, pf2, blocks, limit, wpre, fq, alpha, beta, shared_skip, kt: int, tgk: int, topk: int, fq8: bool) -> str:
+    """chain_gu_source with the rot in the GEMV prologue. Inputs: xh is the fp16 activation [rows, KD] (not rotated), extras after the chain's: suh0, suh1."""
+    assert shared_skip is None and fx_ok(kt, tgk)
+    chunk = (kt + tgk * 4 - 1) // (tgk * 4)
+    nb = min((4 * chunk * 16 + 127) // 128, kt * 16 // 128)
+    src = chain_gu_source(Ks, cb, pf, pf2, blocks, limit, wpre, fq, alpha, beta, shared_skip)
+    xl = _XV_LOAD.replace("XV4", "half4")
+    xl = with_fq8(xl) if fq8 else xl
+    assert xl.count("x + o") >= 1
+    xl = xl.replace("(x + o)", "(xh + o)")
+    assert "(x + o)" not in xl
+    pro = (_FX_PRO.replace("BUTTERFLY", _BUTTERFLY).replace("RSQRT", RSQRT_HAD).replace("RFX_XLOAD", xl)
+           .replace("RFX_NB", str(nb)).replace("RFX_TOPK", str(topk) + "u"))
+    old = "const uint myn = ks0 < KT ? min(chunk, KT - ks0) : 0u;"
+    assert src.count(old) == 1
+    head, comp = pro.split("RFX_SPLIT")
+    if pf and not pf2:                                              # the first tile's trellis words are issued before the rot: their latency hides behind it
+        import re
+        pat = re.compile(r"if \(myn > 0u\) \{ [^}]*\}")
+        src, n = pat.subn(lambda m: m.group(0) + "\n    " + comp, src)
+        assert n == len(Ks)
+        src = src.replace(old, old + head)
+    else:
+        src = src.replace(old, old + head + comp)
+    old = "const device float4* xp0 = (const device float4*)(xh + ulong(zz) * KD + ks0 * 16);"
+    assert src.count(old) == 1
+    src = src.replace(old, "const threadgroup float4* xp0 = rfx + ((ks0 * 16 - rfx_a) >> 2);")
+    old = "const device float4* xp = xp0;"
+    assert src.count(old) == len(Ks)
+    return src.replace(old, "const threadgroup float4* xp = xp0;")
+
+

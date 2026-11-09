@@ -629,6 +629,8 @@ class VlmBackend(Backend):
             return super().replay(cache, tokens, draft)
         bc = self.batch([cache])
         p = bc[0].rows[0].offset
+        pipe = os.environ.get("KYOJIN_REPLAY_PIPE", "1") not in ("0", "")      # flag replay_pipe: the next group is built while the GPU runs this one
+        prev = None
         for i in range(0, len(tokens), 8):
             grp = [int(t) for t in tokens[i:i + 8]]
             ps = self.R.verify(self.model, bc, [grp])
@@ -636,7 +638,16 @@ class VlmBackend(Backend):
             if draft is not None:
                 self._feed_many([(draft, {l: t[:, 0] for l, t in ps.taps.items()}, p)])
             p += len(grp)
-            mx.eval(ps.logits, *bc[0].stacked_arrays(), *self._ring(draft))
+            arrs = (ps.logits, *bc[0].stacked_arrays(), *self._ring(draft))
+            if not pipe:
+                mx.eval(*arrs)
+                continue
+            mx.async_eval(*arrs)                         # same ops on the same stream, only the host wait moves: the bits are the ones of the synchronous loop
+            if prev is not None:
+                mx.eval(*prev)                           # at most one group in flight behind the one being built (bounds the lazy graph)
+            prev = arrs
+        if prev is not None:
+            mx.eval(*prev)
         return self.unbatch(bc, 1)[0]
 
     def make_cache(self):
@@ -668,6 +679,21 @@ class VlmBackend(Backend):
         """Flag pf_warm0: the first chunk's Engram rows into the page cache at admission (False when the model has no Engram tables)."""
         ah = getattr(self, "engram_ahead", None)
         return bool(ah is not None and ah.warm_first(ids, a, b))
+
+    def adopt_first_chunk(self, sid, ids, a: int, b: int) -> bool:
+        """Flag engram_adopt: the first chunk's Engram row jobs submitted at admission (False when the model has no Engram tables)."""
+        ah = getattr(self, "engram_ahead", None)
+        return bool(ah is not None and ah.adopt_first(sid, ids, a, b))
+
+    def adopt_select(self, sid, a: int, b: int) -> None:
+        ah = getattr(self, "engram_ahead", None)
+        if ah is not None:
+            ah.adopt_select(sid, a, b)
+
+    def adopt_drop(self, sid) -> None:
+        ah = getattr(self, "engram_ahead", None)
+        if ah is not None:
+            ah.adopt_drop(sid)
 
     def ced_can_skip(self, cache, next_rows: int) -> int:
         """ced_skip_dec: 0 = the chunk before a chunk of `next_rows` rows runs whole, else the flag's mode (1 = only where the engine takes no snapshot at that boundary,
@@ -710,6 +736,72 @@ class VlmBackend(Backend):
         mx.eval(lg, *self.state(cache), *self._ring(draft))
         self._free_handoff(cache)
         return lg
+
+    def cut_merge_ok(self, cache, rows: int) -> bool:
+        """Flag pf_cut_merge: whether a prompt chunk of `rows` rows on `cache` can run as one pass with the state at a cut captured inside it (kyojin_mlx.cutmerge).
+        Mode 1: not when the chunk would take the CED path (its midpoint calls the attention outside the wrapper); mode 2 runs those chunks exact."""
+        from .. import archs as _A, ced, cutmerge as CM, latent_tq, tq
+        m = CM.mode()
+        tq_latent = tq.config() is not None and latent_tq.latent_ok(self.lm)    # KYOJIN_TQ on DS4.1 only packs the compressed pool (fp4pool, covered); latent TQ caches are not
+        if not m or not cache or not _A.is_model_cache(cache[0]) or tq_latent or not hasattr(cache[0], "HANDOFF"):
+            return False
+        if m >= 3:
+            st = ced.state(self.lm)
+            return st is None or not st.force                  # mode 3 keeps the CED path (decoder half over tail + the rows past the cut); `force` makes n == tail a CED pass: split
+        return m >= 2 or not ced.rewrites_rows(self.lm, rows)
+
+    def _tap_keep(self) -> int:
+        for l in getattr(self.drafter, "tap_ids", ()):
+            return int(getattr(self.lm.layers[l], "_kyojin_tap_keep", 128))
+        return 128
+
+    def prefill_chunk_cut(self, cache, ids, k, draft=None):
+        """Flag pf_cut_merge: `prefill_chunk` of ids, one pass, that also returns the cache and the drafter ring as the split path holds them after the first k rows:
+        (logits, cache at the cut, draft at the cut). The live cache and draft end as after `prefill_chunk(cache, ids)`."""
+        import contextlib
+
+        from .. import ced, cutmerge as CM
+        CM.install(self.lm)
+        ent = cache[0]
+        p, n = int(ent.offset), len(ids)
+        dsnap = self.draft_snapshot(draft) if draft is not None else None
+        ent._cutm = CM.Cut(k, n)
+        if draft is not None:
+            ent.taps = {}
+            keep = self._tap_keep()
+            ent.taps_keep = keep + CM.TAIL_MAX
+        kw, exact = {}, contextlib.nullcontext()
+        st = ced.state(self.lm)
+        if CM.mode() >= 3 and st is not None and st.on:
+            # CED kept: the decoder half runs the split path's tail before the cut plus the rows after it; a pass with no more rows than that is no CED pass (as the split path's two chunks)
+            kw["ced_tail"] = st.tail + (n - k)
+            if n > kw["ced_tail"]:
+                ent._cutm.dec_n, ent._cutm.dec_k = kw["ced_tail"], st.tail
+        elif ced.rewrites_rows(self.lm, n):
+            exact = ced.exact(self.lm)
+        try:
+            with self.HL.last_row(), exact:
+                lg = self.lm(**self._forward_kw(ids, None), cache=cache, **kw).logits[:, -1].astype(mx.float32)
+        finally:
+            cm = ent.__dict__.pop("_cutm", None) if hasattr(ent, "__dict__") else None
+            ent.__dict__.pop("taps_keep", None)
+        taps = None
+        if draft is not None:
+            taps = ent.taps
+            del ent.taps
+        cut = CM.build(cache, cm, p, self.fork)
+        cdraft = None
+        if taps is not None:
+            ms = {l: t.shape[1] for l, t in taps.items()}             # rows per tap layer, ending at p + n (a CED pass: the decoder layers hold fewer)
+            mk = min(min(ms.values()), keep)
+            self._feed(draft, {l: t[0][-mk:] for l, t in taps.items()}, p + n - mk)
+            mc = min(min(ms.values()) - (n - k), keep)                # the taps of the rows before the cut
+            cdraft = self.draft_restore(dsnap)
+            if mc > 0:
+                self._feed(cdraft, {l: t[0][ms[l] - (n - k) - mc:ms[l] - (n - k)] for l, t in taps.items()}, k + p - mc)
+        mx.eval(lg, *self.state(cache), *self.state(cut), *self._ring(draft), *self._ring(cdraft))
+        self._free_handoff(cache)
+        return lg, cut, cdraft
 
     def _free_handoff(self, cache) -> None:
         """Flag kv_handoff_free (default 0): the cross-layer handoff of the pass is dead once the chunk is evaluated (kvledger.free_handoff)."""

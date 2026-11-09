@@ -22,11 +22,12 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .chat import ChatError, FAMILIES, family_of, token_cuts
+from .chat import ChatError, FAMILIES, family_of, render_resume, token_cuts
 from .sampling import Sampling
 from .tokinc import IncTok
 from . import autoconfig
 from . import hostloop as HL
+from . import loopguard as LG
 from .. import engram_rows as ER
 from .. import fired as FD
 from ..ds41_vision import VID_BASE
@@ -126,14 +127,33 @@ def usage_of(stats: dict, n_completion: int) -> dict:
             "prompt_tokens_details": {"cached_tokens": stats["cached_tokens"]}}
 
 
+TIMINGS_PERIOD_S = 1.0        # a streamed reply carries a partial `timings` at most this often
+
+
+def timings_from(queue_s: float, ttft_s: float, total_s: float, cached: int, prompt: int, n_completion: int) -> dict:
+    """One `timings` shape on every Kyojin server: the llama.cpp keys (prompt_n, prompt_ms, prompt_per_second, predicted_n, predicted_ms,
+    predicted_per_second, cache_n) plus this server's queue_s, ttft_s and total_s."""
+    gen = max(total_s - ttft_s, 1e-9)
+    pre = max(ttft_s - queue_s, 1e-9)
+    return {"queue_s": round(queue_s, 4), "ttft_s": round(ttft_s, 4), "total_s": round(total_s, 4),
+            "cache_n": cached, "prompt_n": prompt - cached, "prompt_ms": round(pre * 1000, 1),
+            "prompt_per_second": round((prompt - cached) / pre, 2),
+            "predicted_n": n_completion, "predicted_ms": round(gen * 1000, 1),
+            "predicted_per_second": round(max(n_completion - 1, 0) / gen, 2)}
+
+
 def timings_of(stats: dict, n_completion: int) -> dict:
-    gen = max(stats["total_s"] - stats["ttft_s"], 1e-9)
-    out = {"queue_s": round(stats["queue_s"], 4), "ttft_s": round(stats["ttft_s"], 4), "total_s": round(stats["total_s"], 4),
-           "cache_n": stats["cached_tokens"], "prompt_n": stats["prompt_tokens"] - stats["cached_tokens"],
-           "predicted_n": n_completion, "predicted_per_second": round(max(n_completion - 1, 0) / gen, 2)}
+    out = timings_from(stats["queue_s"], stats["ttft_s"], stats["total_s"], stats["cached_tokens"], stats["prompt_tokens"], n_completion)
     if stats.get("stages") is not None:                  # flag ttft_stages: the same ttft split into its stages (ms)
         out["ttft_stages"] = stats["stages"]
     return out
+
+
+def live_timings(s, now: float):
+    """The partial `timings` of a running session (None before its first token), same shape as timings_of, read from the engine's Session."""
+    if s is None or not s.t_first:
+        return None
+    return timings_from((s.t_start or s.t_first) - s.t_submit, s.t_first - s.t_submit, now - s.t_submit, s.cached, s.n_prompt, s.n_gen)
 
 
 def engage(backend=None) -> dict:
@@ -358,6 +378,11 @@ def make_handler(app: App):
 
         # ------------------------------------------------------------------------ completions
         def _completion(self, body: dict, chat: bool):
+            from .. import flags as FL
+            with FL.request_override(FL.check_request_flags(body.get("kyojin_flags"))):         # held until the reply is fully sent
+                self._completion_run(body, chat)
+
+        def _completion_run(self, body: dict, chat: bool):
             if (body.get("n") or 1) != 1:
                 raise ChatError("n must be 1")
             stream = body.get("stream") is True
@@ -366,7 +391,7 @@ def make_handler(app: App):
             stages = {} if ttft_on() else None               # flag ttft_stages: the stages this thread owns (render, tokenize)
             t_r = time.perf_counter()
             if chat:
-                rendered = app.family.render(body)
+                rendered = render_resume(app.family, body)
                 parser = app.family.parser(rendered)
             else:
                 cuts, spans, real_ids = [], None, None
@@ -395,11 +420,24 @@ def make_handler(app: App):
             app.count += 1
             rid = app.new_id("chatcmpl" if chat else "cmpl")
             created = int(time.time())
-            state = {"started": False}
+            state = {"started": False, "tm_at": time.perf_counter()}
+
+            def tick():
+                """At most once per TIMINGS_PERIOD_S, queue the partial timings for the next chunk of a streamed reply."""
+                now = time.perf_counter()
+                if stream and now - state["tm_at"] >= TIMINGS_PERIOD_S and (tm := live_timings(getattr(handle, "session", None), now)) is not None:
+                    state["tm"], state["tm_at"] = tm, now
+
+            def carry():
+                """No chunk took the queued timings (held text, tool-call XML): an empty delta carries them."""
+                if "tm" in state:
+                    self._sse(chunk(text="") if not chat else chunk())
             msg = {"content": [], "reasoning": [], "calls": []}
             obj_name = "chat.completion.chunk" if chat else "text_completion"
 
             def chunk(delta=None, finish=None, text=None, extra=None):
+                if "tm" in state:                                  # a progressive timings is due: it rides on the next chunk
+                    extra = {**(extra or {}), "timings": state.pop("tm")}
                 if chat:
                     c = {"index": 0, "delta": delta if delta is not None else {}, "finish_reason": finish}
                 else:
@@ -430,6 +468,32 @@ def make_handler(app: App):
                             self._sse(chunk({"tool_calls": [{"index": ev[1], "function": {"arguments": ev[2]}}]}))
 
             stats, reason = None, "stop"
+            lg = LG.ReplyGuard(parser) if chat else None             # flag loop_guard: thinking loops, EOS inside an open think block
+            if lg is not None and not lg.on:
+                lg = None                                            # (a prompt with images is guarded and resumed too: see resume())
+            n_carry = 0                                              # tokens of earlier engine requests of this reply
+
+            def resume(cause: str) -> bool:
+                """Close the think block (the template's close tag), then let the model write its answer in a new engine request that continues
+                the text so far. Once per reply; False = the caller ends the reply."""
+                nonlocal handle, n_carry
+                limit = app.max_tokens(body)
+                close = app.encode(LG.THINK_CLOSE)
+                if limit is not None and len(lg.gen) + len(close) >= limit:
+                    return False
+                if not lg.closes():
+                    return False
+                if not handle.cancelled.is_set():
+                    handle.cancel()
+                app.log(f"{rid[-6:]} loop guard: {cause} after {len(lg.gen)} tokens ({lg.hit or 'eos in think'}): think block closed")
+                emit([ev for t in close for ev in reply.push(t)])
+                n_carry = len(lg.gen) + len(close)
+                # A prompt with images keeps its virtual ids and its image spans (they sit before the reply, so they still hold); the real ids
+                # of the reply are the sampled ids themselves.
+                handle = app.engine.submit(ids + lg.gen + close, max_new=None if limit is None else limit - n_carry, sampling=sampling,
+                                           stop_ids=() if body.get("ignore_eos") is True else app.stop_ids, cuts=cuts, stages=stages,
+                                           vl=spans, real_ids=None if real_ids is None else real_ids + lg.gen + close)
+                return True
             try:
                 if stream:
                     self._sse_start()
@@ -444,26 +508,45 @@ def make_handler(app: App):
                             self.wfile.write(b": waiting\n\n")
                             self.wfile.flush()
                         continue
+                    was_think = lg is not None and LG.in_think(parser)
                     if ev[0] == "tok" and HL.COALESCE:           # everything the engine queued meanwhile: one write, one frame per token
                         toks, tail = HL.drain(handle.events, ev, queue.Empty)
                         FD.hit("serve_coalesce")
                         FD.hit("serve_coalesce_toks", len(toks))
                         self._pend = [] if stream else None
                         try:
-                            emit(HL.drain_events(reply, toks))
+                            tick()
+                            evs = HL.drain_events(reply, toks)
+                            emit(evs)
+                            carry()
                         finally:
                             self._sse_flush()
+                        if lg is not None and not reply.stopped and lg.observe(toks, evs, was_think):
+                            if resume("loop"):
+                                continue
+                            reply.stopped = True                 # a second loop: the reply ends here, with the text so far
                         if reply.stopped and not handle.cancelled.is_set():
                             handle.cancel()
                         if tail is not None:
                             reason, stats = tail[1], tail[2]
+                            if lg is not None and not reply.stopped and lg.eos_open(reason) and resume("eos"):
+                                continue
                             break
                     elif ev[0] == "tok":
-                        emit(reply.push(ev[1]))
+                        tick()
+                        evs = reply.push(ev[1])
+                        emit(evs)
+                        carry()
+                        if lg is not None and not reply.stopped and lg.observe([ev[1]], evs, was_think):
+                            if resume("loop"):
+                                continue
+                            reply.stopped = True
                         if reply.stopped and not handle.cancelled.is_set():
                             handle.cancel()
                     else:
                         reason, stats = ev[1], ev[2]
+                        if lg is not None and not reply.stopped and lg.eos_open(reason) and resume("eos"):
+                            continue
                         break
                 emit(reply.finish())
             except (BrokenPipeError, ConnectionResetError):
@@ -481,10 +564,13 @@ def make_handler(app: App):
             finish = "stop" if reply.stopped or reason == "cancelled" else reason
             if finish == "stop" and msg["calls"]:
                 finish = "tool_calls"
+            if n_carry:                                          # a resumed reply: the usage covers the whole text, not the last engine request
+                stats = {**stats, "prompt_tokens": len(ids), "completion_tokens": stats["completion_tokens"] + n_carry}
             n_comp = reply.n_tokens if reply.stopped else stats["completion_tokens"]
             usage, timings = usage_of(stats, n_comp), timings_of(stats, n_comp)
             app.log(f"{rid[-6:]} {'chat' if chat else 'cmpl'} prompt={stats['prompt_tokens']} cached={stats['cached_tokens']} gen={n_comp} "
-                    f"queue={stats['queue_s']:.2f}s ttft={stats['ttft_s']:.2f}s total={stats['total_s']:.2f}s {finish}")
+                    f"queue={stats['queue_s']:.2f}s ttft={stats['ttft_s']:.2f}s total={stats['total_s']:.2f}s "
+                    f"prefill={timings['prompt_per_second']:.1f} tok/s decode={timings['predicted_per_second']:.1f} tok/s {finish}")
             if stream:
                 self._sse(chunk(finish=finish, extra={"timings": timings}))
                 if include_usage:
@@ -704,6 +790,10 @@ def build_app(args, log=print):
     stops = stop_token_ids(args.model, cfg, tok, fam_name)
     bos = cfg.get("bos_token_id", cfg.get("text_config", {}).get("bos_token_id"))
     engine.bad_ids = frozenset({bos} - stops) if isinstance(bos, int) else frozenset()
+    tg = [tok.convert_tokens_to_ids(x) for x in ("<think>", "</think>")]   # flag spec_typical_phase: the think tags, when the tokenizer has them as single tokens
+    if all(isinstance(i, int) and i >= 0 and i != tok.unk_token_id for i in tg):
+        engine.think_ids = (tg[0], tg[1])
+    engine.detok = lambda ids: tok.decode(ids, skip_special_tokens=False)   # flag spec_typical_cooldown: the line signal reads the session's text
     app = App(engine, tok, family, model_id, defaults, stops, log)
     return app
 

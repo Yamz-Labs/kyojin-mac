@@ -194,11 +194,12 @@ def install_taps(model, layer_ids, keep: int = 128) -> int:
         def __call__(self, h, pre_mix, image_mask, cache, _prev=cls.__call__, _keep=keep):
             tp = getattr(cache, "taps", None)
             if tp is not None:
-                tp[self.layer_idx] = h[:, -_keep:].mean(axis=2)
+                tp[self.layer_idx] = h[:, -getattr(cache, "taps_keep", _keep):].mean(axis=2)          # taps_keep: flag pf_cut_merge keeps more rows for one pass
             return _prev(self, h, pre_mix, image_mask, cache)
 
         blk.__class__ = type(cls.__name__, (cls,), {"__call__": __call__, "__module__": cls.__module__})
         blk._kyojin_tap = True
+        blk._kyojin_tap_keep = keep
         n += 1
     if n:
         from . import bound_layers as BL

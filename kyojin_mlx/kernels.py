@@ -232,6 +232,35 @@ class Mul1Gemv:
                      source=S.fused_source(self.K, rows, dcb, ih, fq8, xsr, FUSED_PREFETCH, half=half, sync=sync, reads=reads))
         return (False, kern, tmpl, grid, tg, shapes, dts)
 
+    def can_fuse_glu(self, rows: int) -> bool:
+        """fused_glu applies: the one-launch fused kernel with its prologue (not the ROT2 two-launch form)."""
+        return self.can_fuse(rows) and self.blocks < ROT2_MIN_BLOCKS
+
+    def fused_glu(self, g: mx.array, u: mx.array, limit: float) -> mx.array:
+        """fused(fq8(act)) with act = silu(min(g, L)) * clip(u, -L, L) cast to fp16, computed in the prologue (no separate activation launch). g, u: (rows, k) fp16.
+        Bit-identical to the swiglu launch followed by fused(act, fq8=True). Only when can_fuse_glu(rows)."""
+        rows = g.shape[0]
+        dcb = self.dcb = S.dense_cb(self.cb)
+        half = self._half_on(rows)
+        key = (rows, "glu", float(limit), half, dcb, TAIL_READS)
+        ent = self._fc.get(key)
+        if ent is None:
+            xsr = S.fused_dims(self.kt, self.tgk)
+            hk = (S.HALF_FLUSH,) if half else ()
+            kern = _kern(("fusedglu", self.K, rows, dcb, float(limit), xsr, FUSED_PREFETCH, TAIL_SYNC, TAIL_READS) + hk,
+                         name=f"kyojin_{dcb}_fusedglu_k{self.K}_m{rows}_x{xsr}_p{int(FUSED_PREFETCH)}{_synctag(TAIL_SYNC)}{_readstag(TAIL_READS)}{'_hf%d' % S.HALF_FLUSH if hk else ''}",
+                         input_names=["x", "u", "suh", "svh", "trellis", "params", "ctr"], output_names=["part", "y"], header=S.dense_header(dcb),
+                         source=S.fused_source(self.K, rows, dcb, True, True, xsr, FUSED_PREFETCH, half=half, sync=TAIL_SYNC, reads=TAIL_READS, glu=float(limit)))
+            ent = self._fc[key] = (kern, [("BITS", self.K), ("MR", rows), ("OT", self.out_dtype)], (self.blocks * 256, self.tgk, 1), (256, 1, 1),
+                                   [(self.tgk, rows, self.n), (rows, self.n)], [mx.float32, self.out_dtype])
+        kern, tmpl, grid, tg, shapes, dts = ent
+        n = self._fnext
+        params = self._fparams[n]
+        self._fnext = n + 1 if n + 1 < self.FUSED_SETS else 0
+        FD.hit("shared_glu")
+        return kern(inputs=[g, u, self._fsuh, self._fsvh, CB.bind(self.words, self.bview), params, self._fctr], template=tmpl, grid=grid, threadgroup=tg,
+                    output_shapes=shapes, output_dtypes=dts)[1]
+
     def fused(self, x: mx.array, fq8: bool = False) -> mx.array:
         """rot + GEMV + finalize in one launch (see metal_src.fused_source); bit-identical to __call__. x: (rows, k) fp16 / fp32, rows == self.rows.
         A linear with ROT2_MIN_BLOCKS or more column blocks (wq_b, wo_b: the prologue would be repeated by every column block) takes two launches:

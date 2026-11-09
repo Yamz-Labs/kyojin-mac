@@ -15,7 +15,7 @@ import os
 import mlx.core as mx
 from .modeldesc import KERNEL as KG
 
-from . import ablit as AB, fuse_attn as FA, wcache as WC
+from . import ablit as AB, ablate as AZ, fuse_attn as FA, wcache as WC
 
 NH = int(os.environ.get("KYOJIN_PF_GLUE_NH", "2"))                  # heads per threadgroup
 ENABLED = os.environ.get("KYOJIN_PF_GLUE", "1") != "0"
@@ -200,6 +200,22 @@ def combine(y: mx.array, shared: mx.array) -> mx.array:
 
 SHARED_MLP = os.environ.get("KYOJIN_SHARED_MLP_FUSE", "1") != "0"      # shared expert: swiglu and its cast to the stream dtype in one compiled launch
 _swiglu_cast = {}
+SHARED_GLU = os.environ.get("KYOJIN_SHARED_GLU", "0") not in ("0", "")      # flag shared_glu: decode rows of the shared expert run swiglu + fp8 round trip inside the down EXL3 GEMV's prologue (one launch fewer per layer)
+
+
+def glu_down(dn, g, u, limit: float, rows: int):
+    """down(fq8(swiglu(g, u))) as ONE launch when `dn` is a plain fused EXL3 linear and (g, u) are fp16 (rows, k) decode outputs; None = the caller runs the stock chain."""
+    from . import exl3_linear as EL, fqfuse as FQF, kernels as KN
+    if type(dn) is not EL.Exl3Linear or dn._bias is not None or dn._weff is not None or dn.out_dtype != mx.float16 or not (EL.LINEAR_FUSED and EL.LF_MASK & 1):
+        return None
+    if EL.MMA_ROWS == 1 or rows > EL.GEMV_MAX_ROWS or rows > KN.MAX_ROWS or g.dtype != mx.float16 or u.dtype != mx.float16 or g.shape != u.shape or g.shape[-1] % 128:
+        return None
+    if not FQF.ENABLED or not _fq_on():
+        return None
+    gv = dn._g.get(rows) or dn._gemv(rows)
+    if not gv.can_fuse_glu(rows):
+        return None
+    return gv.fused_glu(g.reshape(rows, -1), u.reshape(rows, -1), float(limit))
 
 
 def _swiglu_h(limit: float, dt):
@@ -225,10 +241,20 @@ def _impl_shared_mlp(orig):
     L = _A.lang()
 
     def __call__(self, x):
+        if AZ.ACTIVE and AZ.on("moe_shared") and x.ndim == 3 and x.shape[1] == 1:       # ablate: zeros of the shared expert's output
+            AZ.hit("moe_shared")
+            return AZ.zeros_like_shape(x.shape, x.dtype)
         if not SHARED_MLP or x.dtype not in (mx.float16, mx.bfloat16):
             return orig(self, x)
         dtype = x.dtype
         x = L.fake_quant_fp8_ue8m0(x)
+        if SHARED_GLU and dtype == mx.float16:
+            rows = x.size // x.shape[-1]
+            gate, up = self.gate_proj(x), self.up_proj(x)
+            y = glu_down(self.down_proj, gate, up, self.swiglu_limit, rows)
+            if y is not None:
+                return y.reshape(*x.shape[:-1], y.shape[-1])
+            return self.down_proj(L.fake_quant_fp8_ue8m0(_swiglu_h(self.swiglu_limit, dtype)(gate, up)))
         activated = _swiglu_h(self.swiglu_limit, dtype)(self.gate_proj(x), self.up_proj(x))
         return self.down_proj(L.fake_quant_fp8_ue8m0(activated))
     return __call__

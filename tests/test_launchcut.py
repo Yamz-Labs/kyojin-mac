@@ -214,6 +214,7 @@ def _census(tmp_path, rows):
     env = dict(os.environ, KYOJIN_VLM_PKG=vlm, PYTHONPATH=os.pathsep.join([ROOT, vlm]))
     for k in ("KYOJIN_LAUNCHCUT", "KYOJIN_PORT_SUGLUE", "KYOJIN_LAUNCHCUT_SKIP"):
         env.pop(k, None)
+    env["KYOJIN_MOE_CHAIN"] = "0"                                          # the census counts the per-op MoE launches (moe_chain folds 2 of them)
     cmd = [sys.executable, os.path.join(ROOT, "tools", "launchcut_census.py"), "--layers", "6", "--arms", "sg,lc", "--moe", "--steps", "1", "--json", str(out)]
     if rows > 1:
         cmd += ["--rows", str(rows)]

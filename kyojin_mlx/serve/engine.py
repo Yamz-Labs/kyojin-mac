@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import bisect
 import collections
+import dataclasses
 import json
 import math
 import os
@@ -68,12 +69,14 @@ import numpy as np
 
 from .sampling import Sampling, sample_rows
 from . import hostloop as HL
+from . import loopguard as LG
 from . import pysample as PS
 from . import roundlog as RLOG
 from .. import dspol as DSPOL
 from .. import dspol2 as DSP2
 from .. import fired as FD
 from .. import specsam as SPECSAM
+from .. import taps as TAPS
 from .. import hostsync as HS
 from .. import gpuspan as GS
 from .. import plainsplit as PLS
@@ -224,6 +227,7 @@ class Handle:
         self.events = HL.new_queue()                    # ("tok", id) per token, then ("done", reason, stats)
         self.cancelled = threading.Event()
         self._engine = engine
+        self.session = None                  # set by submit(): the HTTP thread reads its timing fields for the progressive `timings`
 
     def cancel(self) -> None:
         self.cancelled.set()
@@ -302,6 +306,17 @@ class Session:
     lk_ema: float = 0.0                     # accepted lookup drafts per lookup round (decayed; drifts back on MTP rounds)
     mt_ema: float = 0.0                     # accepted MTP drafts per MTP round (decayed)
     lk_streak: bool = False                 # the last lookup round landed every draft
+    th_in: bool = False                     # flag spec_typical_phase: the generation is inside an open think block (valid up to out[:th_n])
+    cd_n: int = 0                           # flag spec_typical_cooldown: tokens of `out` fed to the line watch
+    cd_end: int = 0                         # the exact-acceptance window runs while len(out) < cd_end
+    cd_win: int = 0                         # the current window (0 = never triggered)
+    cd_last: int = -1                       # len(out) at the last trigger
+    cd_watch: object = None                 # loopguard.LineWatch, created on first use
+    rw_cut: int = -1                        # flag spec_typical_rewind: index in `out` the session rewinds to after this round's tokens (-1 = none pending)
+    rw_n: int = 0                           # rewinds done in this reply
+    rw_tok: int = 0                         # tokens dropped by those rewinds (generated, then removed from the context)
+    rw_drop: bool = False                   # the next park drops the cache: the session is rebuilt from the prompt + its kept output
+    th_n: int = -1                          # tokens of `out` folded into th_in (-1 = not started: th_in comes from the prompt)
     lk_full_n: int = 0                      # ... and how many consecutive lookup rounds did (flag lookup_confirm)
     lk_adapt: object = None                 # flag spec_lookup_adapt: pld.SuffixBuckets (short-suffix acceptance), created on first use
     lk_suffix: int = 0                      # agreement of the lookup draft planned for this round (read by _spec_update)
@@ -354,6 +369,14 @@ class PrefixCache:
         self.too_big = 0                            # snapshots not kept because one alone is over the budget (a long prefix: the next session prefills it again)
         self.off_grid_skipped = 0                   # flag pf_share: snapshots passed over because their length is not on the asking prompt's grid
         self.disk_hits = self.disk_hit_tokens = self.disk_saved = self.disk_errors = 0
+        self.evicted: collections.OrderedDict = collections.OrderedDict()   # digest of an entry dropped by `shrink` -> length (bounded: EVICTED_KEEP); why a lookup missed
+        self.fam: collections.OrderedDict = collections.OrderedDict()       # digest of a prompt's first block -> (prompt length, {length: digest}) of the last prompt asked (bounded: FAM_KEEP)
+        self.reasons = collections.Counter()        # lookups by miss reason (status: prefix_reasons)
+        self._first = True                          # no lookup since the process started
+        self._keys = None                           # the prefix digests _lookup_memory computed for the prompt being asked (reused by the reason, no second hash)
+
+    EVICTED_KEEP = 4096
+    FAM_KEEP = 64
 
     @staticmethod
     def hasher():
@@ -368,7 +391,9 @@ class PrefixCache:
         self.last_draft = None
         self.last_sig = None
         self.refused = 0
+        self._keys = None
         b, cache = self._lookup_memory(ids, ok, grid)
+        tier = "mem" if b else "none"
         if self.disk is not None:
             hit = self._lookup_disk(ids, above=b + self.block // 4, ok=ok)
             if hit is not None and grid is not None and not grid(hit[0], None):
@@ -377,19 +402,84 @@ class PrefixCache:
                 self.last_sig = None     # a disk load costs ~0.85 s on the served 190 GiB model (~2300 tokens of prefill): below that gain, prefill is faster
             if hit is not None:
                 b, cache = hit
+                tier = "disk"
         self.fallbacks += bool(self.refused)
         if b:
             self.hits += 1
         else:
             self.misses += 1
+        try:
+            self._log_lookup(ids, b, tier)
+        except Exception:                                               # noqa: BLE001  (a diagnostic line never costs the request)
+            pass
         return b, cache
+
+    def _log_lookup(self, ids: list, hit: int, tier: str) -> None:
+        """One log line per request: `prefix: prompt=N hit=H tier=mem|disk|none reason=...`. reason: hit | new (no earlier prompt shares the first block) |
+        diverged (the last prompt that shared the first block differs at a token D in (lo, hi], block-granular; its length is logged) | evicted (the longest prefix
+        of this prompt was a cache entry that `shrink` dropped) | restart (first request since the process started, nothing on disk) | unstored (the last
+        prompt of the family is a prefix of this one but no entry holds it) | short (no block boundary below the prompt). The digests are the ones the memory
+        lookup already computed; on an empty memory tier they are hashed here (a miss pays seconds of prefill)."""
+        n = len(ids)
+        keys = self._keys
+        if keys is None and n > self.block:
+            keys = prefix_digests(ids, sorted({*range(self.block, n, self.block), *(b for b in self.off if b < n)}))
+        mine = dict(keys) if keys else {}
+        first = keys[0][1] if keys else None
+        extra = ""
+        if hit:
+            reason = "hit"
+        elif first is None:
+            reason = "short"
+        else:
+            ev = next((k for k in reversed(keys) if k in self.evicted), None)
+            fam = self.fam.get(first)
+            if ev is not None:
+                reason, extra = "evicted", f" evicted_len={ev[0]}"
+            elif self._first:
+                reason = "restart"
+            elif fam is not None:
+                plen, prev = fam
+                common = sorted(set(prev) & set(mine))
+                bad = next((L for L in common if prev[L] != mine[L]), None)
+                if bad is None:
+                    reason = "unstored"
+                else:
+                    ok_ = [L for L in common if L < bad]
+                    reason, extra = "diverged", f" D_in=({ok_[-1] if ok_ else 0},{bad}] entry_len={plen}"
+            else:
+                reason = "new"
+        self._first = False
+        self.reasons[reason] += 1
+        if first is not None:
+            self.fam[first] = (n, mine)
+            self.fam.move_to_end(first)
+            while len(self.fam) > self.FAM_KEEP:
+                self.fam.popitem(last=False)
+        self.log(f"prefix: prompt={n} hit={hit} tier={tier} reason={reason}{extra}")
+
+    def peek(self, ids: list, ok=None, grid=None) -> int:
+        """Length `lookup` would answer from the memory tier, without restoring or touching the LRU (0 = none). The disk tier is not asked: a longer disk hit makes
+        the caller's guess wrong, which flag engram_adopt turns into a plain miss."""
+        n = len(ids)
+        if self.budget <= 0 or not self.entries:
+            return 0
+        lens = sorted({*range(self.block, n, self.block), *(b for b in self.off if b < n)})
+        for key in reversed(prefix_digests(ids, lens)):
+            if key in self.entries:
+                if grid is not None and not grid(key[0], self.sigs.get(key)):
+                    continue
+                if key in self.stale and (ok is None or not ok(key[0])):
+                    continue
+                return key[0]
+        return 0
 
     def _lookup_memory(self, ids: list, ok=None, grid=None):
         n = len(ids)
         if self.budget <= 0 or not self.entries:
             return 0, None
         lens = sorted({*range(self.block, n, self.block), *(b for b in self.off if b < n)})     # b < n: at least one token is left to prefill
-        keys = prefix_digests(ids, lens)
+        keys = self._keys = prefix_digests(ids, lens)
         for key in reversed(keys):
             e = self.entries.get(key)
             if e is not None:
@@ -462,6 +552,7 @@ class PrefixCache:
                 billed += nb if r[0] == 0 else 0
                 r[0] += 1
         self.entries[key] = (snap, own, dsnap)
+        self.evicted.pop(key, None)
         if sig is not None:
             self.sigs[key] = sig
         if key[0] % self.block:
@@ -498,6 +589,9 @@ class PrefixCache:
                 if self.off[n] <= 0:
                     del self.off[n]
             self._release(key, sz)
+            self.evicted[key] = n                                       # remembered (bounded) so a later miss can say "evicted"
+            if len(self.evicted) > self.EVICTED_KEEP:
+                self.evicted.popitem(last=False)
             dropped = True
         return dropped
 
@@ -532,6 +626,157 @@ class Engine:
     def _spec_rs(self) -> bool:
         """Draw the drafts from the draft head's own q and verify them by rejection sampling (flag spec_rs; read per round)."""
         return os.environ.get("KYOJIN_SPEC_RS", "0") != "0"
+
+    def _samp(self, s):
+        """The session's sampling for the next token(s) (flag think_temperature, read per round): while the session is inside an open think block its
+        temperature is the flag value (top_p / top_k / min_p unchanged), else the request's. Off (empty), greedy sessions and the answer return s.sampling itself."""
+        v = os.environ.get("KYOJIN_THINK_TEMPERATURE", "")
+        if not v or s.sampling.greedy or self.think_ids is None:
+            return s.sampling
+        try:
+            tt = float(v)
+        except ValueError:
+            return s.sampling
+        if tt <= 0.0 or tt == s.sampling.temperature or not self._in_think(s):
+            return s.sampling
+        return dataclasses.replace(s.sampling, temperature=tt)
+
+    think_ids = None                    # (open id, close id) of the model's think tags, set by the serve layer; None = the model has no thinking block
+
+    def _in_think(self, s) -> bool:
+        """The session's next token is generated inside an open think block (flag spec_typical_phase). The state starts from the prompt (its last think
+        tag; a prompt ending in the open tag starts inside) and then folds in only the tokens committed since the last call: O(new tokens) per round."""
+        ti = self.think_ids
+        if ti is None:
+            return False
+        op, cl = ti
+        if s.th_n < 0:
+            s.th_in, s.th_n = False, 0
+            ids = s.ids
+            for i in range(len(ids) - 1, -1, -1):
+                if ids[i] == op or ids[i] == cl:
+                    s.th_in = ids[i] == op
+                    break
+        out = s.out
+        for i in range(s.th_n, len(out)):
+            t = out[i]
+            if t == op:
+                s.th_in = True
+            elif t == cl:
+                s.th_in = False
+        s.th_n = len(out)
+        return s.th_in
+
+    detok = None                        # ids -> text, set by the serve layer (flag spec_typical_cooldown line signal); None = only the repetition signal
+
+    @staticmethod
+    def _cooldown() -> int:
+        """Flag spec_typical_cooldown (tokens; 0 = off), read per round."""
+        try:
+            return max(0, int(os.environ.get("KYOJIN_SPEC_TYPICAL_COOLDOWN", "2048") or 0))
+        except ValueError:
+            return 0
+
+    def _cd_trigger(self, s, base: int) -> bool:
+        """An early loop signal: exact acceptance for the next window of tokens; a re-trigger while armed or in the window after doubles it (cap 16384)."""
+        n = len(s.out)
+        if s.cd_last >= 0 and n - s.cd_last < 64:                  # one loop shows many signals: the same burst counts once
+            return False
+        win = min(2 * s.cd_win, 16384) if s.cd_win and n < s.cd_end + s.cd_win else base
+        s.cd_win, s.cd_end, s.cd_last = win, n + win, n
+        self.stats["spec_typical_cooldown_triggers"] += 1
+        self.stats["spec_typical_cooldown_tokens"] += win
+        return True
+
+    def _cd_armed(self, s, base: int) -> bool:
+        """Feed the session's new tokens to the line watch (O(new tokens)), then say whether its cooldown window is open."""
+        out = s.out
+        if self.detok is not None and len(out) > s.cd_n:
+            if s.cd_watch is None:
+                s.cd_watch = LG.LineWatch()
+            new = out[s.cd_n:]
+            s.cd_n = len(out)
+            try:
+                hit = s.cd_watch.feed(self.detok(list(new)))
+            except Exception:
+                hit = False
+            if hit and self._cd_trigger(s, base) and self._rewind_cap(s):
+                self._rw_mark(s, self._rw_char_to_tok(s, s.cd_watch.first_at))   # flag spec_typical_rewind: back to just before the first copy of the line
+        return len(out) < s.cd_end
+
+    @staticmethod
+    def _rewind() -> int:
+        """Flag spec_typical_rewind (max rewinds per reply; 0 = off), read per round."""
+        try:
+            return max(0, int(os.environ.get("KYOJIN_SPEC_TYPICAL_REWIND", "3") or 0))
+        except ValueError:
+            return 0
+
+    def _rewind_cap(self, s) -> bool:
+        """A rewind is possible for s: flag on, under the cap, a think block known, a backend that can rebuild a dropped cache, a text session."""
+        return (self.think_ids is not None and self._rewind() > s.rw_n and hasattr(getattr(self, "backend", None), "replay") and not getattr(s, "vl", False))
+
+    @staticmethod
+    def _rw_mark(s, cut) -> None:
+        if cut is not None and cut >= 1:
+            s.rw_cut = cut if s.rw_cut < 0 else min(s.rw_cut, cut)
+
+    def _rw_char_to_tok(self, s, off):
+        """Largest token count m with len(text of out[:m]) <= off: the token boundary at or before char offset `off` of the session's output."""
+        if off is None or self.detok is None:
+            return None
+        lo, hi = 0, len(s.out)
+        try:
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if len(self.detok(list(s.out[:mid]))) <= off:
+                    lo = mid
+                else:
+                    hi = mid - 1
+        except Exception:
+            return None
+        return lo
+
+    def _rw_apply(self, s) -> bool:
+        """Flag spec_typical_rewind, after the round's tokens are committed: drop out[cut:] from the session (model context, line watch, lookup index, think state),
+        advance its sampling key, and send it through the dropped-cache path (prompt prefix + replay of the kept output). True when the session was rewound.
+        Refused (the cooldown alone applies) when the session is not inside an open think block, when a think tag lies in the dropped span, or when under the cap no more."""
+        cut, s.rw_cut = s.rw_cut, -1
+        if cut < 1 or cut >= len(s.out) or not self._rewind_cap(s) or not self._in_think(s):
+            return False
+        ti = self.think_ids
+        if any(t == ti[0] or t == ti[1] for t in s.out[cut:]):         # never across a think tag
+            return False
+        n = len(s.out) - cut
+        del s.out[cut:]
+        s.last = s.out[-1]
+        s.n_gen -= n                                                   # positions follow the context; the usage count follows rw_tok
+        s.rw_tok += n
+        s.rw_n += 1
+        s.th_n = -1                                                    # the think state is folded again from the prompt and the kept output
+        s.cd_watch, s.cd_n = None, 0                                   # the line watch restarts on the kept prefix
+        s.cd_end, s.cd_last = cut + s.cd_win, cut                      # exact acceptance from here for the (possibly doubled) window
+        s.lookup_index = None
+        s.lk_streak = False
+        for _ in range(1 + s.rw_n):                                    # the same draws must not come back: advance the key past the rewound rounds
+            self._next_key(s)
+        s.rw_drop = True
+        self.stats["spec_typical_rewinds"] += 1
+        self.stats["spec_typical_rewound_tokens"] += n
+        return True
+
+    def _typical(self):
+        """(eps, delta, hmax) of the relaxed acceptance (flag spec_typical; read per round), None when off or unparsable. hmax = flag spec_typical_hmax, None when off."""
+        if os.environ.get("KYOJIN_SPEC_TYPICAL", "0") in ("0", ""):
+            return None
+        try:
+            hm = os.environ.get("KYOJIN_SPEC_TYPICAL_HMAX", "").strip()
+            hmax = float(hm) if hm else None
+            if hmax is not None and (hmax == float("inf") or hmax != hmax):
+                hmax = None
+            return (max(0.0, float(os.environ.get("KYOJIN_SPEC_TYPICAL_EPS", "0.09"))), max(0.0, float(os.environ.get("KYOJIN_SPEC_TYPICAL_DELTA", "0.3"))), hmax)
+        except ValueError:
+            return None
 
     @property
     def _spec_couple(self) -> int:
@@ -573,6 +818,11 @@ class Engine:
     def _pf_warm0(self) -> bool:
         """Flag pf_warm0 (read per call): the first prefill chunk's Engram rows are read into the page cache when the request is admitted."""
         return os.environ.get("KYOJIN_PF_WARM0", "0") not in ("0", "")
+
+    @property
+    def _engram_adopt(self) -> bool:
+        """Flag engram_adopt (read per call): the first prefill chunk's Engram row jobs are submitted when the request is admitted and adopted by the chunk (replaces pf_warm0)."""
+        return os.environ.get("KYOJIN_ENGRAM_ADOPT", "0") not in ("0", "")
 
     @property
     def _pf_share(self) -> bool:
@@ -833,7 +1083,7 @@ class Engine:
         self.stats = collections.Counter()
         self.bad_ids = frozenset()                                   # server: the begin-of-text id when it is not also a stop id
         for _k in ("spec_lookup_rounds", "spec_lookup_drafted", "spec_lookup_accepted", "spec_skip_rounds", "spec_skip_held", "spec_lookup_short_drafted", "spec_lookup_short_accepted",
-                   "spec_lookup_match", "spec_lookup_nomatch", "spec_lookup_short", "spec_lookup_refused", "spec_gate_cut", "spec_block_cut", "spec_lazy_rounds", "spec_eager_rounds",
+                   "spec_lookup_match", "spec_lookup_nomatch", "spec_lookup_short", "spec_lookup_refused", "spec_gate_cut", "spec_typical_relaxed", "spec_typical_rep_refused", "spec_typical_cooldown_triggers", "spec_typical_cooldown_tokens", "spec_typical_rewinds", "spec_typical_rewound_tokens", "spec_typical_think_skipped", "spec_block_cut", "spec_lazy_rounds", "spec_eager_rounds",
                    "spec_oracle_rounds", "spec_oracle_drafted", "spec_oracle_accepted", "spec_oracle_miss", "spec_oracle_resync",
                    "spec_gate_adapt_rounds", "spec_gate_adapt_up",
                    "mix_slice_rounds", "t_pf_inline_decode", "floor_bursts", "floor_burst_rounds", "share_hits", "share_tokens", "share_seeds", "share_takers", "share_refused_budget", "share_tied", "share_held",
@@ -890,6 +1140,7 @@ class Engine:
         sampling = sampling or Sampling()
         h = Handle(self)
         s = Session(next(self._ids), list(ids), limit, sampling, frozenset(stop_ids), h, cuts=tuple(sorted({int(c) for c in cuts if 0 < int(c) < len(ids)})))
+        h.session = s
         if vl:
             s.vl, s.rids = vl, list(real_ids)
         s.stages = dict(stages or {}) if (stages is not None or ttft_on()) else None
@@ -907,11 +1158,11 @@ class Engine:
         p = self.prefix
         return {"sessions": self.sessions, "waiting": len(self.waiting) + len(self._inbox), "prefilling": len(self.prefilling),
                 "decoding": len(self.members) + len(self.ready), "prefix_entries": len(p.entries), "prefix_bytes": p.bytes,
-                "prefix_hits": p.hits, "prefix_misses": p.misses, "peak_gb": round(mx.get_peak_memory() / 2 ** 30, 3),
+                "prefix_hits": p.hits, "prefix_misses": p.misses, "prefix_reasons": dict(p.reasons), "peak_gb": round(mx.get_peak_memory() / 2 ** 30, 3),
                 "active_gb": round(mx.get_active_memory() / 2 ** 30, 3), "cache_gb": round(mx.get_cache_memory() / 2 ** 30, 3), "mtp_depth": self.mtp_depth,
                 "kv_budget_gb": None if self.kv_budget is None else round(self.kv_budget / 2 ** 30, 3),
                 "kv_gb": round(self.kv_bytes() / 2 ** 30, 4), "kv_peak_gb": round(self.kv_peak / 2 ** 30, 4),
-                "kv_bytes": self.kv_bytes(), "kv_peak_bytes": self.kv_peak, "bound_submits": _bound_submits(), **self._kv_roles(), **self.stats, **({} if self._tuner is None else {"tuner_ms": {n: {a: round(r * 1e3, 1) for a, r in d.items()} for n, d in self._tuner.cost.items()}}),
+                "kv_bytes": self.kv_bytes(), "kv_peak_bytes": self.kv_peak, "bound_submits": _bound_submits(), **self._kv_roles(), **self.stats, **({} if TAPS.router_snapshot() is None else {"router_tap": TAPS.router_snapshot()}), **({} if self._tuner is None else {"tuner_ms": {n: {a: round(r * 1e3, 1) for a, r in d.items()} for n, d in self._tuner.cost.items()}}),
                 **({} if not self._spec_ladder else {"spec_ladder": {**self._ladder.snapshot(), **({"by_n": {str(n): l.snapshot() for n, l in self._ladders.items()}} if self._ladders else {})}}),
                 **({} if p.disk is None else {"disk_ns": p.disk.ns, "disk_files": len(p.disk.index), "disk_bytes": p.disk.bytes(), "disk_hits": p.disk_hits,
                                               "disk_hit_tokens": p.disk_hit_tokens, "disk_saved": p.disk_saved, "disk_errors": p.disk_errors})}
@@ -1018,6 +1269,8 @@ class Engine:
             self._spec_tick()
         else:
             self._decode_tick()
+        if TAPS.R.acc:                                              # flag router_tap: fold the device accumulators into the host counters
+            TAPS.router_flush()
         if self._gpu_span:
             GS.end(self.stats, (self.stats.get("spec_rows", 0) - r0) or 1)
         if tun is not None and self._all_greedy():
@@ -1201,7 +1454,13 @@ class Engine:
             else:
                 s.t_start = time.perf_counter()
                 self.prefilling.append(s)
-                if self._pf_warm0 and not s.resume:
+                if self._engram_adopt and not s.resume and not s.vl:
+                    af = getattr(self.backend, "adopt_first_chunk", None)
+                    if af is not None:
+                        a0 = self.prefix.peek(s.ids, self._stale_ok(s), self._on_grid(s) if self._pf_path else None)
+                        if af(s.sid, s.rids, a0, self._chunk_end(s, a0, len(s.ids))):
+                            self.stats["engram_adopt_made"] += 1
+                elif self._pf_warm0 and not s.resume:
                     wf = getattr(self.backend, "warm_first_chunk", None)
                     if wf is not None and wf(s.rids, 0, self._chunk_end(s, 0, len(s.ids))):
                         self.stats["pf_warm0"] += 1
@@ -1213,10 +1472,13 @@ class Engine:
                 self._finish(s, "cancelled")
 
     def _finish(self, s: Session, reason: str) -> None:
+        ad = getattr(self.backend, "adopt_drop", None)
+        if ad is not None and s.sid is not None:
+            ad(s.sid)                                                # flag engram_adopt: a session that never reached its first chunk frees its row jobs
         s.t_done = time.perf_counter()
         s.cache = s.draft = None
         t_first = s.t_first or s.t_done
-        stats = {"prompt_tokens": s.n_prompt, "completion_tokens": s.n_gen, "cached_tokens": s.cached,
+        stats = {"prompt_tokens": s.n_prompt, "completion_tokens": s.n_gen + s.rw_tok, "cached_tokens": s.cached,
                  "queue_s": (s.t_start or s.t_done) - s.t_submit, "ttft_s": t_first - s.t_submit, "total_s": s.t_done - s.t_submit}
         if s.stages is not None:                                     # flag ttft_stages: every stage of the time to first token
             s.stages["queue_ms"] = round(((s.t_start or s.t_done) - s.t_submit) * 1e3, 3)
@@ -1263,7 +1525,7 @@ class Engine:
         s.last = tok
         s.out.append(tok)
         s.handle.events.put(("tok", tok))
-        if s.n_gen >= s.max_new or s.n_prompt + s.n_gen >= self.ctx:
+        if s.n_gen + s.rw_tok >= s.max_new or s.n_prompt + s.n_gen >= self.ctx:
             return "length"
         return None
 
@@ -1513,6 +1775,9 @@ class Engine:
             s.draft = self.backend.draft_restore(snap_draft) if snap_draft is not None else self.backend.new_draft()
         s.hasher = PrefixCache.hasher()
         s.dg_grid = s.dg_prev = (0, None)
+        sel = getattr(self.backend, "adopt_select", None)
+        if sel is not None and not s.resume and self._engram_adopt:
+            sel(s.sid, hit, self._chunk_end(s, hit, len(s.ids)))     # flag engram_adopt: the real first chunk is known now: arm the jobs submitted at admission, or drop them
         if hit:
             s.hasher.update(np.asarray(s.ids[:hit], dtype=np.int32).tobytes())
             self.stats["prefix_hit_tokens"] += hit
@@ -1574,11 +1839,34 @@ class Engine:
                 return {}
         return {"dg": dg, **({"pdg": pdg} if pb > 0 else {})}
 
-    def _chunk_end(self, s: Session, pos: int, L: int) -> int:
-        """End of the prefill chunk that starts at `pos` of a prompt of L tokens."""
+    def _chunk_end0(self, pos: int, L: int) -> int:
+        """End of the prefill chunk that starts at `pos` of a prompt of L tokens, cuts aside."""
         end = min(L, (pos // self.chunk + 1) * self.chunk)         # chunks end on absolute multiples of `chunk`
         if self.big_chunk and pos >= self.big_from and pos % self.big_chunk == 0 and L - pos >= self.big_chunk:
             end = pos + self.big_chunk                              # deep in a long prompt: fewer, larger chunks (MoE / CED prefill is 1.5-2x faster at 8192 rows than at 2048)
+        return end
+
+    def _cut_merge(self, s: Session, cut: int, L: int) -> bool:
+        """Flag pf_cut_merge (default 0, read per call): the chunk that ends at the LAST cut runs on to the end of the prompt as one pass, and the cut snapshot is taken from
+        the state the pass captured at the cut (kyojin_mlx.cutmerge). Only when the tail after the cut is the generation prompt (<= TAIL_MAX tokens), both chunks of the split
+        path lie in one grid interval (the merged pass crosses no chunk end of the split path but the cut), nobody takes the cache at the cut, and the backend can capture."""
+        if not self._cut_merge_on or s.resume or s.vl or not s.cuts or cut != s.cuts[-1] or not 0 < L - cut <= self._cut_merge_tail:
+            return False
+        if not hasattr(self.backend, "prefill_chunk_cut") or L > self._chunk_end0(s.pos, L) or L > self._chunk_end0(cut, L):
+            return False
+        if self._pf_share and self._share_takers(s, cut):
+            return False
+        return bool(self.backend.cut_merge_ok(s.cache, L - s.pos))
+
+    @property
+    def _cut_merge_on(self) -> bool:
+        return os.environ.get("KYOJIN_PF_CUT_MERGE", "0") not in ("0", "")
+
+    _cut_merge_tail = 64                                             # cutmerge.TAIL_MAX
+
+    def _chunk_end(self, s: Session, pos: int, L: int) -> int:
+        """End of the prefill chunk that starts at `pos` of a prompt of L tokens."""
+        end = self._chunk_end0(pos, L)
         i = bisect.bisect_right(s.cuts, pos)
         if i < len(s.cuts):
             end = min(end, s.cuts[i])                                 # a chunk never runs past the next cut
@@ -1712,6 +2000,10 @@ class Engine:
             self._replay_step(s)
             return
         end = self._chunk_end(s, s.pos, L)
+        merge = end < L and self._cut_merge(s, end, L)
+        cut_pos = end
+        if merge:
+            end = L                                                 # flag pf_cut_merge: one pass to the end of the prompt, the cut state is captured inside it
         skip_mode = self._skip_mode(s, end, L)
         skip = bool(skip_mode)
         stale = skip_mode == 3
@@ -1734,7 +2026,10 @@ class Engine:
         self._inline_s = 0.0
         sliced = (not s.resume) and self._arm_yield()
         try:
-            if skip:
+            if merge:
+                lg, cut_cache, cut_draft = self.backend.prefill_chunk_cut(s.cache, s.rids[s.pos:end], cut_pos - s.pos, draft=s.draft if self.spec else None)
+                self.stats["pf_cut_merge"] += 1
+            elif skip:
                 lg = self.backend.prefill_chunk(s.cache, s.rids[s.pos:end], skip_dec=True, **vl)
             elif self.spec:
                 lg = self.backend.prefill_chunk(s.cache, s.rids[s.pos:end], draft=s.draft, **vl)
@@ -1744,6 +2039,7 @@ class Engine:
             if sliced:
                 self.backend.set_prefill_yield(None)
         t1 = time.perf_counter()
+        c0 = (not s.resume) and s.pos == s.cached                    # the first chunk of the prompt (after the cached prefix)
         t0 += self._inline_s                                         # the decode rounds that ran inside the chunk are not prefill time (stats, debt)
         if fl0 and fl0[0] and fl0[0] == self.members and t1 > self._chunk_t0:       # same decoders before / after: their tokens over the chunk's wall
             ach = (sum(x.n_gen for x in self.members) - fl0[1]) / len(fl0[0]) / (t1 - self._chunk_t0)
@@ -1769,41 +2065,49 @@ class Engine:
             self.stats["pf_eng_rows_uniq"] = ah.rows_uniq
             self.stats["pf_eng_job_ms"] = round(ah.job_seconds * 1e3, 3)
             self.stats["pf_eng_warm_first"] = ah.warmed_first
+            self.stats["engram_adopt_hit"] = ah.adopt_hit
+            self.stats["engram_adopt_miss"] = ah.adopt_miss
         if ah is not None and ah.waits:                                  # host time inside each Engram layer of the chunk (row wait + build)
             for k, v in ah.waits.items():
                 self.stats[f"t_pf_eng{k}"] += v
+            if c0 and self._engram_adopt:                                # the first chunk's wait on its first Engram layer, adopted or cold (A/B on the lane)
+                kind = "adopt" if ah.last_adopted else "cold"
+                self.stats[f"t_pf_eng0_first_{kind}"] += ah.waits.get(0, 0.0)
+                self.stats[f"n_pf_first_{kind}"] += 1
             ah.waits.clear()
-        s.hasher.update(np.asarray(s.ids[s.pos:end], dtype=np.int32).tobytes())
-        self.stats["prefill_tokens" if not s.resume else "rebuild_prefill_tokens"] += end - s.pos
-        s.pos = end
-        if s.path is not None:
-            s.path = (*s.path, end)
-        self._note_grid(s, end)
-        if self._spec_lookup:
-            self._lookup_sync(s, end)                                # incremental 4-gram insert for this chunk
-        cut = end in s.cuts
-        tail = end == self._tail_anchor(s, L) and not s.resume and end not in s.cuts and end % self.block and end % (self.prefix.disk.block if self.prefix.disk is not None else self.block)
-        cut = cut or bool(tail)
-        if skip:
-            self.stats["pf_skip_dec"] += 1                              # decoder half skipped: the decoder rings are stale; modes 1 and 2 store nothing here, mode 3 stores marked
-        if (not skip or stale) and (end % self.block == 0 or cut):
-            self.prefix.store((end, s.hasher.digest()), s.cache, s.draft, stale=stale, sig=s.path)
-            if stale:
-                self.stats["pf_skip_snap"] += 1
-        if (not skip or stale) and self.prefix.disk is not None and (end % self.prefix.disk.block == 0 or cut):
-            td = time.perf_counter()
-            self.prefix.save_disk(s.ids, end, s.cache, s.draft, stale=stale, **self._disk_digests(s, s.ids, end))
-            if tail:
-                self.stats["kv_tail_saved"] += 1                           # flag kv_tail: the anchor's file (its bytes and ms: disk.stats / status)
-                self.stats["t_kv_tail_save"] += time.perf_counter() - td
-            if stale:
-                self.stats["pf_skip_snap_disk"] += 1
-        if self.kv_budget is not None:
-            self._measure(s)
-        if self._pf_share and not s.resume:
-            takers = self._share_takers(s, end)
-            if takers:
-                self._hand_off(s, end, takers)
+        stages = [(cut_pos, cut_cache, cut_draft), (end, s.cache, s.draft)] if merge else [(end, s.cache, s.draft)]
+        for end, cache_, draft_ in stages:                           # (the cut of a merged pass is a stage of its own: hash, path, snapshot, disk checkpoint)
+            s.hasher.update(np.asarray(s.ids[s.pos:end], dtype=np.int32).tobytes())
+            self.stats["prefill_tokens" if not s.resume else "rebuild_prefill_tokens"] += end - s.pos
+            s.pos = end
+            if s.path is not None:
+                s.path = (*s.path, end)
+            self._note_grid(s, end)
+            if self._spec_lookup:
+                self._lookup_sync(s, end)                                # incremental 4-gram insert for this chunk
+            cut = end in s.cuts
+            tail = end == self._tail_anchor(s, L) and not s.resume and end not in s.cuts and end % self.block and end % (self.prefix.disk.block if self.prefix.disk is not None else self.block)
+            cut = cut or bool(tail)
+            if skip:
+                self.stats["pf_skip_dec"] += 1                              # decoder half skipped: the decoder rings are stale; modes 1 and 2 store nothing here, mode 3 stores marked
+            if (not skip or stale) and (end % self.block == 0 or cut):
+                self.prefix.store((end, s.hasher.digest()), cache_, draft_, stale=stale, sig=s.path)
+                if stale:
+                    self.stats["pf_skip_snap"] += 1
+            if (not skip or stale) and self.prefix.disk is not None and (end % self.prefix.disk.block == 0 or cut):
+                td = time.perf_counter()
+                self.prefix.save_disk(s.ids, end, cache_, draft_, stale=stale, **self._disk_digests(s, s.ids, end))
+                if tail:
+                    self.stats["kv_tail_saved"] += 1                           # flag kv_tail: the anchor's file (its bytes and ms: disk.stats / status)
+                    self.stats["t_kv_tail_save"] += time.perf_counter() - td
+                if stale:
+                    self.stats["pf_skip_snap_disk"] += 1
+            if self.kv_budget is not None:
+                self._measure(s)
+            if self._pf_share and not s.resume:
+                takers = self._share_takers(s, end)
+                if takers:
+                    self._hand_off(s, end, takers)
         self.stats["t_pf_after"] += time.perf_counter() - t1               # hash, prefix snapshot, disk save, KV measure
         if end < L:
             return
@@ -1816,7 +2120,7 @@ class Engine:
         TT.stop()
         if TT.on():
             TT.start()
-        tok = int((self.tap(lg) if self.tap is not None else sample_rows(lg, [s.sampling], [self._next_key(s)])).item())
+        tok = int((self.tap(lg) if self.tap is not None else sample_rows(lg, [self._samp(s)], [self._next_key(s)])).item())
         t_s0 = time.perf_counter()
         self.stats["t_pf_sample0"] += t_s0 - s.t_first
         if s.stages is not None:
@@ -1912,7 +2216,10 @@ class Engine:
     def _replay_step(self, s: Session) -> None:
         """Feed the next tokens it had produced to a rebuilt session's cache (teacher forced; the cache covers prompt + out[:-1])."""
         toks = s.out[:-1]
-        upto = min(len(toks), s.replay_pos + self.replay_chunk)
+        chunk = self.replay_chunk
+        if not (self.members or self.ready) and os.environ.get("KYOJIN_REPLAY_PIPE", "1") not in ("0", ""):
+            chunk = max(chunk, 128 - 128 % 8)             # flag replay_pipe: nobody decodes meanwhile, so a longer span per tick keeps the replay pipeline full (groups of 8 stay aligned)
+        upto = min(len(toks), s.replay_pos + chunk)
         if upto > s.replay_pos:
             s.cache = self.backend.replay(s.cache, toks[s.replay_pos:upto], s.draft if self.spec else None)
             self.stats["replay_tokens"] += upto - s.replay_pos
@@ -1927,7 +2234,7 @@ class Engine:
     # ------------------------------------------------------------------------------------------------ decode
     def _launch(self):
         toks = mx.array([s.last for s in self.members], dtype=mx.int32) if self.cur is None else self.cur
-        samp = [s.sampling for s in self.members]
+        samp = [self._samp(s) for s in self.members]
         keys = [self._next_key(s) for s in self.members]
         pick = self.tap if self.tap is not None and len(self.members) == 1 else (lambda lg: sample_rows(lg, samp, keys))
         if getattr(self.backend, "gated", None) is not None and not self.spec:
@@ -2024,6 +2331,9 @@ class Engine:
         self._measure(s)
         s.park_now = False
         s.t_parked = time.perf_counter()
+        if s.rw_drop:                                       # flag spec_typical_rewind: the cache holds tokens the session no longer has: rebuilt on resume
+            s.rw_drop = False
+            self._drop(s)
         self.waiting.append(s)
         self.stats["yields"] += 1
 
@@ -2556,7 +2866,7 @@ class Engine:
     def _plain_launch(self, members: list, toks, p0s: list):
         """Launch one plain step of the speculative batched cache (the draft states take its taps); returns the lazy sampled tokens.
         An armed kltap probe (`POST /admin/tap`) reads the logits of this step for one session, like the plain step of `_launch`."""
-        samp = [s.sampling for s in members]
+        samp = [self._samp(s) for s in members]
         keys = [self._next_key(s) for s in members]
         pick = self.tap if self.tap is not None and len(members) == 1 else (lambda lg: sample_rows(lg, samp, keys))
         if getattr(self.backend, "gated", None) is not None:
@@ -2718,7 +3028,7 @@ class Engine:
             if k not in lh.slot:                                    # no draft this round (depth 0): lh.toks / lh.lg hold the live jobs only, in slot order, so no placeholder row
                 continue
             lg = lh.lg[lh.slot[k]]
-            lq = SPECSAM.logq(lg, s.sampling.temperature, s.sampling.top_k)
+            lq = SPECSAM.logq(lg, self._samp(s).temperature, s.sampling.top_k)
             n = 1 + int(lh.depths[k])
             keys = [self._next_key(s) for _ in range(block + n)]
             toks.append(SPECSAM.draw(lq, keys[:block]))
@@ -2843,7 +3153,7 @@ class Engine:
         if lh is None:                                               # eager drafts (no lazy pass, or every job has depth 0)
             if cpl:
                 lam = self._spec_couple / 100.0
-                drafted = be.draft_many(jobs, couple=[(members[i].sampling.temperature * lam, cpl[i]) if i in cpl else None for i in range(len(members))])
+                drafted = be.draft_many(jobs, couple=[(self._samp(members[i]).temperature * lam, cpl[i]) if i in cpl else None for i in range(len(members))])
                 self.stats["spec_couple_rounds"] += 1
             else:
                 drafted = be.draft_many(jobs)
@@ -2890,7 +3200,7 @@ class Engine:
         c1b = time.thread_time()
         samplings, keys = [], []
         for k, (s, n) in enumerate(zip(members, lens)):
-            samp = _GREEDY if rs is not None and k in rs[0] else s.sampling    # a spec_rs row is sampled by specsam.decide (no second filtered draw)
+            samp = _GREEDY if rs is not None and k in rs[0] else self._samp(s)    # a spec_rs row is sampled by specsam.decide (no second filtered draw)
             samplings += [samp] * n
             ck = cpl.get(k)
             keys += ck[:n] if ck is not None and n <= len(ck) else [self._next_key(s) for _ in range(n)]   # one key per verify row (None for a greedy session); spec_couple: the keys the draft chain saw
@@ -2902,18 +3212,48 @@ class Engine:
                     continue
                 n = 1 + int(lh.depths[k])
                 r0 = res.starts[k]
-                rsl.append(SPECSAM.decide(res.logits[r0:r0 + n], rs[1][k], rs[0][k][0][:n - 1], s.sampling, rs[0][k][1]))
+                rsl.append(SPECSAM.decide(res.logits[r0:r0 + n], rs[1][k], rs[0][k][0][:n - 1], self._samp(s), rs[0][k][1]))
+        tyk, tym = [], []                                            # flag spec_typical: (member, mask [n - 1]) per sampled MTP / lookup session, built next to va
+        ty = self._typical()
+        ty_lk = os.environ.get("KYOJIN_SPEC_TYPICAL_LOOKUP", "rep")   # read per round: rep (default) | 0 | 1
+        ty_rep = ty_lk not in ("0", "1", "")
+        ty_ph = os.environ.get("KYOJIN_SPEC_TYPICAL_PHASE", "all") == "answer"   # read per round: all (default) | answer
+        cdn = self._cooldown() if ty is not None else 0               # flag spec_typical_cooldown (0 = off)
+        if ty is not None:
+            for k, s in enumerate(members):
+                n = lens[k]
+                if s.sampling.greedy or n < 2 or (rs is not None and k in rs[0]):
+                    continue
+                if cdn and self._cd_armed(s, cdn):                   # an early loop signal: this session accepts by exact equality for the window
+                    continue
+                if k in lookups and ty_lk in ("0", ""):              # flag spec_typical_lookup=0: copied text accepts by exact equality only
+                    self.stats["spec_typical_lookup_skipped"] += 1
+                    continue
+                if ty_ph and self._in_think(s):                      # thinking: exact acceptance (the normal sampled path); the relaxed rule biases long reasoning toward its mode
+                    self.stats["spec_typical_think_skipped"] += 1
+                    continue
+                r0 = res.starts[k]
+                if lh is not None and k in lh.slot:
+                    dr = lh.toks[lh.slot[k]][:n - 1]
+                else:
+                    dr = mx.array(toks[k][1:n], dtype=mx.int32)
+                tyk.append(k)
+                tym.append(SPECSAM.typical_mask(res.logits[r0:r0 + n - 1], dr, va[r0:r0 + n - 1] == dr.astype(va.dtype), self._samp(s), ty[0], ty[1], ty[2]))
         HL.mark("spec_verify_sample")
         tb = time.perf_counter()                                     # host graph build of the round (drafts + verify) ends here, the GPU wait starts
         extra = [a for pair in rsl for a in pair]
         if lh is not None and HS.enabled():                          # KYOJIN_VERIFY_ASYNC: ONE wait for the verify argmax and the drafts, then plain copies
-            mx.eval(va, lh.toks, lh.conf, *extra)
+            mx.eval(va, lh.toks, lh.conf, *extra, *tym)
             lh.packed = True
             vals = HS.read(va)
             rsv = [HS.read(a) for a in extra]
+            tyv = dict(zip(tyk, [HS.read(a) for a in tym]))
         else:
+            if tym:
+                mx.eval(va, *extra, *tym)
             vals = va.tolist()
             rsv = [a.tolist() for a in extra]
+            tyv = dict(zip(tyk, [a.tolist() for a in tym]))
         self.stats["t_rbuild"] += tb - t0; self.stats["t_rwait"] += time.perf_counter() - tb; self.stats["n_round"] += 1
         HL.mark("spec_wait")
         if lh is not None:
@@ -2928,6 +3268,7 @@ class Engine:
                 confs = dc() if callable(dc) else None
         t2 = time.perf_counter()
         HL.mark("spec_post")
+        ptap = TAPS.ptap_collect(members, toks, res, lookups) if TAPS.ptap_on() else {}   # flag spec_ptap: read-only probe, one eval + read per round
         leaving: dict = {}
         accepted = []
         built: list = []                                              # rows the verify actually built per session (flag spec_ladder: the width to price)
@@ -2955,12 +3296,38 @@ class Engine:
                 while a < len(drafts) and acc_l[a]:
                     a += 1
                 tail = int(out_l[a])
+            elif k in tyv:                                             # flag spec_typical: equality OR the relaxed rule, decided on device
+                mk = tyv[k]
+                a = 0
+                thk = self.think_ids if ty_ph else None             # a think tag among the drafts flips the phase for the rows after it
+                thin = False
+                while a < len(drafts) and mk[a]:
+                    if thk is not None:
+                        if thin and vals[r0 + a] != drafts[a]:       # an open tag drafted this round: the rows after it are thinking, equality only
+                            self.stats["spec_typical_think_skipped"] += 1
+                            break
+                        thin = drafts[a] == thk[0] or (thin and drafts[a] != thk[1])
+                    if ty_rep and vals[r0 + a] != drafts[a] and SPECSAM.repeats(s.out + drafts[:a], drafts[a]):
+                        self.stats["spec_typical_rep_refused"] += 1
+                        if cdn and self._cd_trigger(s, cdn) and self._rewind_cap(s):   # the refused 12-gram is an early loop signal
+                            fr = SPECSAM.first_repeat(s.out + drafts[:a], drafts[a])
+                            self._rw_mark(s, fr if 0 <= fr <= len(s.out) else None)       # flag spec_typical_rewind: back to just before its first occurrence
+                        # flag spec_typical_lookup=rep: the relaxed rule never extends a span the session already repeats
+                        break
+                    a += 1
+                tail = int(vals[r0 + a])
+                rel = sum(1 for j in range(a) if vals[r0 + j] != drafts[j])
+                if rel:
+                    self.stats["spec_typical_relaxed"] += rel
             else:
                 a = 0
                 while a < len(drafts) and vals[r0 + a] == drafts[a]:
                     a += 1
                 tail = int(vals[r0 + a])
             accepted.append(a)
+            if k in ptap:                                             # flag spec_ptap: one line per sampled session and round
+                rsk = rs is not None and k in rs[0]
+                TAPS.ptap_write(k, s, tk, ptap[k], [bool(acc_l[j]) if rsk else vals[r0 + j] == tk[1 + j] for j in range(len(tk) - 1)], a, k in lookups, rsk)
             if self._lazy_trim and rs is None and k not in lookups and depths[k] > 0 and not self._orc_round:
                 s.kept_ema = float(len(drafts)) if s.kept_ema < 0 else s.kept_ema + TRIM_RATE * (len(drafts) - s.kept_ema)
             conf = confs[k] if confs is not None and k < len(confs) else None
@@ -2990,6 +3357,10 @@ class Engine:
                     break
             if reason is None and ((s.yield_after is not None and s.seg_gen >= s.yield_after and self.waiting) or s.park_now):
                 reason = "yield"
+            if s.rw_cut >= 0:                                         # flag spec_typical_rewind: a loop signal of this round
+                if reason is None and self._rw_apply(s):
+                    reason = "yield"
+                s.rw_cut = -1
             if reason is None or reason == "yield":
                 s.rounds += 1
             if reason:

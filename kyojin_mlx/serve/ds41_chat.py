@@ -56,11 +56,13 @@ TOOL_OUTPUT_TEMPLATE = "<tool_result>{content}</tool_result>"
 
 REASONING_EFFORT_TEMPLATE = (
     "Reasoning Effort: {budget} (range 1-100, the higher the value, the more thorough the reasoning)\n\n")
-# The fleet's medium text (configs/templates/ds4-template-medium-v2.jinja), served for the named `medium` level.
-REASONING_EFFORT_MEDIUM = (
-    "Reasoning Effort: Matched to the task.\nMatch the depth of your work to the difficulty of the task: spend it on the "
-    "points that decide the answer and verify what they rest on, not on alternatives the task does not call for. Gather "
-    "what the answer needs, then give it.\n\n")
+# Optional guidance text for the named `medium` level. Off by default (medium = the trained numeric line only);
+# KYOJIN_EFFORT_GUIDANCE=1 appends it after the numeric line.
+MEDIUM_TEXT = (
+    "Match the depth of your work to the difficulty of the task: spend it on the points that decide the answer, not on "
+    "alternatives the task does not call for. Between tool calls, think only about the next step. Check facts with the tools "
+    "rather than in your head. Plan in your reasoning, but do not draft the answer there: write code and long text once, in "
+    "the answer. When you have settled a point, keep it and move on.")
 
 # Official aliases (low / high / max) plus the OpenAI level names the reference does not define.
 # `minimal`, `medium`, `xhigh` and `ultra` (the top Hermes Agent level) are this server's choice; `none` is not an effort,
@@ -224,7 +226,10 @@ def chat_options(body: dict[str, Any], default_thinking: bool = True,
 
 def effort_line(effort: int) -> str:
     """The effort text for a resolved effort value."""
-    return REASONING_EFFORT_MEDIUM if effort == EFFORT_LEVELS["medium"] else REASONING_EFFORT_TEMPLATE.format(budget=effort)
+    line = REASONING_EFFORT_TEMPLATE.format(budget=effort)
+    if effort == EFFORT_LEVELS["medium"] and os.environ.get("KYOJIN_EFFORT_GUIDANCE") == "1":
+        return line[:-1] + MEDIUM_TEXT + "\n\n"
+    return line
 
 
 # ---- OpenAI request -> reference message form ------------------------------------------------------------

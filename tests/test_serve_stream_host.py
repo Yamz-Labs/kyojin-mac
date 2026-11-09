@@ -46,8 +46,11 @@ class Engine:
     def __init__(self, bursts):
         self.bursts, self.handles = bursts, []
 
+    session = None
+
     def submit(self, ids, **kw):
         h = Handle()
+        h.session = self.session
         self.handles.append(h)
         threading.Thread(target=self._feed, args=(h,), daemon=True).start()
         return h
@@ -146,3 +149,40 @@ def test_non_streaming_reply_with_the_flag_on():
     finally:
         srv.shutdown()
     assert o["choices"][0]["text"] == "".join(f"{i};" for i in range(1, sum(BURSTS) + 1)) and o["usage"]["completion_tokens"] == sum(BURSTS)
+
+
+TIMING_KEYS = {"prompt_n", "prompt_ms", "prompt_per_second", "predicted_n", "predicted_ms", "predicted_per_second", "cache_n", "queue_s", "ttft_s", "total_s"}
+
+
+def timings_frames(frames):
+    return [json.loads(f)["timings"] for f in frames if f != "[DONE]" and "timings" in json.loads(f)]
+
+
+@pytest.mark.parametrize("coalesce", [False, True])
+def test_progressive_timings_ride_on_content_frames_and_the_final_one_has_the_same_shape(coalesce, monkeypatch):
+    HL.COALESCE = coalesce
+    session = types.SimpleNamespace(t_submit=0.0, t_start=0.5, t_first=1.0, cached=1, n_prompt=3, n_gen=7)
+    for period, extra in ((SV.TIMINGS_PERIOD_S, False), (0.0, True)):
+        monkeypatch.setattr(SV, "TIMINGS_PERIOD_S", period)
+        srv, eng = serve(BURSTS)
+        eng.session = session
+        try:
+            frames = stream(srv)
+        finally:
+            srv.shutdown()
+        tms = timings_frames(frames)
+        assert all(set(t) == TIMING_KEYS for t in tms)
+        if extra:                                                    # period 0: every content frame carries the session numbers, no extra empty frame
+            assert len(tms) == (len(BURSTS) if coalesce else len(frames) - 3) + 1                       # one per burst when coalesced (one tick per socket write), else one per token frame; plus the final chunk
+            assert tms[0]["prompt_n"] == 2 and tms[0]["cache_n"] == 1 and tms[0]["prompt_ms"] == 500.0 and tms[0]["predicted_n"] == 7
+            assert len(frames) == len(stream_frames_without_session())
+        else:
+            assert len(tms) == 1                                     # a one-second period: only the final chunk
+
+
+def stream_frames_without_session():
+    srv, _ = serve(BURSTS)
+    try:
+        return stream(srv)
+    finally:
+        srv.shutdown()

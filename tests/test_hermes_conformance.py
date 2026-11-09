@@ -430,9 +430,18 @@ def test_real_tokens_of_the_history_extend_the_turn_one_tokens(thinking):
     assert t2[:len(t1)] == t1
 
 
-def test_ds41_medium_uses_fleet_text_and_tools_lead_the_system_text():
+def test_ds41_medium_is_numeric_line_only_and_guidance_is_opt_in(monkeypatch):
+    from kyojin_mlx.serve.ds41_chat import render_chat
+    monkeypatch.delenv("KYOJIN_EFFORT_GUIDANCE", raising=False)
+    plain = render_chat([{"role": "user", "content": "hi"}], reasoning_effort="medium")
+    assert "Reasoning Effort: 62 (range" in plain and "Match the depth" not in plain
+    monkeypatch.setenv("KYOJIN_EFFORT_GUIDANCE", "1")
+    assert "Between tool calls, think only about the next step." in render_chat([{"role": "user", "content": "hi"}], reasoning_effort="medium")
+
+
+def test_ds41_medium_tools_lead_the_system_text():
     from kyojin_mlx.serve.ds41_chat import render_chat
     tools = [{"type": "function", "function": {"name": "f", "description": "d", "parameters": {"type": "object", "properties": {}}}}]
     medium = render_chat([{"role": "system", "content": "SYSTEXT"}, {"role": "user", "content": "hi"}], tools, reasoning_effort="medium")
-    assert "Reasoning Effort: Matched to the task." in medium and medium.index("## Tools") < medium.index("SYSTEXT")
+    assert "Reasoning Effort: 62 " in medium and medium.index("## Tools") < medium.index("SYSTEXT")
     assert "Reasoning Effort: 75 " in render_chat([{"role": "user", "content": "hi"}], reasoning_effort="high")

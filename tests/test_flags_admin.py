@@ -45,7 +45,7 @@ def test_get_all_lists_every_lever_with_its_current_value(monkeypatch):
 @pytest.mark.parametrize("name", [n for n, f in FL.FLAGS.items() if f.runtime])
 def test_set_writes_env_and_module_attributes(name):
     f = FL.FLAGS[name]
-    for v in ("1", "0") if f.kind == "bool" else ("7", "0"):
+    for v in (tuple(f.choices) if f.kind == "mode" and "1" not in f.choices else ("1", "0")) if f.kind in ("bool", "mode") else (("norm,attn", "") if f.kind == "str" else ("7", "0")):
         g = FL.GEN
         FL.set(name, v)
         assert os.environ[f.env] == v and FL.GEN == g + 1 and FL.get_all()[name]["value"] == v
@@ -266,4 +266,4 @@ def test_flag_table_defaults_reach_the_lever_modules():
 def test_every_runtime_flag_accepts_its_own_default(name):
     """A switchable flag must take its table default back through set() (gpu_keepalive's 0.5 was refused by the 0/1 parser)."""
     f = FL.FLAGS[name]
-    assert FL._norm(f, f.default) == (f.default if f.kind == "int" else ("1" if FL._on(f.default) else "0"))
+    assert FL._norm(f, f.default) == (f.default if f.kind in ("int", "str", "float", "mode") else ("1" if FL._on(f.default) else "0"))

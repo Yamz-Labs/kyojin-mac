@@ -315,8 +315,13 @@ def _block_mid(blk, h, pre_mix, image_mask, cache, ctx: _Ctx):
     attn_pre, attn_post, attn_comb = blk.hc_mixes(h_t, blk.hc_attn_fn, blk.hc_attn_scale, blk.hc_attn_base)
     x_full = blk.attn_norm(blk.hc_pre(h, pre_mix))
     cache._ced_nohist = t < ctx.n
+    cm = getattr(cache, "_cutm", None)
     try:
-        a = _attention_mid(blk.attn, x_full, x_full[:, -t:], cache, ctx.s0, ctx.s_t)
+        if cm is not None and cm.dec_n == t and cm.n == ctx.n:               # flag pf_cut_merge=3: the midpoint in the two segments of the merged pass
+            from . import cutmerge as CM
+            a = CM.mid_attention(blk.attn, x_full, cache, ctx, cm)
+        else:
+            a = _attention_mid(blk.attn, x_full, x_full[:, -t:], cache, ctx.s0, ctx.s_t)
     finally:
         cache._ced_nohist = False
     x = L.hc_expand(AB.attn_out(blk, a), h_t, attn_post, attn_comb)

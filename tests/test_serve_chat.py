@@ -139,6 +139,14 @@ def test_glm_render_has_tools_and_think():
     assert "get_weather" not in none.prompt and none.parse_tools is False
 
 
+def test_glm_medium_guidance_is_opt_in():
+    fam = GlmFamily(FakeTok(), "", None, {})
+    msgs = [{"role": "user", "content": "x"}]
+    assert "Match the depth" not in fam.render({"messages": msgs}).prompt
+    on = fam.render({"messages": msgs, "chat_template_kwargs": {"effort_guidance": True}}).prompt
+    assert "Match the depth" in on and "think only about the next step" in on
+
+
 def test_stop_ids_without_eos_token_in_tokenizer(tmp_path):
     """A bare tokenizer.json has no eos_token: the family's end token must still stop the reply (a DS4.1 tool call ends with it)."""
     from kyojin_mlx.serve.server import stop_token_ids

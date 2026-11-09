@@ -31,6 +31,7 @@ import mlx.core as mx
 from .modeldesc import KERNEL as KG
 
 from . import fired as FD
+from . import ablate as AZ
 from . import cdecpack as CD
 from . import mirrorq as MQ
 from . import idxshort as IDXS
@@ -344,6 +345,53 @@ _MERGE_INV = """    float v[DPT];
 assert _ATTN.count(_Q_LOAD) == 1 and _ATTN_PART.count(_Q_LOAD) == 1 and _ATTN_MERGE.count(_MERGE_OUT) == 1
 _ATTN_Q, _ATTN_PART_Q, _ATTN_MERGE_Q = _ATTN.replace(_Q_LOAD, _Q_ROPE), _ATTN_PART.replace(_Q_LOAD, _Q_ROPE), _ATTN_MERGE.replace(_MERGE_OUT, _MERGE_INV)
 
+# attn_merge_tail (KYOJIN_ATTN_MERGE_TAIL): the merge rides in the tail of the part kernel. Every part threadgroup stores its partials, then arrives on the counter
+# of its (row, head group); the last arriver (counter reset by it, so the buffer is zero for the next launch) runs the statements of _ATTN_MERGE[_Q] for the HG heads
+# of the group on the partials the others stored (read back with relaxed atomic loads after device fences, the moe_chain protocol: metal_src._CH_ARRIVE).
+# Same arithmetic in the same order: bit-identical to the two-launch path. No early return before the arrival (checked below).
+ATTN_MERGE_TAIL = os.environ.get("KYOJIN_ATTN_MERGE_TAIL", "0") not in ("0", "")
+_MT_LDF = """
+#define LDF(ptr) as_type<float>(atomic_load_explicit((const device atomic_uint*)((ptr)), memory_order_relaxed))
+"""
+_MT_ARRIVE = """
+    threadgroup_barrier(mem_flags::mem_device);
+    threadgroup uint mt_last;
+    if (tid == 0) {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        const uint old = atomic_fetch_add_explicit(((device atomic_uint*)(ctr)) + (tg / SPLIT), 1u, memory_order_relaxed);
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        const bool lst = (old + 1u) == uint(SPLIT);
+        if (lst) atomic_store_explicit(((device atomic_uint*)(ctr)) + (tg / SPLIT), 0u, memory_order_relaxed);
+        mt_last = lst ? 1u : 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (mt_last == 0u) return;
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+"""
+_MT_R = "    const uint r = threadgroup_position_in_grid.x;              // u * H + h\n    const uint tid = thread_position_in_threadgroup.x;\n"
+
+
+def merge_tail_source(part: str, merge: str) -> str:
+    assert "return" not in part and merge.count(_MT_R) == 1, "attn part / merge template changed"
+    body = merge.replace(_MT_R, "").replace("part_o[(r * SPLIT + s) * D + tid * DPT + i]", "LDF(part_o + (r * SPLIT + s) * D + tid * DPT + i)")
+    body = body.replace("ml[(r * SPLIT + s) * 2 + 1]", "LDF(ml + (r * SPLIT + s) * 2 + 1)").replace("ml[(r * SPLIT + s) * 2]", "LDF(ml + (r * SPLIT + s) * 2)")
+    assert body.count("LDF(") == 4 and "part_o[" not in body and "ml[" not in body
+    head = "    for (uint hh = 0; hh < HG; ++hh) {\n    const uint r = (u * H + h0 + hh);\n"
+    return _MT_LDF + part + _MT_ARRIVE + head + body + "    }\n"
+
+
+_mt_ctr: dict = {}
+
+
+def _attn_ctr(n: int) -> mx.array:
+    """Zeroed arrival counters, one per (row, head group). The kernel leaves them zero; >= 16 words (MLX binds arrays under 8 elements as `constant`)."""
+    n = max(16, n)
+    c = _mt_ctr.get(n)
+    if c is None:
+        c = _mt_ctr[n] = mx.zeros((n,), dtype=mx.uint32)
+        mx.eval(c)
+    return c
+
 # ----------------------------------------------------------------------------------------------------------------- kv chain in one launch
 # One threadgroup (128 threads) per (row, ring slot). The slot a row writes recomputes its kv row (rms_norm in mx.fast.rms_norm's single-row layout:
 # 4 contiguous values per thread, simd_sum, then the simdgroup partials; the rope tail and the fp8 round trip of _KV_RING) and writes it; every other
@@ -413,6 +461,53 @@ _KV_CHAIN = r"""
         out[o + lid * 8 + i] = static_cast<T>((metal::rint(vv / step) * step) * scale);
     }
 """
+
+
+# kv chain + the commit's slot write in one launch: one threadgroup per (slot of the stacked buffer, ring position). A slot a row of the pass owns
+# computes exactly the _KV_CHAIN result and writes it to `out` (the row's ring, read by the attention) and to `buf` (the stacked buffer the commit
+# keeps); every other slot copies the base buffer into `buf`. rowof[slot] = the row that owns the slot (plain decode: one row per session), -1 = none.
+_KV_CHAIN_STK = _KV_CHAIN.replace("""    const uint tg = threadgroup_position_in_grid.x;
+    const uint b = tg / uint(W);
+    const uint s = tg % uint(W);
+    const uint lid = thread_position_in_threadgroup.x;
+    const uint sg = simdgroup_index_in_threadgroup, sl = thread_index_in_simdgroup;
+    const int e = wmap[b * uint(W) + s];                       // kv row that writes this slot of row b's ring, -1 = keep the base ring
+    const ulong o = (ulong(b) * uint(W) + s) * uint(D);
+    if (e < 0) {
+        if (lid < 64) {
+            const ulong q = (ulong(sess[b]) * uint(W) + s) * uint(D) + lid * 8;
+            *(device uint4*)(out + o + lid * 8) = *(const device uint4*)(ring + q);
+        }
+        return;
+    }
+""", """    const uint tg = threadgroup_position_in_grid.x;
+    const uint slot = tg / uint(W);
+    const uint s = tg % uint(W);
+    const uint lid = thread_position_in_threadgroup.x;
+    const uint sg = simdgroup_index_in_threadgroup, sl = thread_index_in_simdgroup;
+    const int rw = rowof[slot];
+    const ulong ob = (ulong(slot) * uint(W) + s) * uint(D);
+    if (rw < 0) {
+        if (lid < 64) *(device uint4*)(buf + ob + lid * 8) = *(const device uint4*)(ring + ob + lid * 8);
+        return;
+    }
+    const uint b = uint(rw);
+    const int e = wmap[b * uint(W) + s];
+    const ulong o = (ulong(b) * uint(W) + s) * uint(D);
+    if (e < 0) {
+        if (lid < 64) {
+            const uint4 v4 = *(const device uint4*)(ring + ob + lid * 8);
+            *(device uint4*)(out + o + lid * 8) = v4;
+            *(device uint4*)(buf + ob + lid * 8) = v4;
+        }
+        return;
+    }
+""")
+_old="        out[o + lid * 8 + i] = static_cast<T>((metal::rint(vv / step) * step) * scale);\n"
+_new="        const T ov = static_cast<T>((metal::rint(vv / step) * step) * scale);\n        out[o + lid * 8 + i] = ov;\n        buf[ob + lid * 8 + i] = ov;\n"
+assert _KV_CHAIN_STK.count(_old) == 1
+_KV_CHAIN_STK = _KV_CHAIN_STK.replace(_old, _new)
+assert "rowof[slot]" in _KV_CHAIN_STK
 
 
 # ----------------------------------------------------------------------------------------------------------------- indexer scores kernel
@@ -777,6 +872,19 @@ def attend(q: mx.array, win: mx.array, pool: mx.array, idx: mx.array, pos: mx.ar
         ms = SPLIT_MS
         sp = -(-M // ms)
         fk = _fk() if rt is not None else ""
+        if ATTN_MERGE_TAIL:
+            nm = "kyojin_dsv4_attn_part_mt" + qs + ("" if it is None else "_i") + fk
+            kt = _kernels.get(nm)
+            if kt is None:
+                src = merge_tail_source(_ATTN_PART if rt is None else rope_src(_ATTN_PART_Q), _ATTN_MERGE if it is None else rope_src(_ATTN_MERGE_Q))
+                kt = _kernels[nm] = mx.fast.metal_kernel(
+                    name=nm, input_names=["q", "win", "pool", "idx", "pos", "sess", "ip", "fp"] + ([] if rt is None else ["rt"]) + ["sink"] + ([] if it is None else ["it"]) + ["ctr"],
+                    output_names=["part_o", "ml", "out"], source=src, header=_CONTRACT_OFF)
+            ngrp = N * (H // hgs)
+            return kt(inputs=[q, win, pool, idx, pos, sess, _u32((K, pool.shape[1])), _f32((scale,))] + ([] if rt is None else [rt]) + [sink] + ([] if it is None else [it]) + [_attn_ctr(ngrp)],
+                      template=[("T", q.dtype), ("H", H), ("HG", hgs), ("D", D), ("W", W), ("MS", ms), ("SPLIT", sp)] + (list(rd) if rt is not None else ([] if it is None else [("RD", it.shape[-1])])),
+                      grid=(ngrp * sp * 128, 1, 1), threadgroup=(128, 1, 1),
+                      output_shapes=[(N, H, sp, D), (N, H, sp, 2), (N, H, D)], output_dtypes=[mx.float32, mx.float32, q.dtype])[2]
         kp = _kernels.get("kyojin_dsv4_attn_part" + qs + fk)
         if kp is None:
             kp = _kernels["kyojin_dsv4_attn_part" + qs + fk] = mx.fast.metal_kernel(
@@ -993,6 +1101,16 @@ class Plan:
                 src=None if src == rows else mx.array(src, dtype=mx.int32))
         return o
 
+    def rowof(self) -> mx.array:
+        """int32 [NS]: the row that owns each slot of the stacked buffers in a plain pass (one row per session), -1 = no row (attn_core_fuse kv chain)."""
+        a = self._wmap.get("rowof")
+        if a is None:
+            ro = [-1] * self.NS
+            for j, sl in enumerate(self.sess):
+                ro[sl] = j
+            a = self._wmap["rowof"] = mx.array(ro, dtype=mx.int32)
+        return a
+
     def wmap(self, m: int) -> mx.array:
         """Per (row, slot) the kv row that slot holds after the rows up to this one, int32 [n * m] (-1 = keep the base ring). The overlay scatter
         as one dense lookup for the kv-chain kernel (one kv row may write several snapshots)."""
@@ -1090,6 +1208,10 @@ ISCORE_MMA_MIN = int(os.environ.get("KYOJIN_ISCORE_MMA_MIN", "262144"))
 # kernels that already read / write those dims. Both bit-identical to the stock ops; see _KV_CHAIN and the _Q_ROPE / _MERGE_INV substitutions.
 CPROJ = os.environ.get("KYOJIN_DEC_CPROJ", "0") not in ("0", "")          # compressor wkv + wgate of a kv-source layer: x32 cast + two f32 matmuls -> one launch (stagek2.xgemv)
 KV_CHAIN = os.environ.get("KYOJIN_KV_CHAIN", "1") not in ("0", "")
+# attn_core_fuse: one launch less per layer in the plain decode attention core, same bits (default off): the kv chain writes the stacked window buffer the commit
+# keeps, so the commit's slot scatter (a whole-buffer copy when the stack has spare slots) is gone. See _KV_CHAIN_STK. (A part + merge fold through a
+# last-threadgroup counter was measured 25-45 us per layer SLOWER and dropped.)
+ATTN_CORE_FUSE = os.environ.get("KYOJIN_ATTN_CORE_FUSE", "0") not in ("0", "")
 ROPE_FUSE = os.environ.get("KYOJIN_ROPE_FUSE", "1") not in ("0", "")
 # The rows of a served pass (RowsCache with a pass open) through the fused row core: the window ring and the attention of row j read the session's
 # committed ring plus the pass's own kv rows (fuse_attn.attend_rows_m / kv_apply_m) instead of a per-row copy of the ring, and the ring a commit keeps is
@@ -1216,7 +1338,9 @@ def _rows_cache_class():
                 if last is not None and idx is None:
                     idx = mx.array(last, dtype=mx.int32)
                 pick = (lambda a: a) if last is None else (lambda a, i=idx: a[i])
-                if pd.win is not None:
+                if getattr(pd, "win_stk", None) is not None:                        # attn_core_fuse: the kv chain already wrote the stacked buffer
+                    self.win[l] = pd.win_stk
+                elif pd.win is not None:
                     self.win[l] = _keep_slots(self.win[l], pick(pd.win), slots)
                 if pd.kvr is not None and p_last is not None:                      # STATE_NOCOPY: the compressor state of the kept rows, written once
                     plan, r = pd.kvr
@@ -1761,6 +1885,20 @@ def kv_chain(kvr: mx.array, w: mx.array, base: mx.array, sess: mx.array, wmap: m
              grid=(n * W * 128, 1, 1), threadgroup=(128, 1, 1), output_shapes=[(n, W, D)], output_dtypes=[kvr.dtype])[0]
 
 
+def kv_chain_stack(kvr: mx.array, w: mx.array, base: mx.array, sess: mx.array, wmap: mx.array, rowof: mx.array, rt: mx.array, eps: float):
+    """kv_chain plus the commit's slot write: (rings [n, W, D], stacked buffer [NS, W, D] = base with the slots of the rows replaced). One launch."""
+    n, D = kvr.shape
+    NS, W = base.shape[0], base.shape[1]
+    key = ("kvchain_stk", D, W, ROPE_FMA)
+    k = _kc.get(key)
+    if k is None:
+        k = _kc[key] = mx.fast.metal_kernel(name="kyojin_dsv4_kv_chain_stk" + _fk(), input_names=["kvr", "w", "ring", "wmap", "rowof", "rt", "eps"],
+                                            output_names=["out", "buf"], source=rope_src(_KV_CHAIN_STK), header=_CONTRACT_OFF)
+    out, buf = k(inputs=[kvr, w, base, wmap, rowof, rt, _f32((eps,))], template=[("T", kvr.dtype), ("D", D), ("W", W), ("RD", rt.shape[-1])],
+                 grid=(NS * W * 128, 1, 1), threadgroup=(128, 1, 1), output_shapes=[(n, W, D), (NS, W, D)], output_dtypes=[kvr.dtype, kvr.dtype])
+    return out, buf
+
+
 def rot_fq4(x: mx.array, cos: mx.array, sin: mx.array, rd: int) -> mx.array:
     """fake_quant_fp4_ue8m0(_apply_index_rotary(x, cos, sin, rd)) for x [..., heads, 128] half with one cos / sin row per position (broadcast over the
     heads): one kernel when ROT_FQ4, else the stock chain."""
@@ -1810,6 +1948,12 @@ def core(attn, x: mx.array, cache, pre=None, stage: bool = False, ex: dict | Non
     else:                                                                       # decstage `in`: the q latent, the pre-rope q and the raw kv
         qr, q, kv = pre
         q = q.reshape(n, H, 1, D)
+    if AZ.ACTIVE and AZ.on("attn"):                                             # ablate: zeros for the attention output; no kv write, compressor, indexer or attend; `pend` empty = cache untouched
+        AZ.hit("attn")
+        o = AZ.zeros_like_shape((n, attn.o_groups, 1, (H // attn.o_groups) * D), dt)
+        if stage:
+            return o
+        return attn.wo_b(fq8(attn.wo_a(o).transpose(0, 2, 1, 3).flatten(-2)))
     rope_fuse = (ROPE_FUSE or stage) and D == KG.HEAD_DIM and attn.rope.dims == KG.ROPE_DIMS
     kvfuse = (KV_CHAIN or stage) and D == KG.HEAD_DIM and attn.rope.dims == KG.ROPE_DIMS
     kvfuse = kvfuse and (x if pre is None else kv).dtype == mx.float16 and attn.kv_norm.weight.dtype == mx.float16
@@ -1822,7 +1966,7 @@ def core(attn, x: mx.array, cache, pre=None, stage: bool = False, ex: dict | Non
     rope_f, rope_i = plan.attn_rope(attn.rope) if (kvfuse or rope_fuse or rowfuse) else (None, None)
     if not rope_fuse and not rowfuse:                                           # (the hoisted q of decstage `in` is pre-rope)
         q = attn.rope(q, plan.pos_arr)
-    pd = st.pend[l] = SimpleNamespace(win=None, kvs=None, scs=None, cmp=None, keys=None, r=0, cnt=None, kcnt=None, kvr=None, kvrow=None, scrow=None)
+    pd = st.pend[l] = SimpleNamespace(win=None, kvs=None, scs=None, cmp=None, keys=None, r=0, cnt=None, kcnt=None, kvr=None, kvrow=None, scrow=None, win_stk=None)
     FD.hit("kvchain") if kvfuse else None
     FD.hit("ropefuse") if rope_fuse else None
     FD.hit("rows_core_fuse") if rowfuse else None
@@ -1839,7 +1983,12 @@ def core(attn, x: mx.array, cache, pre=None, stage: bool = False, ex: dict | Non
         base = st.win[l] if st.win[l] is not None else mx.zeros((S, W, D), dtype=dt)
         if pre is None:
             kv = attn.wkv(xq)
-        win = ex["win"] if ex and ex.get("win") is not None else kv_chain(kv.reshape(n, D), attn.kv_norm.weight, base, plan.sess_arr, plan.wmap(W), rope_f, attn.kv_norm.eps)
+        if (ATTN_CORE_FUSE and not (ex and ex.get("win") is not None) and st._counts is None and plan.plain and base.shape[0] == plan.NS
+                and not (plan.slots == list(range(plan.NS)))):                  # attn_core_fuse: the commit's slot scatter rides in the kv chain launch
+            FD.hit("attn_core_fuse_kv")
+            win, pd.win_stk = kv_chain_stack(kv.reshape(n, D), attn.kv_norm.weight, base, plan.sess_arr, plan.wmap(W), plan.rowof(), rope_f, attn.kv_norm.eps)
+        else:
+            win = ex["win"] if ex and ex.get("win") is not None else kv_chain(kv.reshape(n, D), attn.kv_norm.weight, base, plan.sess_arr, plan.wmap(W), rope_f, attn.kv_norm.eps)
     else:
         if pre is None:
             kv = attn.kv_norm(attn.wkv(xq))
@@ -1918,6 +2067,10 @@ def core(attn, x: mx.array, cache, pre=None, stage: bool = False, ex: dict | Non
             t_max = CD.rows(hand.compress_kv) if hand.index_k is None else min(CD.rows(hand.compress_kv), CD.rows(hand.index_k))
         if t_max > 0 and hand.compress_kv is not None:
             short = IDXS.decide(idxr, cfg, em, rt, t_max, n, _CANON_POOLS) if idxr is not None and IDXS.ENABLED else None
+            if short is None and AZ.ACTIVE and AZ.on("idx") and idxr is not None:     # ablate: the first-k positions below each row's length (the idx_short form), no wq_b, scores or select
+                AZ.hit("idx")
+                short = (IDXS.idx_for(em, idxr.index_topk if rt else min(idxr.index_topk, t_max))[:, None, :],
+                         IDXS.all_mask(n, t_max) if getattr(idxr, "is_candidate_source", False) else None)
             if short is not None:
                 # flag idx_short: every pooled key of every row fits in the top-k, so the exact selection is the identity (see idxshort.py): no wq_b, no scores, no select
                 FD.hit("idx_short")

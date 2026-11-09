@@ -31,6 +31,7 @@ import mlx.core as mx
 from .modeldesc import KERNEL as KG
 
 from . import ablit as AB
+from . import ablate as AZ
 from . import fuse as F
 from . import fuse_attn as FA
 from . import flags as FL
@@ -364,6 +365,8 @@ def _impl_block(orig):
     SP = importlib.import_module(f"{__package__}.spec")
 
     def __call__(self, h, pre_mix, image_mask, cache):
+        if AZ.ACTIVE and AZ.chain_only() and h.shape[1] == 1:               # ablate mhc / norm: their stand-ins live in the stock chain, the fused stage paths step aside
+            return orig(self, h, pre_mix, image_mask, cache)
         if type(cache) is SP.ChainCache:
             r = _chain_block(orig, L, SP, self, h, pre_mix, image_mask, cache)
             if r is None:
