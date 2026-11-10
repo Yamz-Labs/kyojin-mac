@@ -58,4 +58,4 @@ GLM 5.5, Qwen 4 and HY4 Flash are not released; their layouts are **not guessed 
 
 ## What this page does not settle
 
-Nothing here was timed. Whether a new model reaches the bars is a lane measurement after steps 1 to 6 pass, with `docs/cloud/rival/WORK_LEDGER.md` section 3 as the do-not-redo list.
+Nothing here was timed. Whether a new model reaches the bars is a lane measurement after steps 1 to 6 pass, with the maintainers' measurement log as the do-not-redo list.

@@ -119,7 +119,7 @@ class CedSpec:
     given config qualifies is `ced.layout(config)` (keyed on the layer layout, not on the model)."""
     adapter: str
     mid: int | None = None            # first decoder layer; None = the even split n // 2 (DS4.1: 20 of 40). An explicit layer lifts the even-layer-count rule
-    tail: int | None = None           # decoder-half rows per chunk; None = sliding_window (DS4.1: 128; never lower, docs/cloud/rival/WORK_LEDGER.md)
+    tail: int | None = None           # decoder-half rows per chunk; None = sliding_window (DS4.1: 128; never lower, measured)
 
 
 @dataclass

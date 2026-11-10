@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Packed-key prefill scan for the plain indexer layers (KYOJIN_PF_IDX_CPACK, default 0; track cpackscan).
 
-Where the time goes (docs/cloud/rival/WORK_LEDGER.md, 01/11 08:00, one 8192-row chunk at 1M tokens): the 3 plain layers on 500K keys cost ~1.8 s. That is the exact
+Where the time goes (measured 01/11, one 8192-row chunk at 1M tokens): the 3 plain layers on 500K keys cost ~1.8 s. That is the exact
 arithmetic of the scores, 2 x 32 x 128 x 8192 x Tc FLOPs per layer (pf_flat docstring), not key traffic: the fused score kernel runs one query row per threadgroup and is
 FLOP bound, so reading 68 B/key of fp4 codes (KeySlots) instead of 256 B/key of fp16 cannot make the dense scan cheaper, and `mx.quantized_matmul` over the codes writes the
 [rows * 32, Tc] half product (pf_idx_qmm, ledger nightq26 pending). The only exact way under that floor is to not score key blocks that provably hold no top-k key
