@@ -8,7 +8,7 @@ cache. The weights are tiny stand-ins (the byte counts come from the shapes and 
 
   python tools/pf_moe_count.py [--layers 20] [--rows 8192] [--arms ...] [--ks 2,3,3,4] [--json out.json]
 
-Rows per expert come from `served_counts`: a model fitted to the numbers the ledger records for the lane (docs/cloud/rival/WORK_LEDGER.md, oppfcfg,
+Rows per expert come from `served_counts`: a model fitted to the numbers measured on the lane (oppfcfg,
 opskew): per 4096-row pass 355 of 384 experts hold <= 64 rows, those hold ~54.5 % of the pairs, the 29 others hold the rest, the busiest holds ~1400.
 A call of 8192 rows is two independent 4096-row draws from the same expert popularity (not a rescaling).
 """
