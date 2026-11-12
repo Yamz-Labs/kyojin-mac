@@ -60,6 +60,24 @@ One warm-up discarded, then one measured run.
 Memory: one resident copy of the weights. The 35B GGUF is a 20.8 GiB file and uses 21.6-22.0 GB in MLX.
 DeepSeek V4.1 uses 176-178 GB at 8K context and 187 GB at 983K.
 
+## New in 1.9.2
+
+Foreign checkpoints (GGUF, NVFP4, FP8, MXFP4) and several users at once. Measured on a Mac Studio through the real server
+(temperature 0, 3 fixed prompts, one warm-up discarded), against 1.9.1. Each change can be turned off:
+
+| change | effect (served) | off |
+|---|---|---|
+| fused TurboQuant decode step, plain and per user | Qwen3-8B UD-IQ3_XXS, 1 user 122 -> 139 tok/s, 4 users +47 % | `KYOJIN_TQ_STEP=0` |
+| KV format by depth: a session whose prompt fits in 4096 tokens keeps a plain fp16 cache and turns TurboQuant when it crosses 4096 (between two decode steps); a longer prompt starts in TurboQuant | Qwen3-8B, clients that send no `max_tokens`: 4 users 265 -> 320, 8 users 256 -> 540, 8 different prompts 208 -> 394; decode at 32K stays TurboQuant (82 vs 61 tok/s fp16) | `KYOJIN_TQ_FROM=0` |
+| `--sessions` derived from memory (one session's KV at 4096 tokens measured after load, floor 4, cap 8; an explicit value wins) | Qwen3-8B: 8 sessions, 8 users ~620 tok/s | `--sessions 4` |
+| no shared-prefix pool below 256 tokens (a prefix made of the chat template alone made 8 different users slower) | Qwen 35B-A3B UD-Q4_K_XL, 8 users 371 -> 469, 8 different prompts 320 -> 407; Qwen 27B NVFP4, 8 users 219 -> 257 | `KYOJIN_MU_POOL_MIN=0` |
+| MLX buffer cache floor capped at 2 GiB (was working set / 32) | memory gpt-oss-20b 22 -> 16 GB, Qwen 35B-A3B 33 -> 28 GB, Qwen 27B NVFP4 35 -> 29 GB, Qwen3-30B-A3B FP8 43 -> 38 GB; speed equal | `KYOJIN_CACHE_FLOOR_MAX_MB=1000000` |
+
+- Per model, 1 user / 8 users: Qwen3-30B-A3B FP8 97 -> 129 / 161 -> 300; Qwen 35B-A3B UD-Q4_K_XL +6 to 11 % / +27 %; Qwen 27B NVFP4 +2 to 7 % / +17 %;
+  gpt-oss-20b equal. DeepSeek V4.1 Flash: unchanged (it keeps 4 sessions).
+- The depth rule and the in-session conversion apply to the mlx-lm backends (Qwen family, GLM, gpt-oss); the DeepSeek V4.1 path is unchanged. The conversion
+  ends one decode epoch (all sessions rebatch once).
+
 ## New in 1.9.1
 
 Sampled sessions (temperature > 0) are what agents send. These flags are runtime (`POST /admin/flags`) and read from `KYOJIN_*` at

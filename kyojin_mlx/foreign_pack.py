@@ -23,7 +23,7 @@ E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5,
 KVALUES_IQ4NL = np.array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113], np.float32)
 FORMATS = ("q4_0", "iq4_nl", "q4_k", "nvfp4", "mxfp4")
 FORMATSK = ("q5_k", "q6_k", "iq4_xs", "q3_k", "iq3_s", "iq3_xxs", "q2_k", "iq2_xxs", "iq2_xs", "iq2_s", "iq1_s", "iq1_m")           # flag kstored: GGUF K / IQ blocks read as stored (same bytes, bit fields split per 32-unit; see the K section of foreign_metal)
-FORMATS8 = ("fp8", "q8_0")                      # flag fp8stored: one byte per weight, natural order (see foreign_metal 8-bit section); not in FORMATS
+FORMATS8 = ("fp8", "q8_0", "fp8b")                      # flag fp8stored: one byte per weight, natural order (see foreign_metal 8-bit section); not in FORMATS
 LAYOUT = {"q4_0": "H", "iq4_nl": "H", "q4_k": "Q4K", "nvfp4": "N", "mxfp4": "N"}
 UNIT = {"q4_0": 32, "iq4_nl": 32, "q4_k": 32, "nvfp4": 32, "mxfp4": 32}
 KALIGN = {"q4_0": 32, "iq4_nl": 32, "q4_k": 256, "nvfp4": 32, "mxfp4": 32}      # k must be a multiple of this
@@ -167,6 +167,9 @@ def dequant(p: Pack, g=True) -> np.ndarray:
         return p.qs.astype(np.float32)
     if p.fmt == "fp8":
         w = E4M3_TAB[p.qs]
+        return w * np.broadcast_to(np.asarray(p.gscale, np.float32).reshape(-1, 1), (n, 1)) if g else w
+    if p.fmt == "fp8b":
+        w = (E4M3_TAB[p.qs].reshape(n, k // 32, 32) * p.meta.astype(np.float32)[..., None]).reshape(n, k)
         return w * np.broadcast_to(np.asarray(p.gscale, np.float32).reshape(-1, 1), (n, 1)) if g else w
     if p.fmt == "q8_0":
         return (p.qs.view(np.int8).astype(np.float32).reshape(n, k // 32, 32) * p.meta.astype(np.float32)[..., None]).reshape(n, k)

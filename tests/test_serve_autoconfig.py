@@ -24,7 +24,7 @@ def make_pack(root, *, max_ctx=1048576, draft_block=5, mtp=True):
 def test_ds41_stub_resolves_like_the_lane_script(tmp_path):
     pack = AC.read_pack(make_pack(tmp_path / "ds41-stub"))
     opts = AC.resolve_options(pack)
-    assert opts["sessions"] == 4
+    assert opts["sessions"] is None                          # derived after load (server._auto_sessions), 4..8
     assert opts["ctx"] == 1048576
     assert opts["prefill_chunk"] == 8192
     assert opts["prefix_block"] == 8192
@@ -80,3 +80,12 @@ def test_positional_path_keeps_fixed_defaults(tmp_path):
     AC.resolve_serve_args(args)
     assert (args.ctx, args.prefix_cache_mb, args.kv_disk, args.kv_disk_gib) == (32768, 1024, None, 0.0)
     assert args.mtp_depth is None and args.thinking is None and args.reasoning_effort is None
+
+
+def test_auto_sessions_clamp():
+    G = 2 ** 30
+    assert AC.auto_sessions(1 * G, None) == 4                 # memory unknown: the floor
+    assert AC.auto_sessions(1 * G, 2 * G) == 4                # tight budget: never below the floor
+    assert AC.auto_sessions(1 * G, 6 * G) == 6
+    assert AC.auto_sessions(0.1 * G, 197 * G) == 8            # roomy: the cap
+    assert AC.auto_sessions(0.1 * G, 197 * G, max_rows=6) == 6

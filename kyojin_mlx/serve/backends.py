@@ -81,6 +81,22 @@ class Backend:
         """Everything that changes the cached values besides the tokens (kvdisk.KvDisk namespace), or None: this backend cannot checkpoint to disk."""
         return None
 
+    def make_cache_for(self, need: int):
+        """The cache of a new session that will hold up to `need` tokens (prompt + reply): `make_cache` unless the backend picks the KV format by depth."""
+        return self.make_cache()
+
+    def adapt_cache(self, cache, need: int):
+        """A restored cache (prefix hit) for a session that will hold up to `need` tokens: unchanged unless the backend picks the KV format by depth."""
+        return cache
+
+    def tq_cross_at(self, cache):
+        """The depth where this session's cache should turn TurboQuant (KYOJIN_TQ_FROM), or None: nothing to convert."""
+        return None
+
+    def to_tq(self, cache):
+        """The session's plain KV layers converted to TurboQuant (tq_cross_at reached)."""
+        return cache
+
     def gpu_keepalive(self) -> None:
         """A tiny GPU command while idle, so the first real one does not pay the GPU wake-up (see Engine.run)."""
         mx.eval(mx.array(0.0) + 1.0)
@@ -227,6 +243,7 @@ class Q35Backend(Backend):
         self.MU = MU
         self.model = model
         self.rowlinears = MU.install(model)
+        self.mla = MU.install_mla(model)            # MLA attention: per user under a RowsKV, no shared-prefix pool (PoolKV attends K / V, not the latent)
         from .. import depchain
         depchain.install(MU._trunk(model.language_model if "language_model" in model else model).layers)     # test-only slope probe, off unless KYOJIN_TEST_DEP_CHAIN > 0
         self.max_rows = 16                          # EXL3 GEMV: launches of <= 4 rows, up to 16 rows
@@ -245,6 +262,34 @@ class Q35Backend(Backend):
         from .. import kvwin
         return kvwin.make_prompt_cache(self.model)  # KYOJIN_KVWIN unset = mlx-lm make_prompt_cache, unchanged
 
+    def make_cache_for(self, need):
+        from .. import kvwin, tq
+        if tq.FROM > 0 and need <= tq.FROM and tq.config() is not None:
+            return kvwin.make_prompt_cache(self.model, plain=True)     # KYOJIN_TQ_FROM: short session, plain fp16 KV (TurboQuant pays off from ~FROM tokens on)
+        return self.make_cache()
+
+    def adapt_cache(self, cache, need):
+        from .. import tq
+        from mlx_lm.models.cache import KVCache
+        cfg = tq.config()
+        if tq.FROM <= 0 or need <= tq.FROM or cfg is None or not any(type(c) is KVCache for c in cache):
+            return cache
+        ref = self.make_cache()                     # which layers take TurboQuant (full attention, not MLA)
+        return [tq.from_kv(c, cfg) if type(c) is KVCache and type(r) is tq.TQKVCache else c for c, r in zip(cache, ref)]
+
+    def tq_cross_at(self, cache):
+        from .. import tq
+        from mlx_lm.models.cache import KVCache
+        if tq.FROM <= 0 or tq.config() is None or not any(type(c) is KVCache for c in cache):
+            return None
+        if getattr(self, "_tq_layers", None) is None:
+            self._tq_layers = tuple(type(r) is tq.TQKVCache for r in self.make_cache())     # which layers take TurboQuant (full attention, not MLA)
+        return tq.FROM if any(t and type(c) is KVCache for c, t in zip(cache, self._tq_layers)) else None
+
+    def to_tq(self, cache):
+        from .. import tq
+        return self.adapt_cache(cache, tq.FROM + 1)
+
     def fork(self, cache):
         return self.MU.fork_cache(cache)
 
@@ -254,7 +299,7 @@ class Q35Backend(Backend):
         return lg
 
     def batch(self, caches):
-        return self.MU.batch_caches(caches)
+        return self.MU.batch_caches(caches, 0 if self.mla else None)
 
     def unbatch(self, bc, n):
         return self.MU.unbatch_caches(bc, n)
@@ -1225,9 +1270,6 @@ def load_backend(path: str, kind: str | None = None, **kw) -> tuple[Backend, dic
         from .. import foreign_linear as FL
         from ..foreign_names import ARCHS
         if FL.is_foreign(path) == "gguf" and any(a.model_type == mt for a in ARCHS.values()):     # a bare GGUF of a mapped architecture without a table row (qwen2, qwen2_moe, llama, glm4, glm4_moe,
-            if mt == "deepseek_v3":                                                              # MLA: the latent cache of mlx-lm deepseek_v3 is multiplied as one array (embed_q / k_pe.swapaxes), the
-                raise ValueError(f"{path}: a deepseek2 GGUF loads (names, kv_b split: tests/test_gguf_arch2.py) but is not served: Q35Backend's per-user cache hands the MLA attention "   # per-user cache hands lists
-                                 "a list of keys, which deepseek_v3 cannot use; it needs a batched latent-cache path")
             kind = "q35"                                                                         # gemma3, mistral3): the generic mlx-lm loader + Q35Backend, as qwen3 already is
     prefix = row.mtp_prefix if row is not None else "mtp."
     if kind == "q35" or (kind is None and row is not None and row.backend == "q35"):
@@ -1242,7 +1284,7 @@ def load_backend(path: str, kind: str | None = None, **kw) -> tuple[Backend, dic
         if auto:                                            # DS4.1 / GLM: MTP stays opt-in (--mtp-depth N) as before (ModelDesc.mtp_auto False); a row that sets it gets the draft head when the pack carries it
             mtp = bool(row is not None and row.mtp_auto and has_mtp_tensors(mtp_head or path, prefix))
         return load_vlm(path, mtp=bool(mtp), **kw)
-    if os.environ.get("KYOJIN_BACKEND_FALLBACK", "0") != "0":              # no row: the per-user cache / multiuser plumbing on the stock model class
+    if (row is not None and row.backend == "generic") or os.environ.get("KYOJIN_BACKEND_FALLBACK", "0") != "0":   # generic row or no row: the per-user cache / multiuser plumbing on the stock model class
         be = load_generic(path, log=kw.get("log", print))
         if os.environ.get("KYOJIN_MTPGEN", "0") != "0" and mtp is not False:       # flag mtpgen: the pack's own draft head, any layout mtpgen knows
             from .. import mtpgen

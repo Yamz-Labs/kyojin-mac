@@ -11,6 +11,7 @@ Kernels (foreign_metal.py, launched through kernels._kern like the rest of the r
 Thresholds are environment knobs (KYOJIN_FOREIGN_*), unmeasured defaults: tools/fmt_gate_mac.py --native prints the numbers to set them from."""
 from __future__ import annotations
 
+import functools
 import glob
 import json
 import math
@@ -55,10 +56,12 @@ NBRK = int(os.environ.get("KYOJIN_FOREIGN_NBRK", "2"))
 NBR = int(os.environ.get("KYOJIN_FOREIGN_NBR", "2"))
 NTN = int(os.environ.get("KYOJIN_FOREIGN_NTN", "1"))
 _FMMA_MIN_ENV = os.environ.get("KYOJIN_FOREIGN_FMMA_MIN")                      # one value for every format; unset = FMMA_MIN_FMT
-FMMA_MIN_FMT = {"nvfp4": 2, "mxfp4": 2, "q4_k": 3, "q4_0": 3, "q5_k": 4, "q6_k": 4, "iq4_xs": 4, "q3_k": 4, "iq3_s": 4, "iq3_xxs": 4, "q2_k": 4, "iq2_xxs": 4, "iq2_xs": 2, "iq2_s": 3, "iq1_s": 2, "iq1_m": 3}               # gate 17408x5120, GB/s GEMV vs fmma: K formats R3 GEMV vs fmma over 3 shapes: q5_k 670/706 728/689 568/547, q6_k 779/744 855/861 663/635, iq4_xs 618/632 678/622 514/482 (min 4); fp4 R2 608/692 R4 314/701; q4_k R2 752/687 R3 667/694; q4_0 R2 773/736 R3 705/745
+# 11/11 retune after the K / IQ wrapper cache (a7341f4, the stored GEMV lost 25-46 us of host per call): the GEMV leads up to R4 on IQ3_XXS / IQ3_S /
+# IQ2_XXS / IQ2_XS / IQ1_S (R4 GB/s fmma -> GEMV: 303 -> 341, 289 -> 355, 188 -> 255, 163 -> 263, 96 -> 207; IQ2_XS R2 162 -> 361) and drops from R5 (NBR 1)
+FMMA_MIN_FMT = {"nvfp4": 2, "mxfp4": 2, "q4_k": 3, "q4_0": 3, "q5_k": 4, "q6_k": 4, "iq4_xs": 4, "q3_k": 4, "iq3_s": 5, "iq3_xxs": 5, "q2_k": 4, "iq2_xxs": 5, "iq2_xs": 5, "iq2_s": 3, "iq1_s": 5, "iq1_m": 3}               # gate 17408x5120, GB/s GEMV vs fmma: K formats R3 GEMV vs fmma over 3 shapes: q5_k 670/706 728/689 568/547, q6_k 779/744 855/861 663/635, iq4_xs 618/632 678/622 514/482 (min 4); fp4 R2 608/692 R4 314/701; q4_k R2 752/687 R3 667/694; q4_0 R2 773/736 R3 705/745
 FMMA_MAX = int(os.environ.get("KYOJIN_FOREIGN_FMMA_MAX", "16"))   # flag foreign_fmma: rows served by the few-row MMA
 WIDE_MIN = int(os.environ.get("KYOJIN_FOREIGN_WIDE_MIN", "9"))                # flag foreign_wide: rows served by the register-fed NAX product (foreign_wide.wide_source_reg) on stored bytes
-WIDE_MAX_FMT = {"nvfp4": 24, "mxfp4": 24, "q4_0": 64, "q4_k": 64, "q5_k": 64, "q6_k": 64, "iq4_xs": 64, "fp8": 32, "q8_0": 64}   # gate 17408x5120 / 5120x17408 / 5120x5120 (min of 14 interleaved reps): the K types, q4_0 and q8_0 beat decode + matmul to R64 (q8_0 2-3x), fp8 beats mma8 to R32, MLX's in-place qmm wins fp8 / fp4 above that
+WIDE_MAX_FMT = {"nvfp4": 24, "mxfp4": 24, "q4_0": 64, "q4_k": 64, "q5_k": 64, "q6_k": 64, "iq4_xs": 64, "fp8": 32, "q8_0": 64, "fp8b": 64}   # gate 17408x5120 / 5120x17408 / 5120x5120 (min of 14 interleaved reps): the K types, q4_0 and q8_0 beat decode + matmul to R64 (q8_0 2-3x), fp8 beats mma8 to R32, MLX's in-place qmm wins fp8 / fp4 above that
 WIDE_MAX_ENV = os.environ.get("KYOJIN_FOREIGN_WIDE_MAX")
 FMMA_NT, FMMA_WS = int(os.environ.get("KYOJIN_FOREIGN_FMMA_NT", "2")), int(os.environ.get("KYOJIN_FOREIGN_FMMA_WS", "4"))
 GMM = os.environ.get("KYOJIN_FOREIGN_GMM", "1") not in ("0", "")             # prefill routed experts: sorted gathered matmul over the decoded stack (0 = one launch per expert)
@@ -98,6 +101,31 @@ def kstored() -> bool:
     """Flag kstored (KYOJIN_KSTORED, default 2, read at load): GGUF Q5_K / Q6_K / IQ4_XS matrices stay as stored on the device (GEMV for few rows). 2 = the same plus a
     resident fp16 copy for the rows above (kept only while it fits, _f16copy_fits). 0 = decoded to fp16 at load, as before."""
     return os.environ.get("KYOJIN_KSTORED", "1") not in ("0", "")
+
+
+_FP8B_CACHE: dict = {}
+
+
+def _fp8b_pack(ck, c, block):
+    """Pack "fp8b" of a block-scaled E4M3 linear, or None when its blocks do not fit the 32-weight units (block k-size not a multiple of 32, k % 32).
+    meta half [n, k/32] = the block scale of each unit times a power of two 2^p (the largest one lands in [64, 128): no fp16 subnormal, and x256 in the
+    wide kernel stays finite); gs = 2^-p per row, exact. Memoised per weight name (the loader asks twice)."""
+    key = c["weight"]
+    if key in _FP8B_CACHE:
+        return _FP8B_CACHE[key]
+    _, shp, w8 = ck.raw(c["weight"])
+    n, k = int(shp[0]), int(shp[1])
+    g = np.asarray(ck.scale_f32(c["scale"]), np.float32).reshape(-1, 1) if np.ndim(ck.scale_f32(c["scale"])) < 2 else np.asarray(ck.scale_f32(c["scale"]), np.float32)
+    bn, bk = (block if block else (-(-n // g.shape[0]), -(-k // g.shape[1])))
+    pk = None
+    if k % 32 == 0 and bk % 32 == 0 and -(-n // bn) == g.shape[0] and -(-k // bk) == g.shape[1] and np.all(np.isfinite(g)) and np.all(g > 0):
+        rows = np.arange(n) // bn
+        units = (np.arange(k // 32) * 32) // bk
+        p2 = 6 - int(np.floor(np.log2(float(g.max()))))
+        meta = (g[rows][:, units] * np.float32(2.0 ** p2)).astype(np.float16)
+        pk = FP.Pack("fp8b", n, k, np.ascontiguousarray(w8).view(np.uint8).reshape(n, k), meta, np.float32(2.0 ** -p2))
+    _FP8B_CACHE[key] = pk
+    return pk
 
 
 def k_f16copy() -> bool:
@@ -140,6 +168,7 @@ def _f16copy_fits(nbytes: int) -> bool:
 
 # ------------------------------------------------------------------------------------------------------------------------------ kernel launches
 # rowgs: gs is one float per output row (a same-input group); lut: the E2M1 decode is a table read. Both False = the kernels of 3d5fd49 (same keys, names, text).
+@functools.lru_cache(maxsize=None)
 def _gemv_kern(fmt, nbr, gather, rowgs=False, lut=False, glu=False):
     tag = f"{'g' if gather else 's'}" + ("r" if rowgs else "") + ("l" if lut else "") + ("u" if glu else "")
     return KN._kern(("fgemv", fmt, nbr, gather) + ((rowgs, lut) if rowgs or lut else ()) + (("glu",) if glu else ()), name=f"kyojin_fg_gemv_{fmt}_n{nbr}{tag}",
@@ -157,6 +186,7 @@ def _pair_kern(tag, fmt, nbr, lut, names, mk):
     return KN._kern(("fpair", tag, fmt, nbr, lut), name=f"kyojin_fg_pair{tag}_{fmt}_n{nbr}", input_names=["x", "xrows", "eids"] + pnames, output_names=["y"], header=hdr, source=src)
 
 
+@functools.lru_cache(maxsize=None)
 def _mma_kern(fmt, ntn, rowgs=False, lut=False):
     return KN._kern(("fmma", fmt, ntn) + ((rowgs, lut) if rowgs or lut else ()), name=f"kyojin_fg_mma_{fmt}_t{ntn}" + ("r" if rowgs else "") + ("l" if lut else ""),
                     input_names=["xp", "qs", "mt", "gs"], output_names=["y"], header=FM.header(fmt, "mma", lut), source=FM.mma_source(fmt, ntn, rowgs))
@@ -172,36 +202,51 @@ def fmma_on() -> bool:
     return os.environ.get("KYOJIN_FOREIGN_FMMA", "1") not in ("0", "")
 
 
+@functools.lru_cache(maxsize=None)   # wide_header(fmt) formats the IQ grid tables as source text (28-115 us of host per R16 call)
+def _wide_kern(fmt, rowgs):
+    from . import foreign_wide as FW
+    return KN._kern(("fwide", fmt, rowgs), name=f"kyojin_fg_wide_{fmt}" + ("r" if rowgs else ""), input_names=FW.wide_inputs(fmt), output_names=["y"],
+                    header=FW.wide_header(fmt), source=FW.wide_source_reg(fmt, rowgs))
+
+
+@functools.lru_cache(maxsize=None)   # fmma_header(fmt) formats the IQ grid tables as source text (28-115 us of host per R5-R16 call)
 def _fmma_kern(fmt, rowgs=False):
     return KN._kern(("ffmma", fmt, rowgs), name=f"kyojin_fg_fmma_{fmt}" + ("r" if rowgs else ""), input_names=FM.fmma_inputs(fmt), output_names=["y"],
                     header=FM.fmma_header(fmt), source=FM.fmma_source(fmt, rowgs))
 
 
+@functools.lru_cache(maxsize=None)
 def _fmma_prep_kern():
     return KN._kern(("ffmma_prep",), name="kyojin_fg_fmma_prep", input_names=["x", "idx"], output_names=["xt"], source=FM.fmma_prep_source())
 
 
+@functools.lru_cache(maxsize=None)
 def _deq_kern(fmt, rowgs=False, lut=False):
     return KN._kern(("fdeq", fmt) + ((rowgs, lut) if rowgs or lut else ()), name=f"kyojin_fg_deq_{fmt}" + ("r" if rowgs else "") + ("l" if lut else ""),
                     input_names=["qs", "mt", "gs"], output_names=["w"], header=FM.header(fmt, "mma", lut), source=FM.dequant_source(fmt, rowgs))
 
 
+@functools.lru_cache(maxsize=None)
 def _gemv8_kern(fmt, nbr, gather=False, glu=False):
     return KN._kern(("fgemv8", fmt, nbr) + (("g",) if gather else ()) + (("glu",) if glu else ()), name=f"kyojin_fg_gemv8_{fmt}_n{nbr}" + ("g" if gather else "") + ("u" if glu else ""),
                     input_names=FM.gemv8_inputs(fmt, gather, glu), output_names=["y"], header=FM.header8(fmt) + (FM.GLU_HELPER if glu else ""),
                     source=FM.gemv8_source(fmt, nbr, gather, glu))
 
 
+@functools.lru_cache(maxsize=None)
 def _mma8_kern(fmt, ntn):
     return KN._kern(("fmma8", fmt, ntn), name=f"kyojin_fg_mma8_{fmt}_t{ntn}", input_names=["xp"] + FM.gemv8_inputs(fmt)[1:], output_names=["y"], header=FM.header8(fmt),
                     source=FM.mma8_source(fmt, ntn))
 
 
+@functools.lru_cache(maxsize=None)
 def _deq8_kern(fmt):
     return KN._kern(("fdeq8", fmt), name=f"kyojin_fg_deq8_{fmt}", input_names=FM.gemv8_inputs(fmt)[1:], output_names=["w"], header=FM.header8(fmt),
                     source=FM.dequant8_source(fmt))
 
 
+# cached: the K / IQ headers rebuild their grid tables as source text (IQ3_S ~40 us of host time per call)
+@functools.lru_cache(maxsize=None)
 def _gemvk_kern(fmt, nbr, gather=False, glu=False):
     return KN._kern(("fgemvk", fmt, nbr) + (("g",) if gather else ()) + (("glu",) if glu else ()),
                     name=f"kyojin_fg_gemvk_{fmt}_n{nbr}" + ("g" if gather else "") + ("u" if glu else ""),
@@ -209,10 +254,14 @@ def _gemvk_kern(fmt, nbr, gather=False, glu=False):
                     source=FM.gemvk_source(fmt, nbr, gather, glu))
 
 
+# cached: the K / IQ headers rebuild their grid tables as source text (IQ3_S ~40 us of host time per call)
+@functools.lru_cache(maxsize=None)
 def _deqk_kern(fmt):
     return KN._kern(("fdeqk", fmt), name=f"kyojin_fg_deqk_{fmt}", input_names=FM.dequantk_inputs(fmt), output_names=["w"], header=FM.hdrk(fmt), source=FM.dequantk_source(fmt))
 
 
+# cached: the K / IQ headers rebuild their grid tables as source text (IQ3_S ~40 us of host time per call)
+@functools.lru_cache(maxsize=None)
 def _mmak_kern(fmt, ntn):
     return KN._kern(("fmmak", fmt, ntn), name=f"kyojin_fg_mmak_{fmt}_t{ntn}", input_names=["xp"] + FM.gemvk_inputs(fmt)[1:], output_names=["y"], header=FM.hdrk(fmt),
                     source=FM.mmak_source(fmt, ntn))
@@ -381,7 +430,7 @@ class DevPack:
 
     # ---- one matrix, x2 [R, k] fp16 -> [R, n] fp16
     def gemv_ok(self, nbr=None):
-        return self.k % 512 == 0 and self.n % (8 * (nbr or NBR)) == 0
+        return (self.k % 512 == 0 or (self.fmt in FM.FORMATS8 and self.k % 32 == 0)) and self.n % (8 * (nbr or NBR)) == 0
 
     def apply(self, x2):
         R = x2.shape[0]
@@ -620,8 +669,7 @@ class DevPack:
         rc = min(MT, 7168 // (ws * 32))                    # rows per reduction pass: 28 KB of threadgroup memory at most
         names = FW.wide_inputs(self.fmt)
         arrs = {"x": xp, "qs": self.qs, "mt": self.meta, "gs": self.gs, "hi": getattr(self, "hi", None)}
-        kern = KN._kern(("fwide", self.fmt, self.rowgs), name=f"kyojin_fg_wide_{self.fmt}" + ("r" if self.rowgs else ""), input_names=names, output_names=["y"],
-                        header=FW.wide_header(self.fmt), source=FW.wide_source_reg(self.fmt, self.rowgs))
+        kern = _wide_kern(self.fmt, self.rowgs)
         return kern(inputs=[arrs[a] for a in names], template=[("MT", MT), ("KIN", self.k), ("N", self.n), ("WS", ws), ("RC", rc)],
                     grid=(-(-self.n // 32) * 32 * ws, -(-R // MT), 1), threadgroup=(32 * ws, 1, 1), output_shapes=[(R, self.n)], output_dtypes=[mx.float16])[0]
 
@@ -1078,8 +1126,8 @@ def is_foreign(path) -> str | None:
             rep = VI.detect_checkpoint(ck.info(), ck.config)
         finally:
             ck.close()
-        if any(f in rep["counts"] for f in ("nvfp4", "mxfp4")) and "mxfp4_blocks" not in rep["counts"]:     # FP8 linears beside them: the usual mix, decoded at load
-            return "safetensors"
+        if (any(f in rep["counts"] for f in ("nvfp4", "mxfp4")) or any(f.startswith("fp8_") for f in rep["counts"])) and "mxfp4_blocks" not in rep["counts"]:
+            return "safetensors"                                 # NVFP4 / MXFP4 (FP8 beside them) or a plain FP8 release (Qwen-FP8, DeepSeek, GLM, MiniMax layouts)
     return None
 
 
@@ -1114,12 +1162,15 @@ def _read_safetensors(path) -> _Src:
         if c is None or c["fmt"].startswith("dense_"):
             continue
         tag8 = ck.raw(c["weight"])[0] if c["fmt"].startswith("fp8_") else None
-        if (fp8stored() and tag8 == "F8_E4M3" and c["fmt"] in ("fp8_tensor", "fp8_channel", "fp8_noscale") and not _EXP.match(p + ".weight")
+        if (fp8stored() and tag8 == "F8_E4M3" and c["fmt"] in ("fp8_tensor", "fp8_channel", "fp8_noscale")
                 and ck.raw(c["weight"])[1][-1] % 32 == 0 and len(ck.raw(c["weight"])[1]) == 2):    # flag fp8stored: E4M3 bytes as stored, scale per row
             _, shp, w8 = ck.raw(c["weight"])
             sc = np.float32(1.0) if c["fmt"] == "fp8_noscale" else np.asarray(ck.scale_f32(c["scale"]), np.float32).reshape(-1)
             pk = FP.Pack("fp8", shp[0], shp[1], np.ascontiguousarray(w8).view(np.uint8), None, sc if np.ndim(sc) == 0 or sc.size != 1 else np.float32(sc[0]))
-        elif c["fmt"].startswith("fp8_"):                            # NVFP4 packs keep attention in FP8 (block scales, E5M2, experts: fp16 at load)
+        elif (fp8stored() and tag8 == "F8_E4M3" and c["fmt"] == "fp8_block" and len(ck.raw(c["weight"])[1]) == 2
+              and _fp8b_pack(ck, c, block) is not None):                # flag fp8stored: block-scaled E4M3 (DeepSeek / Qwen-FP8 / GLM / MiniMax layout) as stored
+            pk = _fp8b_pack(ck, c, block)
+        elif c["fmt"].startswith("fp8_"):                            # E5M2, blocks that straddle the 32-weight units: fp16 at load
             w = np.asarray(VI.load_linear(ck, p)).astype(np.float16)
             pk = FP.Pack("dense", w.shape[0], w.shape[1], w)
         elif c["fmt"] in ("nvfp4", "mxfp4"):
@@ -1305,9 +1356,18 @@ def load_foreign(path, dtype=mx.float16, log=print):
     marks = {p + ".weight": mx.zeros((1,)) for p in {**src.packs, **src.embed}}
     weights = (model.sanitize if hasattr(model, "sanitize") else dict)({**src.dense, **marks})        # glm4 and some others have no sanitize: names are the HF ones already
     by_id = {id(v): k for k, v in weights.items()}
+    # a top-level group sanitize drops whole (mtp.* in qwen3_5: the MTP head is served from its own sidecar) is dropped for the quantised linears too
+    kept = {id(v) for v in weights.values()}
+    groups = {}
+    for k, v in {**src.dense, **marks}.items():
+        groups.setdefault(k.split(".", 1)[0], []).append(id(v) in kept)
+    dropped = {g for g, ks in groups.items() if not any(ks)}
     where = {}
     for k, v in marks.items():
         if id(v) not in by_id:
+            if k.split(".", 1)[0] in dropped:
+                src.packs.pop(k[:-len(".weight")], None); src.embed.pop(k[:-len(".weight")], None)
+                continue
             raise ValueError(f"model.sanitize() rewrote {k}: this architecture's weight renaming is not followable")
         where[k[:-len(".weight")]] = by_id[id(v)][:-len(".weight")]
     mods = []

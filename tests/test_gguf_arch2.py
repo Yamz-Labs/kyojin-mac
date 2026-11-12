@@ -352,18 +352,21 @@ def _bare_llama(tmp_path, arch="llama", model_type="llama", chat="{{ bos_token }
     return p
 
 
-def test_deepseek2_gguf_is_refused_at_load_with_the_reason(tmp_path, monkeypatch):
+def test_deepseek2_gguf_is_routed_to_the_generic_loader(tmp_path, monkeypatch):
+    """MLA (deepseek_v3 class) is served: Q35Backend runs its attention per user under a RowsKV (multiuser.install_mla, tests/test_mla_rows.py)."""
     from kyojin_mlx.serve import backends as B
     from kyojin_mlx import foreign_linear as FL
     p = tmp_path / "d.gguf"
     SY.write_gguf(p, {"general.architecture": "deepseek2"}, [])
+    seen = {}
     monkeypatch.setattr(B, "wire_memory", lambda log=print: 0)
     monkeypatch.setattr(N, "gguf_config", lambda g: {"model_type": "deepseek_v3"})
     monkeypatch.setattr(FL, "is_foreign", lambda path: "gguf")
     monkeypatch.setattr(GF, "GgufFile", lambda path: None)
     monkeypatch.setattr(GF, "find_gguf", lambda path: str(p))
-    with pytest.raises(ValueError, match="batched latent-cache"):
-        B.load_backend(str(p))
+    monkeypatch.setattr(N, "gguf_has_mtp", lambda path: False)
+    monkeypatch.setattr(B, "load_q35", lambda path, **kw: seen.update(path=path) or ("backend", {"model_type": "deepseek_v3"}))
+    assert B.load_backend(str(p))[0] == "backend" and seen["path"] == str(p)
 
 
 @pytest.mark.parametrize("arch,model_type", [("llama", "llama"), ("mistral3", "llama"), ("qwen2", "qwen2")])

@@ -1674,6 +1674,20 @@ class TQKVCache(WinKVCache):
         self._prev = self._chunk = None
 
 
+FROM = int(os.environ.get("KYOJIN_TQ_FROM", "4096"))        # > 0: a session whose prompt + reply fits in FROM tokens keeps a plain fp16 cache (faster at short
+                                                            # depth); longer ones get TurboQuant at admission (serve.backends.Q35Backend). 0 = TurboQuant for all. Default 4096: Qwen3-8B crossover 4-8K (11/11).
+
+
+def from_kv(c, cfg: dict) -> "TQKVCache":
+    """A plain KVCache (keys after rope) -> a TurboQuant cache holding the same rows: the pool quantizes [sink, L - window), the ring keeps the rest fp16, as if
+    the rows had been prefilled into it."""
+    t = TQKVCache(**cfg)
+    if c.keys is not None and c.offset > 0:
+        n = int(c.offset)
+        t.update_and_fetch(c.keys[:, :, :n], c.values[:, :, :n])
+    return t
+
+
 def config():
     """Parse KYOJIN_TQ -> dict(kbits, vbits, sink, window) or None (off)."""
     v = os.environ.get(ENV, "").strip().lower()

@@ -222,3 +222,35 @@ def test_finish_without_write_back(monkeypatch):
     [t.start() for t in ths]; [t.join() for t in ths]
     eng.stop()
     assert out[0][0] == want[0][0] and out[1][0] == want[1][0]
+
+
+class FakeTQ(Fake):
+    """KYOJIN_TQ_FROM stand-in: a plain cache turns 'TurboQuant' at depth 30 (to_tq marks it); the tokens must not notice."""
+    def tq_cross_at(self, cache):
+        return None if cache.get("tq") else 30
+
+    def to_tq(self, cache):
+        assert not cache.get("tq") and len(cache["h"]) >= 30
+        return {"h": list(cache["h"]), "tq": True}
+
+
+def test_plain_session_turns_tq_when_it_crosses():
+    prompts = {n: [(n * 5 + i * 7) % V for i in range(8 + 6 * n)] for n in range(4)}       # 8, 14, 20, 26 prompt tokens
+    limits = {0: 40, 1: 10, 2: 25, 3: 3}                                                   # crosses 30: n0 (48), n2 (45); n1 (24), n3 (29) never
+    want = {n: solo(prompts[n], max_new=limits[n]) for n in prompts}
+    eng = Engine(FakeTQ(), sessions=3, ctx=4096, chunk=4, block=8, prefix_bytes=0)
+    eng.start()
+    out = {}
+
+    def worker(n):
+        time.sleep(0.01 * n)
+        out[n] = collect(eng.submit(prompts[n], max_new=limits[n]))
+    ths = [threading.Thread(target=worker, args=(n,)) for n in prompts]
+    [t.start() for t in ths]; [t.join() for t in ths]
+    st = eng.status()
+    eng.stop()
+    for n in prompts:
+        assert out[n][0] == want[n][0], n
+        assert out[n][1] == "length" and len(out[n][0]) == limits[n]
+    assert eng.stats["n_tq_converted"] == 2, eng.stats["n_tq_converted"]
+    assert st["waiting"] == 0 and st["decoding"] == 0

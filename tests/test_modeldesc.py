@@ -104,7 +104,8 @@ def test_qualify_families_unchanged():
            "Qwen3_5MoeForConditionalGeneration": ("hybrid_gdn", "qwen", "qwen35", "kvwin", True),
            "Qwen3_5MoeForCausalLM": ("hybrid_gdn", "qwen", "qwen35", "kvwin", False),
            "DeepseekV41ForCausalLM": ("ds41", "ds41", None, "native", False),
-           "Glm5NextForConditionalGeneration": ("glm5_next", "glm", None, "native", True)}
+           "Glm5NextForConditionalGeneration": ("glm5_next", "glm", None, "native", True),
+           "GptOssForCausalLM": ("gpt_oss", "harmony", None, "fp16", False)}
     assert {a: (f["family"], f["server"], f["ref"], f["kv"], f["vision"]) for a, f in pack.FAMILIES.items()} == old
 
 

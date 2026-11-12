@@ -42,7 +42,10 @@ _MRG = r"""
     const int NS1 = info[0], RP1 = info[1], RP2 = info[2], G = info[3], Hk = info[4];
     const int u = int(z) / Hk, hk = int(z) % Hk;
     const int trow = int(z) * RP2 + int(g);
+    const bool HS = info[5] != 0;
+    const float SK = HS ? sinks[hk * G + int(g)] : 0.0f;                  // learned attention sink of query head hk * G + g (gpt-oss)
     float M = pml2[trow * 2];
+    if (HS) M = max(M, SK);
     for (int s = 0; s < NS1; s++) M = max(M, pml1[((hk * NS1 + s) * RP1 + u * G + int(g)) * 2]);
     float w = fast::exp(pml2[trow * 2] - M);
     float acc = w * po2[trow * D + d], L = w * pml2[trow * 2 + 1];
@@ -52,13 +55,14 @@ _MRG = r"""
         acc += w * po1[row * D + d];
         L += w * pml1[row * 2 + 1];
     }
+    if (HS) L += fast::exp(SK - M);                                     // the sink adds to the softmax denominator only
     out[(int(z) * G + int(g)) * D + d] = (T_)(acc / L);
 """
 
 
 def _mrg_kernel():
     if "mrg" not in _kern:
-        _kern["mrg"] = mx.fast.metal_kernel("kyojin_mu_mrg", ["po1", "pml1", "po2", "pml2", "info"], ["out"], _MRG)
+        _kern["mrg"] = mx.fast.metal_kernel("kyojin_mu_mrg", ["po1", "pml1", "po2", "pml2", "info", "sinks"], ["out"], _MRG)
     return _kern["mrg"]
 
 
@@ -68,7 +72,7 @@ def _geom(R: int, D: int):
     return TQ, WM, WN, WM * TQ * 16
 
 
-def pooled_attention(q, pk, pv, tk, tv, lens: mx.array, scale: float):
+def pooled_attention(q, pk, pv, tk, tv, lens: mx.array, scale: float, sinks: mx.array | None = None):
     """q [Nu, Hq, 1, D]; pk / pv [1, Hk, P, D] shared prefix (or None); tk / tv [Nu, Hk, cap, D] pooled tails, lens [Nu] int32 keys per session
     (>= 1). Returns [Nu, Hq, 1, D]."""
     Nu, Hq, _, D = q.shape
@@ -76,7 +80,7 @@ def pooled_attention(q, pk, pv, tk, tv, lens: mx.array, scale: float):
     G = Hq // Hk
     if pk is not None and Nu * G > SD.MAX_ROWS:                                         # more sessions than rows per threadgroup: chunk
         U = max(1, SD.MAX_ROWS // G)
-        return mx.concatenate([pooled_attention(q[i:i + U], pk, pv, tk[i:i + U], tv[i:i + U], lens[i:i + U], scale) for i in range(0, Nu, U)])
+        return mx.concatenate([pooled_attention(q[i:i + U], pk, pv, tk[i:i + U], tv[i:i + U], lens[i:i + U], scale, sinks) for i in range(0, Nu, U)])
     bk = SD.NAX_BK
     sc = mx.array([scale], dtype=mx.float32)
     q = mx.contiguous(q)
@@ -101,7 +105,8 @@ def pooled_attention(q, pk, pv, tk, tv, lens: mx.array, scale: float):
     else:
         ns, RP1 = 0, 1
         po1, pml1 = po2[:1], pml2[:1]
-    out = _mrg_kernel()(inputs=[po1, pml1, po2, pml2, mx.array([ns, RP1, RP2, G, Hk], dtype=mx.int32)], template=[("D", D), ("T_", q.dtype)],
+    sk = sinks.astype(mx.float32) if sinks is not None else mx.zeros((1,), dtype=mx.float32)
+    out = _mrg_kernel()(inputs=[po1, pml1, po2, pml2, mx.array([ns, RP1, RP2, G, Hk, int(sinks is not None)], dtype=mx.int32), sk], template=[("D", D), ("T_", q.dtype)],
                         grid=(D, G, Nu * Hk), threadgroup=(min(D, 256), 1, 1), output_shapes=[(Nu * Hk * G, D)], output_dtypes=[q.dtype])[0]
     return out.reshape(Nu, Hq, 1, D)
 
@@ -160,8 +165,8 @@ class PoolKV:
         self.lens = [n + 1 for n in self.lens]
         return None, None
 
-    def attend(self, q: mx.array, scale: float) -> mx.array:
-        return pooled_attention(q, self.pk, self.pv, self.tk, self.tv, mx.array(self.lens, dtype=mx.int32), scale)
+    def attend(self, q: mx.array, scale: float, sinks: mx.array | None = None) -> mx.array:
+        return pooled_attention(q, self.pk, self.pv, self.tk, self.tv, mx.array(self.lens, dtype=mx.int32), scale, sinks)
 
     def unbatch(self) -> list[KVCache]:
         out = []

@@ -234,7 +234,8 @@ def test_cache_limit_default_follows_the_weights():
     assert cache_limit_mb_for(5 * 2 ** 30) == 512
     assert cache_limit_mb_for(10 * 2 ** 20) == 256
     assert cache_limit_mb_for(172 * 2 ** 30) == 16384
-    assert cache_limit_mb_for(10 * 2 ** 20, 243 * 2 ** 30) == 7776    # the floor follows the machine (a small model on a big Mac)
+    assert cache_limit_mb_for(10 * 2 ** 20, 243 * 2 ** 30) == 2048    # the floor follows the machine, capped at 2 GiB (a small model on a big Mac)
+    assert cache_limit_mb_for(10 * 2 ** 20, 48 * 2 ** 30) == 1536     # 64 GB Mac: working set / 32, under the cap
     assert cache_limit_mb_for(10 * 2 ** 20, 8 * 2 ** 30) == 256
     assert cache_limit_mb_for(172 * 2 ** 30, 243 * 2 ** 30) == 16384
 

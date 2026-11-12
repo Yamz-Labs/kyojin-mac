@@ -6,7 +6,7 @@ mx = pytest.importorskip("mlx.core")
 from kyojin_mlx import foreign_gguf as GF, foreign_linear as FL, foreign_pack as FP, foreign_synth as SY, foreign_metal as FM
 
 needs_gpu = pytest.mark.skipif(not mx.metal.is_available(), reason="needs a Metal GPU")
-FORMATS = ("nvfp4", "mxfp4", "q4_0", "q4_k", "q5_k", "q6_k", "iq4_xs", "q3_k", "q2_k", "iq3_s", "iq3_xxs", "iq2_xxs", "iq2_xs", "iq2_s", "iq1_s", "iq1_m", "q8_0", "fp8")
+FORMATS = ("nvfp4", "mxfp4", "q4_0", "q4_k", "q5_k", "q6_k", "iq4_xs", "q3_k", "q2_k", "iq3_s", "iq3_xxs", "iq2_xxs", "iq2_xs", "iq2_s", "iq1_s", "iq1_m", "q8_0", "fp8", "fp8b")
 
 
 def _pack(fmt, n, k, seed=0):
@@ -17,6 +17,11 @@ def _pack(fmt, n, k, seed=0):
         w8 = rng.integers(0, 256, (n, k), dtype=np.uint8)
         w8[(w8 & 127) == 127] = 0x38
         return FP.Pack("fp8", n, k, w8, None, rng.uniform(0.5, 2.0, n).astype(np.float32))
+    if fmt == "fp8b":    # E4M3 bytes, block scale per 32-unit constant over 128 x 128 blocks, power-of-two row scale (the loader's layout)
+        w8 = rng.integers(0, 256, (n, k), dtype=np.uint8)
+        w8[(w8 & 127) == 127] = 0x38
+        g = rng.uniform(16.0, 120.0, (-(-n // 128), -(-k // 128))).astype(np.float32)
+        return FP.Pack("fp8b", n, k, w8, g[np.arange(n) // 128][:, (np.arange(k // 32) * 32) // 128].astype(np.float16), np.float32(2.0 ** -7))
     return GF.to_pack(fmt.upper(), SY.random_blocks(fmt.upper(), n, k, rng), k)
 
 
@@ -34,7 +39,7 @@ def test_wide_matches_decode(fmt, R):
 
 
 @needs_gpu
-@pytest.mark.parametrize("fmt", ("nvfp4", "q4_k", "q6_k", "fp8", "q8_0"))
+@pytest.mark.parametrize("fmt", ("nvfp4", "q4_k", "q6_k", "fp8", "q8_0", "fp8b"))
 def test_wide_route(fmt, monkeypatch):
     """Rows 9..WIDE_MAX go through the wide product, 1..8 and above do not; KYOJIN_FOREIGN_WIDE=0 switches it off."""
     d = FL.DevPack(_pack(fmt, 64, 512))

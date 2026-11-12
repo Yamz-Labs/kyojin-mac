@@ -26,9 +26,9 @@ def _mod(hq, hk, d, rd, rng):
     return m
 
 
-def _stock(c, m, qp, kp, vp):
-    hq, hk = m.num_attention_heads, m.num_key_value_heads
-    q, gate = mx.split(qp.reshape(1, 1, hq, -1), 2, axis=-1)
+def _stock(c, m, qp, kp, vp, gated=True):
+    hq, hk = TS._heads(m)
+    q, gate = mx.split(qp.reshape(1, 1, hq, -1), 2, axis=-1) if gated else (qp.reshape(1, 1, hq, -1), None)
     d = q.shape[-1]
     k = m.k_norm(kp.reshape(1, 1, hk, d)).transpose(0, 2, 1, 3)
     v = vp.reshape(1, 1, hk, d).transpose(0, 2, 1, 3)
@@ -36,24 +36,29 @@ def _stock(c, m, qp, kp, vp):
     q, k = m.rope(q, offset=c.offset), m.rope(k, offset=c.offset)
     c.update_and_fetch(k, v)
     out = c.attend(q, m.scale)
-    return out.transpose(0, 2, 1, 3).reshape(1, 1, -1) * mx.sigmoid(gate.reshape(1, 1, -1))
+    out = out.transpose(0, 2, 1, 3).reshape(1, 1, -1)
+    return out * mx.sigmoid(gate.reshape(1, 1, -1)) if gated else out
 
 
+@pytest.mark.parametrize("gated", [True, False])                  # gated q (Qwen3.5 / 3.6) and plain q with mlx-lm head names (Qwen3)
 @pytest.mark.parametrize("hq,hk,d,rd,kb,vb", CLASSES)
-def test_step_matches_stock(hq, hk, d, rd, kb, vb):
+def test_step_matches_stock(hq, hk, d, rd, kb, vb, gated):
     rng = np.random.default_rng(0)
     m = _mod(hq, hk, d, rd, rng)
+    if not gated:
+        m.n_heads, m.n_kv_heads = m.num_attention_heads, m.num_key_value_heads
+        del m.num_attention_heads, m.num_key_value_heads
     a, b = (TQ.TQKVCache(kb, vb, sink=4, window=48, margin=16) for _ in range(2))
     dt = mx.float16
     errs = []
     for t in range(420):                                  # crosses the sink, the ring filling, the full ring and one pool growth (step 256)
-        qp = mx.array(rng.standard_normal((1, 1, hq * 2 * d)).astype(np.float16))
+        qp = mx.array(rng.standard_normal((1, 1, hq * (2 if gated else 1) * d)).astype(np.float16))
         kp = mx.array(rng.standard_normal((1, 1, hk * d)).astype(np.float16))
         vp = mx.array(rng.standard_normal((1, 1, hk * d)).astype(np.float16))
-        ref = _stock(a, m, qp, kp, vp)
-        got = TS.step(b, m, qp, kp, vp, m.scale)
+        ref = _stock(a, m, qp, kp, vp, gated)
+        got = TS.step(b, m, qp, kp, vp, m.scale, gated=gated)
         if got is None:                                   # sink rows run the stock chain
-            got = _stock(b, m, qp, kp, vp)
+            got = _stock(b, m, qp, kp, vp, gated)
         else:
             assert t >= 4
         mx.eval(ref, got)

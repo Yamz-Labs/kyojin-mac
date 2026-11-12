@@ -27,10 +27,10 @@ class ModelDesc:
     architectures: dict                   # config.json "architectures"[0] -> has a vision tower
     block: str                            # layer layout: "hybrid_gdn" (linear attention + full attention every N) | "csa_moe_hc" | "mla_dsa_moe_hc"
     attn: str                             # "gdn+gqa" | "csa" (compressed sparse + sliding window) | "mla_dsa"
-    kv: str                               # "kvwin" (quantized pool on the full-attention layers) | "native" (the model's own cache, no KV bits to choose)
+    kv: str                               # "kvwin" (quantized pool on the full-attention layers) | "native" (the model's own cache, no KV bits to choose) | "fp16" (plain cache: attention sinks)
     moe: str                              # "yes" | "no" | "config" (decided by the experts count of the config)
     hc: str                               # hyper-connections: "yes" | "no" | "config" (hc_mult in the config)
-    backend: str                          # serve.backends loader: "q35" | "vlm"
+    backend: str                          # serve.backends loader: "q35" | "vlm" | "generic" (stock mlx-lm class + multiuser plumbing)
     server: str                           # serve.chat family: "qwen" | "glm" | "ds41" (also the `thinking` flag spelling in chat)
     family: str                           # qualify family name
     arch: str | None = None               # kyojin_mlx.archs.ARCHS key (None = not patched through patch_model)
@@ -65,6 +65,10 @@ DESCS = (
         name="glm5_next", model_types=("glm5_next",), architectures={"Glm5NextForConditionalGeneration": True},
         block="mla_dsa_moe_hc", attn="mla_dsa", kv="native", moe="yes", hc="yes", backend="vlm", server="glm", family="glm5_next",
         arch="glm5_next", chat_prefixes=("glm",), stop_tokens=("<|user|>", "<|observation|>", "<|endoftext|>")),
+    ModelDesc(                                      # OpenAI gpt-oss (MXFP4 experts read natively by mlx-lm, attention with learned sinks: fp16 KV, no TurboQuant pool)
+        name="gpt_oss", model_types=("gpt_oss",), architectures={"GptOssForCausalLM": False},
+        block="moe", attn="gqa+sinks", kv="fp16", moe="yes", hc="no", backend="generic", server="harmony", family="gpt_oss",
+        stop_tokens=("<|return|>", "<|call|>")),
 )
 
 _BY_TYPE = {t: d for d in DESCS for t in d.model_types}
