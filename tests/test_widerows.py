@@ -27,7 +27,7 @@ def _pack(fmt, n, k, seed=0):
 
 @needs_gpu
 @pytest.mark.parametrize("fmt", FORMATS)
-@pytest.mark.parametrize("R", (9, 16, 17, 33, 48, 49, 64))
+@pytest.mark.parametrize("R", (5, 8, 9, 16, 17, 33, 48, 49, 64))
 def test_wide_matches_decode(fmt, R):
     d = FL.DevPack(_pack(fmt, 100, 1024, seed=R))
     x = (np.random.default_rng(R).standard_normal((R, 1024)) * 0.5).astype(np.float16)
@@ -41,7 +41,8 @@ def test_wide_matches_decode(fmt, R):
 @needs_gpu
 @pytest.mark.parametrize("fmt", ("nvfp4", "q4_k", "q6_k", "fp8", "q8_0", "fp8b"))
 def test_wide_route(fmt, monkeypatch):
-    """Rows 9..WIDE_MAX go through the wide product, 1..8 and above do not; KYOJIN_FOREIGN_WIDE=0 switches it off."""
+    """Rows WIDE_MIN..WIDE_MAX go through the wide product, the rows below and above do not; the 8-bit formats start at 5 on linears of at least
+    WIDE8_MIN_SIZE weights (this 64 x 512 test matrix is under it: 9, unless the size floor is lowered). KYOJIN_FOREIGN_WIDE=0 switches it off."""
     d = FL.DevPack(_pack(fmt, 64, 512))
     calls = []
     orig = d._wide
@@ -50,9 +51,15 @@ def test_wide_route(fmt, monkeypatch):
     for R in (1, 8, 9, hi, hi + 1):
         d.apply(mx.zeros((R, 512), mx.float16))
     assert calls == [9, hi]
+    calls.clear()
+    monkeypatch.setattr(FL, "WIDE8_MIN_SIZE", 0)
+    lo = FL.WIDE_MIN_FMT.get(fmt, 9)
+    for R in (1, lo - 1, lo, hi, hi + 1):
+        d.apply(mx.zeros((R, 512), mx.float16))
+    assert calls == [lo, hi]
     monkeypatch.setenv("KYOJIN_FOREIGN_WIDE", "0")
     d.apply(mx.zeros((12, 512), mx.float16))
-    assert calls == [9, hi]
+    assert calls == [lo, hi]
 
 
 @needs_gpu

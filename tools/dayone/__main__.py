@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 from . import engine, shapes
@@ -21,7 +22,10 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     todo = {}
     for w in (list(shapes.SHAPES) if a.all or not a.what else a.what):
-        todo[w] = shapes.SHAPES[w] if w in shapes.SHAPES else json.load(open(w))
+        if w in shapes.SHAPES:
+            todo[w] = shapes.SHAPES[w]
+        else:                                                   # a config.json path: the family is named after the file (a path cannot be a temp-dir prefix)
+            todo[os.path.splitext(os.path.basename(w))[0]] = json.load(open(w))
     out = {}
     for name, cfg in todo.items():
         for fl in (("off", "on") if a.flags == "both" else (a.flags,)):

@@ -60,7 +60,14 @@ _FMMA_MIN_ENV = os.environ.get("KYOJIN_FOREIGN_FMMA_MIN")                      #
 # IQ2_XXS / IQ2_XS / IQ1_S (R4 GB/s fmma -> GEMV: 303 -> 341, 289 -> 355, 188 -> 255, 163 -> 263, 96 -> 207; IQ2_XS R2 162 -> 361) and drops from R5 (NBR 1)
 FMMA_MIN_FMT = {"nvfp4": 2, "mxfp4": 2, "q4_k": 3, "q4_0": 3, "q5_k": 4, "q6_k": 4, "iq4_xs": 4, "q3_k": 4, "iq3_s": 5, "iq3_xxs": 5, "q2_k": 4, "iq2_xxs": 5, "iq2_xs": 5, "iq2_s": 3, "iq1_s": 5, "iq1_m": 3}               # gate 17408x5120, GB/s GEMV vs fmma: K formats R3 GEMV vs fmma over 3 shapes: q5_k 670/706 728/689 568/547, q6_k 779/744 855/861 663/635, iq4_xs 618/632 678/622 514/482 (min 4); fp4 R2 608/692 R4 314/701; q4_k R2 752/687 R3 667/694; q4_0 R2 773/736 R3 705/745
 FMMA_MAX = int(os.environ.get("KYOJIN_FOREIGN_FMMA_MAX", "16"))   # flag foreign_fmma: rows served by the few-row MMA
-WIDE_MIN = int(os.environ.get("KYOJIN_FOREIGN_WIDE_MIN", "9"))                # flag foreign_wide: rows served by the register-fed NAX product (foreign_wide.wide_source_reg) on stored bytes
+WIDE_MIN_ENV = os.environ.get("KYOJIN_FOREIGN_WIDE_MIN")                     # one value for every format (KYOJIN_FOREIGN_WIDE_MIN=9 restores the old 8-bit route); unset = WIDE_MIN_FMT
+WIDE_MIN = int(WIDE_MIN_ENV or "9")
+# 12/11: the 8-bit formats take the wide product from R5 (gate 17408x5120, GB/s of stored bytes, stored GEMV -> wide: Q8_0 R5 725 -> 865, R8 521 -> 867;
+# fp8 R5 629 -> 856, R8 456 -> 858; fp8b R5 650 -> 858, R8 458 -> 847; R4 equal), the others from R9
+WIDE_MIN_FMT = {"q8_0": 5, "fp8": 5, "fp8b": 5}
+# ... on the large dense linears only: served dense 27B FP8 N8 97.9 -> 149.4 (+53 %), N8d 86.8 -> 125.1; the small attention linears of the MoE models lost
+# (Qwen3-30B-A3B FP8 N8 318 -> 301, GLM-4.7-Flash Q8_0 188 -> 172 with every 8-bit linear on it), so below WIDE8_MIN_SIZE weights the 8-bit route is unchanged
+WIDE8_MIN_SIZE = int(os.environ.get("KYOJIN_FOREIGN_WIDE8_MIN_SIZE", str(16 << 20)))                # flag foreign_wide: rows served by the register-fed NAX product (foreign_wide.wide_source_reg) on stored bytes
 WIDE_MAX_FMT = {"nvfp4": 24, "mxfp4": 24, "q4_0": 64, "q4_k": 64, "q5_k": 64, "q6_k": 64, "iq4_xs": 64, "fp8": 32, "q8_0": 64, "fp8b": 64}   # gate 17408x5120 / 5120x17408 / 5120x5120 (min of 14 interleaved reps): the K types, q4_0 and q8_0 beat decode + matmul to R64 (q8_0 2-3x), fp8 beats mma8 to R32, MLX's in-place qmm wins fp8 / fp4 above that
 WIDE_MAX_ENV = os.environ.get("KYOJIN_FOREIGN_WIDE_MAX")
 FMMA_NT, FMMA_WS = int(os.environ.get("KYOJIN_FOREIGN_FMMA_NT", "2")), int(os.environ.get("KYOJIN_FOREIGN_FMMA_WS", "4"))
@@ -648,7 +655,8 @@ class DevPack:
 
     def wide_ok(self, R):
         hi = int(WIDE_MAX_ENV) if WIDE_MAX_ENV else WIDE_MAX_FMT.get(self.fmt, 32)
-        return wide_on() and WIDE_MIN <= R <= hi and not self.E and self.k % 128 == 0 and (self.fmt in FM._FMMA_PAIR or self.fmt in FM.FORMATS8) and self.w16 is None
+        lo = int(WIDE_MIN_ENV) if WIDE_MIN_ENV else (WIDE_MIN_FMT.get(self.fmt, WIDE_MIN) if self.n * self.k >= WIDE8_MIN_SIZE else WIDE_MIN)
+        return wide_on() and lo <= R <= hi and not self.E and self.k % 128 == 0 and (self.fmt in FM._FMMA_PAIR or self.fmt in FM.FORMATS8) and self.w16 is None
 
     def _wide(self, x2, share=True):
         """x2 [R, k] -> [R, n] fp16 on the stored bytes: foreign_wide.wide_source_reg (one weight read for all rows, NAX matmul, fp32 accumulation)."""

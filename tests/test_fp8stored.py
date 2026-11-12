@@ -90,9 +90,9 @@ def _pack(fmt, n, k, seed=0):
 
 @needs_gpu
 @pytest.mark.parametrize("fmt", FM.FORMATS8)
-@pytest.mark.parametrize("R", (1, 2, 4, 8, 9, 12, 13, 16, 24, 32, 33, 56, 57, 70))
+@pytest.mark.parametrize("R", (1, 2, 4, 5, 6, 8, 9, 12, 13, 16, 24, 32, 33, 56, 57, 70))
 def test_apply_matches_float32_reference(fmt, R):
-    """R <= GEMV8_ROWS: the stored GEMV; to DENSE8_ROWS: the simdgroup-matrix kernel (32-row slices); above: decode + matmul. All against x @ W^T in float32."""
+    """R <= 4: the stored GEMV; R5 up to the format's wide max: the register-fed wide product (WIDE_MIN_FMT); to DENSE8_ROWS: the simdgroup-matrix kernel (32-row slices); above: decode + matmul. All against x @ W^T in float32."""
     import mlx.core as mx
     from kyojin_mlx import foreign_linear as FL
     p = _pack(fmt, 128, 1024)

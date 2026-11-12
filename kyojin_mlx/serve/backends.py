@@ -1075,12 +1075,14 @@ def load_q35(path: str, mtp: bool | None = None, mtp_head: str | None = None, lo
         import json
         from .q35mlx import Q35MlxBackend, find_mtp_dir
         model, _ = mlxpack.load(path)
-        be = Q35MlxBackend(model)
+        d = find_mtp_dir(path, mtp_head) if mtp is not False else None
+        # Q35MlxBackend is the Qwen3.5 wrapper class (model.language_model, GDN layers, MTP head). A text-only mlx-lm class (Qwen3 dense / MoE, ...) has none of
+        # these and serves on the plain Q35Backend, linears as stored (mx.quantized_matmul with the file's group_size / bits / mode).
+        be = Q35MlxBackend(model) if "language_model" in model else Q35Backend(model)
         be.pack = path
         if os.environ.get("KYOJIN_WARM_LOAD", "1") != "0":
             be.warm(log)
-        d = find_mtp_dir(path, mtp_head) if mtp is not False else None
-        if d is not None:
+        if d is not None and isinstance(be, Q35MlxBackend):
             log(f"mtp: {be.enable_mtp(d)}")
         return be, json.load(open(os.path.join(path, "config.json")))
     from ..exl3_linear import load_exl3
@@ -1099,6 +1101,14 @@ class GenericBackend(Q35Backend):
     multiuser rows, kvdisk through the generic adapter); none of the Qwen step regions, no draft head, no kvwin. Correctness path, not a speed path."""
     kind = "generic"
     vision = None                                   # flag visiongen: the model's GenVision (visiongen.py), set by load_generic
+
+    def make_cache(self):
+        """A vlm wrapper without make_cache (mlx-vlm qwen4_exp: the language model has it): the language model's own caches, so its linear-attention layers get
+        their state cache (mlx-lm's default would hand them plain KVCaches). Models with their own make_cache, or none anywhere: the Q35Backend line, unchanged."""
+        lm = self.model.language_model if "language_model" in self.model else None
+        if not hasattr(self.model, "make_cache") and lm is not None and hasattr(lm, "make_cache"):
+            return lm.make_cache()
+        return super().make_cache()
 
     def _embed_kw(self):
         import inspect
