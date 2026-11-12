@@ -148,7 +148,7 @@ def p_entry(x: Ctx):
     mt = x.cfg["model_type"]
     pack = autoconfig.read_pack(x.path)
     row = modeldesc.backend_desc(mt)
-    if row is not None:
+    if row is not None and row.backend != "generic":         # q35 / vlm rows load Metal-bound backends; a generic row (stock class) runs here like the no-row path
         return f"modeldesc row {row.name}, chat {pack.family}, backend {row.backend} (described: the Metal-bound backend load is not run on CPU)"
     missing = ["chat family"] * (pack.family is None) + ["modeldesc row"]
     try:
@@ -168,7 +168,8 @@ def p_entry(x: Ctx):
     got = [int(t) for t in mx.argmax(be.step(bc, mx.array(firsts)), axis=-1).tolist()]
     if got != solo:
         raise AssertionError(f"backend 2-row step {got} != solo {solo}")
-    return f"no row, chat {pack.family}; {type(be).__name__}: make_cache, chunked prefill, fork, 2-row step == solo"
+    head = f"modeldesc row {row.name}" if row is not None else "no row"
+    return f"{head}, chat {pack.family}; {type(be).__name__}: make_cache, chunked prefill, fork, 2-row step == solo"
 
 
 def p_load(x: Ctx):

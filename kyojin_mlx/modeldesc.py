@@ -69,6 +69,11 @@ DESCS = (
         name="gpt_oss", model_types=("gpt_oss",), architectures={"GptOssForCausalLM": False},
         block="moe", attn="gqa+sinks", kv="fp16", moe="yes", hc="no", backend="generic", server="harmony", family="gpt_oss",
         stop_tokens=("<|return|>", "<|call|>")),
+    ModelDesc(                                      # Baidu ERNIE 4.5 MoE family (mlx-lm ernie4_5 / ernie4_5_moe; the prefix takes a later ernie* model_type that mlx-lm learns): stock class,
+        name="ernie", model_types=("ernie4_5", "ernie4_5_moe"),   # per-user caches + multi-user rows of GenericBackend, the pack's own chat template (no speed path yet)
+        architectures={"Ernie4_5_ForCausalLM": False, "Ernie4_5_MoeForCausalLM": False},
+        block="moe", attn="gqa", kv="fp16", moe="config", hc="no", backend="generic", server="qwen", family="ernie",
+        chat_prefixes=("ernie",), backend_prefixes=("ernie",)),
 )
 
 _BY_TYPE = {t: d for d in DESCS for t in d.model_types}

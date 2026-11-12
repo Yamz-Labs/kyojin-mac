@@ -60,6 +60,21 @@ One warm-up discarded, then one measured run.
 Memory: one resident copy of the weights. The 35B GGUF is a 20.8 GiB file and uses 21.6-22.0 GB in MLX.
 DeepSeek V4.1 uses 176-178 GB at 8K context and 187 GB at 983K.
 
+## New in 1.9.3
+
+MLX-format checkpoints, 8-bit linears with several rows, day-one rows. Measured on a Mac Studio through the real server (temperature 0, 3 fixed
+prompts, one warm-up discarded, 2 passes in swapped order), against 1.9.2:
+
+| change | effect (served) | off |
+|---|---|---|
+| MLX-format quantized Qwen3 directories (mlx-community affine 4-bit, MXFP4, NVFP4; dense and MoE) load as a plain Qwen backend | same files against mlx_lm.server, 1 user: Qwen3-8B 4-bit 177.3 vs 152.8 tok/s, MXFP4 183.6 vs 160.4, NVFP4 176.6 vs 148.0, Qwen3-30B-A3B 4-bit 170.9 vs 130.6; prefill still 2 to 19 % slower | - |
+| Q8_0 / FP8 matrices of at least 16M weights take the wide product from 5 rows | Qwen3.6-27B FP8, 8 users 101.8 -> 149.6, 8 different prompts 92.3 -> 125.5; Qwen 35B-A3B UD-Q4_K_XL (Q8_0 attention), 8 users 530 -> 562, 1 user equal | `KYOJIN_FOREIGN_WIDE_MIN=9` |
+| ERNIE 4.5 MoE row (generic backend, Jinja chat family); a vision wrapper without its own cache factory serves with its language model's caches | loads instead of refused | - |
+
+- The wide product changes the summation order on 5 to 8-row steps (speculative verify, several users): greedy outputs of models with large 8-bit
+  matrices can differ from 1.9.2 after a few dozen tokens. Qwen 35B-A3B UD-Q4_K_XL: GSM8K (200 problems) 93.0 % (1.9.2) vs 93.5 %, perplexity equal.
+- DeepSeek V4.1 Flash: unchanged (same outputs at 131K and 983K context). Qwen 27B NVFP4: same outputs, 1 user +12 %.
+
 ## New in 1.9.2
 
 Foreign checkpoints (GGUF, NVFP4, FP8, MXFP4) and several users at once. Measured on a Mac Studio through the real server

@@ -32,6 +32,11 @@ SHAPES: dict = {
                           tie_word_embeddings=False, attention_bias=False, partial_rotary_factor=0.5),
     # GLM-4.5 style next-n head declared (num_nextn_predict_layers): the head layer would be appended after the trunk's layers (mtpgen, flag mtpgen)
     "glm_nextn": dict(SHAPES_BASE_GLM, num_nextn_predict_layers=1),
+    # ERNIE 4.5 MoE: first layer dense, then routed + one shared expert (moe_layer_start_index / moe_num_shared_experts / aux-free routing bias)
+    "ernie_moe": dict(model_type="ernie4_5_moe", architectures=["Ernie4_5_MoeForCausalLM"], hidden_size=64, intermediate_size=128, max_position_embeddings=512,
+                      num_attention_heads=4, num_key_value_heads=2, num_hidden_layers=4, rms_norm_eps=1e-6, vocab_size=V, rope_theta=10000.0, use_bias=False,
+                      tie_word_embeddings=False, moe_num_experts=8, moe_layer_start_index=1, moe_intermediate_size=32, moe_k=2, moe_layer_interval=1,
+                      moe_use_aux_free=True, moe_num_shared_experts=1, head_dim=16),
     # Mamba2 / SSM only
     "mamba2": dict(model_type="mamba2", architectures=["Mamba2ForCausalLM"], max_position_embeddings=512, **_mamba2_like()),
     # SSM + attention + routed experts with the latent projection (hybrid_override_pattern: M mamba, * attention, E moe)
@@ -69,4 +74,6 @@ SHAPES: dict = {
                                                              mrope_interleaved=True)),
                        vision_config=dict(model_type="qwen3_5", depth=2, hidden_size=32, intermediate_size=64, out_hidden_size=64, num_heads=2, patch_size=4,
                                           spatial_merge_size=2, temporal_patch_size=2, in_channels=3, num_position_embeddings=64)),
+    # Qwen 4 class (mlx-vlm qwen4_exp, field names of its config.py): GDN + Qwen sparse attention (indexer) + hyper-connections + MTP + vision tower; PLE off
+    "qwen4_exp_like": {'model_type': 'qwen4_exp', 'architectures': ['Qwen4ExpForConditionalGeneration'], 'image_token_id': 90, 'video_token_id': 91, 'vision_start_token_id': 92, 'vision_end_token_id': 93, 'vocab_size': 96, 'eos_token_id': 95, 'text_config': {'model_type': 'qwen4_exp_text', 'hidden_size': 64, 'num_hidden_layers': 4, 'num_attention_heads': 4, 'num_key_value_heads': 2, 'head_dim': 16, 'linear_num_value_heads': 4, 'linear_num_key_heads': 2, 'linear_key_head_dim': 16, 'linear_value_head_dim': 16, 'linear_conv_kernel_dim': 4, 'num_experts': 4, 'num_experts_per_tok': 2, 'shared_expert_intermediate_size': 32, 'moe_intermediate_size': 32, 'rms_norm_eps': 1e-06, 'vocab_size': 96, 'max_position_embeddings': 512, 'hc_count': 2, 'hc_lowrank': 16, 'full_attention_interval': 2, 'indexer_n_heads': 2, 'indexer_kv_heads': 1, 'indexer_head_dim': 16, 'indexer_budget': 16, 'indexer_compress_ratio': 4, 'mtp_num_hidden_layers': 1, 'eos_token_id': 95, 'tie_word_embeddings': False, 'ple_embed_dim': 64, 'rope_parameters': {'type': 'default', 'mrope_section': [2, 1, 1], 'rope_theta': 10000.0, 'partial_rotary_factor': 0.5}}, 'vision_config': {'model_type': 'qwen4_exp', 'depth': 2, 'hidden_size': 32, 'intermediate_size': 64, 'out_hidden_size': 64, 'num_heads': 2, 'patch_size': 4, 'spatial_merge_size': 2, 'temporal_patch_size': 2, 'in_channels': 3, 'num_position_embeddings': 64}},
 }
