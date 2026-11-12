@@ -122,7 +122,7 @@ _SRC = """
     const float l2b = fpar[2];
     float o[G];
     if (gi < (uint)HQ) {
-        tq_norm_rope<D, RD, T>(qp + gi * 2 * D, qw, fpar[0], l2b, pos, lane, buf, o);
+        tq_norm_rope<D, RD, T>(qp + gi * QS, qw, fpar[0], l2b, pos, lane, buf, o);
         for (int g = 0; g < G; g++) qout[gi * D + g * 32 + lane] = (T)o[g];
     } else if (gi < (uint)(HQ + HK)) {
         int hk = (int)gi - HQ;
@@ -209,18 +209,29 @@ def mark_owned(c):
     c._own_ids = (c.kq[0], c.kq[1], c.vq[0], c.vq[1])
 
 
-def step(c, mod, qp, kp, vp, scale):
+def _heads(mod):
+    return (getattr(mod, "num_attention_heads", None) or getattr(mod, "n_heads", None), getattr(mod, "num_key_value_heads", None) or getattr(mod, "n_kv_heads", None))
+
+
+def ok(c, mod, qp, gated=True) -> bool:
+    """True when `step` takes this cache / layer / row (no side effect): the multi-user caller checks every user before writing any cache."""
+    if not ENABLED or type(c) is not TQ.TQKVCache or not c.fused or c.kq is None or c.rk is None or c.sk is None or c.window <= 0:
+        return False
+    if not rope_ok(mod.rope):
+        return False
+    Hq, Hk = _heads(mod)
+    D = qp.shape[-1] // ((2 if gated else 1) * Hq)
+    return not (D not in (64, 128, 256) or c.offset < c.sink or c.rk.dtype != qp.dtype or c.rk.shape[1] != Hk or c.rk.shape[2] < 1 or c.rk.shape[0] != 1)
+
+
+def step(c, mod, qp, kp, vp, scale, gated=True):
     """qp [1, 1, Hq * 2 D] (queries and gates per head), kp / vp [1, 1, Hk * D] projections of ONE row -> the gated attention output [1, 1, Hq * D], or None when
     the cache / layer is not in the fused class (the caller then runs the stock chain). Appends the row to the cache like update_and_fetch."""
-    if not ENABLED or type(c) is not TQ.TQKVCache or not c.fused or c.kq is None or c.rk is None or c.sk is None or c.window <= 0:
+    if not ok(c, mod, qp, gated):
         return None
-    if not rope_ok(mod.rope):
-        return None
-    Hq, Hk = mod.num_attention_heads, mod.num_key_value_heads
-    D = qp.shape[-1] // (2 * Hq)
+    Hq, Hk = _heads(mod)
+    D = qp.shape[-1] // ((2 if gated else 1) * Hq)
     prev = c.offset
-    if D not in (64, 128, 256) or prev < c.sink or c.rk.dtype != qp.dtype or c.rk.shape[1] != Hk or c.rk.shape[2] < 1 or c.rk.shape[0] != 1:
-        return None
     if prev + 1 > c._cap():
         c._alloc(1, Hk, D, D, qp.dtype, 1)
     _own(c)
@@ -242,17 +253,19 @@ def step(c, mod, qp, kp, vp, scale):
     qout, rko, rvo = _step_kernel()(
         inputs=[cg(qp), cg(kp), cg(vp), mod.q_norm.weight, mod.k_norm.weight, c.kq[0], c.kq[1], c.vq[0], c.vq[1], cg(c.rk), cg(c.rv), cbk, midk, cbv, midv,
                 TQ._sgn_mx(D), ia, _fpar(mod)],
-        template=[("D", D), ("KB", c.kbits), ("VB", c.vbits), ("HQ", Hq), ("HK", Hk), ("RD", rd), ("CHR", CH), ("T", dt)],
+        template=[("D", D), ("QS", (2 if gated else 1) * D), ("KB", c.kbits), ("VB", c.vbits), ("HQ", Hq), ("HK", Hk), ("RD", rd), ("CHR", CH), ("T", dt)],
         grid=(32 * (Hq + 2 * Hk + 2 * Hk * nch), 1, 1), threadgroup=(32, 1, 1),
         output_shapes=[(Hq * D,), (1, Hk, nrn, D), (1, Hk, nrn, D)], output_dtypes=[dt, dt, dt])
     c.offset = prev + 1
     c._prev = (c.rk, c.rv, prev)
     c._chunk = None
     c.rk, c.rv = rko, rvo
-    return c._decode(qout.reshape(1, Hq, 1, D), scale, gate=qp)
+    if gated:
+        return c._decode(qout.reshape(1, Hq, 1, D), scale, gate=qp)
+    return c._decode(qout.reshape(1, Hq, 1, D), scale).reshape(1, 1, Hq * D)     # ungated attention (q_proj = Hq * D): plain merge
 
 
-_REQ = ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm", "rope", "num_attention_heads", "num_key_value_heads", "scale")
+_REQ = ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm", "rope", "scale")
 _patched = set()
 
 
@@ -264,19 +277,22 @@ def install(model) -> int:
     n = 0
     for _, m in model.named_modules():
         cls = type(m)
-        if cls in _patched or not all(hasattr(m, a) for a in _REQ):
+        if cls in _patched or not all(hasattr(m, a) for a in _REQ) or None in _heads(m):
             continue
         orig = cls.__call__
 
         def call(self, x, mask=None, cache=None, _orig=orig, **kw):
-            if cache is not None and x.shape[0] == 1 and x.shape[1] == 1 and not kw:
-                c = cache.caches[0] if hasattr(cache, "caches") and len(cache.caches) == 1 else cache
-                qp, kp = self.q_proj(x), self.k_proj(x)
-                Hq, Hk = self.num_attention_heads, self.num_key_value_heads
-                if type(c) is TQ.TQKVCache and qp.shape[-1] == 2 * Hq * (kp.shape[-1] // Hk):
-                    out = step(c, self, qp, kp, self.v_proj(x), self.scale)
-                    if out is not None:
-                        return self.o_proj(out)
+            if cache is not None and x.shape[1] == 1 and not kw:
+                cs = cache.caches if hasattr(cache, "caches") else [cache]                  # RowsKV: one private cache per user (row b of the batch)
+                if len(cs) == x.shape[0] and all(type(c) is TQ.TQKVCache for c in cs):
+                    qp, kp = self.q_proj(x), self.k_proj(x)                                  # lazy: unused when the stock chain runs below
+                    Hq, Hk = _heads(self)
+                    D = kp.shape[-1] // Hk
+                    gated = qp.shape[-1] == 2 * Hq * D
+                    if qp.shape[-1] in (Hq * D, 2 * Hq * D) and all(ok(c, self, qp[b:b + 1], gated) for b, c in enumerate(cs)):    # gated q (Qwen3.5 / 3.6) or plain q (Qwen3)
+                        vp = self.v_proj(x)
+                        outs = [step(c, self, qp[b:b + 1], kp[b:b + 1], vp[b:b + 1], self.scale, gated=gated) for b, c in enumerate(cs)]
+                        return self.o_proj(outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=0))
             return _orig(self, x, mask, cache, **kw)
 
         cls.__call__ = call

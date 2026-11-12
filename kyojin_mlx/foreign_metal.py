@@ -315,8 +315,11 @@ def header(fmt: str, kind: str = "gemv", lut: bool = False) -> str:
 # fp8  : one E4M3 byte per weight, natural order, no per-unit scale; the per-tensor / per-row scale is gs float [N] (one per output row), applied to the row sum.
 # q8_0 : GGUF Q8_0 as stored: int8 per weight, natural order, one float16 scale per 32 weights (mt half [N, K/32]); applied to each 32-block sum. gs float [N] (ones).
 # Not part of FORMATS / _MT: the 4-bit kernels above are untouched. Both write half(clamp(v, -65504, 65504)): an overflowing row saturates, never inf (fuse.sat).
-FORMATS8 = ("fp8", "q8_0")
-META_DTYPE8 = {"fp8": None, "q8_0": "float16"}
+# fp8b : block-scaled FP8 (weight_scale_inv grid, e.g. 128x128): fp8 bytes + the q8_0 scale scheme (mt half [N, K/32], the block scale of each 32-weight unit;
+#        32 divides the block, so a unit never straddles two blocks). gs float [N] (ones).
+FORMATS8 = ("fp8", "q8_0", "fp8b")
+META_DTYPE8 = {"fp8": None, "q8_0": "float16", "fp8b": "float16"}
+META8 = ("q8_0", "fp8b")                            # 8-bit formats with a per-unit scale (mt)
 
 
 def _e4m3_table():
@@ -334,11 +337,11 @@ SAT16 = "clamp({v}, -65504.0f, 65504.0f)"
 
 
 def header8(fmt: str) -> str:
-    return HDR8 if fmt == "fp8" else UNR
+    return UNR if fmt == "q8_0" else HDR8
 
 
 def gemv8_inputs(fmt, gather=False, glu=False):
-    base = ["x", "qs", "gs"] if fmt == "fp8" else ["x", "qs", "mt", "gs"]
+    base = ["x", "qs", "gs"] if fmt not in META8 else ["x", "qs", "mt", "gs"]
     if glu and not gather:
         return ["x", "x2"] + base[1:]
     return ["x", "xrows", "eids"] + base[1:] if gather else base
@@ -348,18 +351,19 @@ def gemv8_inputs(fmt, gather=False, glu=False):
 def gemv8_source(fmt: str, nbr: int = 2, gather: bool = False, glu: bool = False) -> str:
     """Body. Template ints: R (rows, any 1..16), KIN, N, NBR. Inputs x (half [R, KIN]), qs (uint32 [N, KIN/4]), [mt], gs (float [N]); output y half [R, N].
     The structure of gemv_source: a simdgroup owns 2 NBR output rows, a lane owns 32 consecutive weights of each row per 512-chunk (two 16-byte units), the chunk of x
-    sits in threadgroup memory, the next chunk's words are prefetched. Needs KIN % 512 == 0 and N % (8 NBR) == 0.
+    sits in threadgroup memory, the next chunk's words are prefetched. Needs KIN % 32 == 0 and N % (8 NBR) == 0: a last partial chunk (KIN % 512, e.g. the 768-wide experts
+    of Qwen3-30B-A3B, 1408 of GLM-4.5) stages zeros past KIN and clamps the word / scale reads to the row, so its idle lanes multiply real weights by 0.
     gather: as gemvk_source (E stacked matrices as E * N rows, gs float [E * N], slot = grid y, y half [S, N])."""
-    q8 = fmt == "q8_0"
-    if q8:
+    q8 = fmt in META8
+    if fmt == "q8_0":
         dec = ("float4 d0 = float4(as_type<char4>(wa[i])), d1 = float4(as_type<char4>(wb[i]));"
                " w[j * 32u + i * 4u + 0u] = d0.x; w[j * 32u + i * 4u + 1u] = d0.y; w[j * 32u + i * 4u + 2u] = d0.z; w[j * 32u + i * 4u + 3u] = d0.w;"
                " w[j * 32u + 16u + i * 4u + 0u] = d1.x; w[j * 32u + 16u + i * 4u + 1u] = d1.y; w[j * 32u + 16u + i * 4u + 2u] = d1.z; w[j * 32u + 16u + i * 4u + 3u] = d1.w;")
     else:
         dec = ("UNR for (uint b = 0; b < 4; ++b) { w[j * 32u + i * 4u + b] = E4M3T[(wa[i] >> (8u * b)) & 255u];"
                " w[j * 32u + 16u + i * 4u + b] = E4M3T[(wb[i] >> (8u * b)) & 255u]; }")
-    ml0 = "mc[j] = float(mt[n * UPR + ul]);" if q8 else ""
-    mln = "mn_[j] = float(mt[n * UPR + (c + 1u) * 16u + ul]);" if q8 else ""
+    ml0 = "mc[j] = float(mt[n * UPR + min(ul, UPR - 1u)]);" if q8 else ""
+    mln = "mn_[j] = float(mt[n * UPR + min((c + 1u) * 16u + ul, UPR - 1u)]);" if q8 else ""
     mcd = "float mc[NBR], mn_[NBR];" if q8 else ""
     mcs = "mc[j] = mn_[j];" if q8 else ""
     fin = "acc[j * R + r] += s * mc[j];" if q8 else "acc[j * R + r] += s;"
@@ -370,7 +374,7 @@ def gemv8_source(fmt: str, nbr: int = 2, gather: bool = False, glu: bool = False
     const uint tgi = threadgroup_position_in_grid.x;
     const uint hh = lane >> 4, ul = lane & 15u;
     const uint rbase = (tgi * 4u + sg) * (2u * NBR) + hh * NBR;
-    const uint RWD = uint(KIN) / 16u, NC = uint(KIN) / 512u, UPR = uint(KIN) / 32u;
+    const uint RWD = uint(KIN) / 16u, NC = (uint(KIN) + 511u) / 512u, UPR = uint(KIN) / 32u;
     device const half* XP = (device const half*)x;
     device half* YP = y;
     device const uint4* q4 = (device const uint4*)qs;
@@ -380,14 +384,15 @@ def gemv8_source(fmt: str, nbr: int = 2, gather: bool = False, glu: bool = False
     UNR for (uint i = 0; i < NBR * R; ++i) acc[i] = 0.0f;
     uint4 qa[NBR], qb[NBR], na[NBR], nb[NBR];
     @MCD@
-    UNR for (uint j = 0; j < NBR; ++j) { const uint n = rbase + j; qa[j] = q4[n * RWD + ul * 2u]; qb[j] = q4[n * RWD + ul * 2u + 1u]; @ML0@ }
+    UNR for (uint j = 0; j < NBR; ++j) { const uint n = rbase + j; const uint u0 = min(ul * 2u, RWD - 2u); qa[j] = q4[n * RWD + u0]; qb[j] = q4[n * RWD + u0 + 1u]; @ML0@ }
     for (uint c = 0; c < NC; ++c) {
       for (uint i = tid; i < uint(R) * 64u; i += 128u) { uint r = i >> 6, j = i & 63u;
+        if (c * 512u + j * 8u >= uint(KIN)) { *(threadgroup uint4*)(xs + r * 640u + j * 8u + (j >> 2) * 8u) = uint4(0u); continue; }
         uint4 v = *(device const uint4*)(XP + r * uint(KIN) + c * 512u + j * 8u);
         *(threadgroup uint4*)(xs + r * 640u + j * 8u + (j >> 2) * 8u) = v; }
       threadgroup_barrier(mem_flags::mem_threadgroup);
       if (c + 1u < NC) {
-        UNR for (uint j = 0; j < NBR; ++j) { const uint n = rbase + j, u = (c + 1u) * 32u + ul * 2u; na[j] = q4[n * RWD + u]; nb[j] = q4[n * RWD + u + 1u]; @MLN@ }
+        UNR for (uint j = 0; j < NBR; ++j) { const uint n = rbase + j, u = min((c + 1u) * 32u + ul * 2u, RWD - 2u); na[j] = q4[n * RWD + u]; nb[j] = q4[n * RWD + u + 1u]; @MLN@ }
       }
       const uint xa = ul * 32u, xb = xa + 16u;
       UNR for (uint j = 0; j < NBR; ++j) {
@@ -436,7 +441,7 @@ def gemv8_source(fmt: str, nbr: int = 2, gather: bool = False, glu: bool = False
 @functools.lru_cache(maxsize=None)
 def dequant8_source(fmt: str) -> str:
     """Body. Template ints: KIN, N. Inputs qs (uint32 [N, KIN/4]), [mt], gs (float [N]); output w half [N, KIN]. One thread per 4 weights."""
-    sc = "float(mt[row * (uint(KIN) / 32u) + (col4 >> 3)]) * gs[row]" if fmt == "q8_0" else "gs[row]"
+    sc = "float(mt[row * (uint(KIN) / 32u) + (col4 >> 3)]) * gs[row]" if fmt in META8 else "gs[row]"
     if fmt == "q8_0":
         body = "float4 d_ = float4(as_type<char4>(wd));"
     else:
@@ -466,9 +471,9 @@ def mma8_source(fmt: str, ntn: int = 1, half_a: bool = False) -> str:
     [mt (q8_0)], gs (float [N]). Output y half [R, N] (saturated). A = 8 weight rows x 8 k, B = 8 k x 8 activation rows. A unit is 32 weights; lane (fm, c) holds the 8
     bytes c*8..c*8+7 of row fm: tile t, element e is byte 2t+e, so tile t contracts over k = 8c + 2t + e (A column 2c+e). half_a: A and B are half (exact for E4M3 and int8),
     the float accumulator is scaled once per unit for q8_0."""
-    q8 = fmt == "q8_0"
+    q8 = fmt in META8
     T = "half" if half_a else "float"
-    if q8:
+    if fmt == "q8_0":
         dec = (f"{T}2 a_[4]; UNR for (uint t = 0; t < 4; ++t) {{ const uint wv = (t < 2u) ? w2.x : w2.y; const uint sh = 16u * (t & 1u);"
                f" a_[t] = {T}2({T}(char((wv >> sh) & 255u)), {T}(char((wv >> (sh + 8u)) & 255u))); }}")
     else:
@@ -661,6 +666,18 @@ template <typename TP> inline void dec_iq2s(KU c, uint u, thread float* w, TP T)
     float db = d * (0.5f + float(l < 2u ? (sb & 15u) : (sb >> 4))) * 0.25f;
     iq2_group(T[2u * g], T[2u * g + 1u], (c.h.x >> (8u * l)) & 255u, db, &w[8u * l]); }
 }
+inline uint2 s2g(uint s) {                     // ggml seed word (8 x 2-bit digits) -> the two iq2s_grid words (bytes 8 / 25 / 43)
+  uint2 r = uint2(0u);
+  UNR for (uint i = 0; i < 4; ++i) { uint d0 = (s >> (2u * i)) & 3u, d1 = (s >> (2u * i + 8u)) & 3u;
+    r.x |= (8u + 17u * d0 + (d0 >> 1)) << (8u * i); r.y |= (8u + 17u * d1 + (d1 >> 1)) << (8u * i); }
+  return r;
+}
+template <typename TP> inline void dec_iq2s_sd(KU c, uint u, thread float* w, TP T) {
+  uint ib = u & 7u, qh = kub(c.m, ib), sb = kub(c.m, 8u + ib); float d = float(as_type<half2>(c.d).x);
+  UNR for (uint l = 0; l < 4; ++l) { uint g = ((c.q.x >> (8u * l)) & 255u) | ((qh << (8u - 2u * l)) & 0x300u);
+    float db = d * (0.5f + float(l < 2u ? (sb & 15u) : (sb >> 4))) * 0.25f; uint2 gg = s2g(uint(T[g]));
+    iq2_group(gg.x, gg.y, (c.h.x >> (8u * l)) & 255u, db, &w[8u * l]); }
+}
 template <typename TP> inline void iq1_group(uint g, float dl, float delta, thread float* w, TP T) {
   const uint s = T[g];
   UNR for (uint i = 0; i < 8; ++i) w[i] = dl * (float((s >> (2u * i)) & 3u) - 1.0f + delta);
@@ -724,6 +741,12 @@ template <typename TP> inline void dp_iq2s(KU c, uint u, thread half2* w, TP T) 
     half2 db = h2sat(d * (0.5f + float(l < 2u ? (sb & 15u) : (sb >> 4))) * 0.25f);
     gp8(T[2u * g], T[2u * g + 1u], (c.h.x >> (8u * l)) & 255u, db, &w[4u * l]); }
 }
+template <typename TP> inline void dp_iq2s_sd(KU c, uint u, thread half2* w, TP T) {
+  uint ib = u & 7u, qh = kub(c.m, ib), sb = kub(c.m, 8u + ib); float d = float(as_type<half2>(c.d).x);
+  UNR for (uint l = 0; l < 4; ++l) { uint g = ((c.q.x >> (8u * l)) & 255u) | ((qh << (8u - 2u * l)) & 0x300u);
+    half2 db = h2sat(d * (0.5f + float(l < 2u ? (sb & 15u) : (sb >> 4))) * 0.25f); uint2 gg = s2g(uint(T[g]));
+    gp8(gg.x, gg.y, (c.h.x >> (8u * l)) & 255u, db, &w[4u * l]); }
+}
 inline half2 dgt(uint v, uint i) { return as_type<half2>(((v >> (2u * i)) & 0x00030003u) | 0x64006400u) - half2(1024.0h); }
 inline void dp_q2k(KU c, uint u, thread half2* w, int) {
   half2 dd = as_type<half2>(c.d); uint ib = (u & 7u) * 2u; uint a = kub(c.m, ib), b = kub(c.m, ib + 1u);
@@ -766,7 +789,9 @@ def hdrk(fmt):
         h = HDRK + "inline uint ksg(uint s) { return s | ((popcount(s) & 1u) << 7); }\n"
         h += "" if fmt in ("iq2_xxs", "iq2_xs", "iq2_s") else _tab("IQ2_G", [0, 0])         # decoders of the other types stay compiled, their tables are stubs
         h += "" if fmt in ("iq1_s", "iq1_m") else _tab("IQ1_G", [0], "ushort")
-        if fmt in ("iq2_xxs", "iq2_xs", "iq2_s"):
+        if fmt == "iq2_s" and IQ2S_SEED:
+            h += _tab("IQ2_G", S.KGRID_2BIT_1024, "ushort")
+        elif fmt in ("iq2_xxs", "iq2_xs", "iq2_s"):
             g = GG.iq2_grid({"iq2_xxs": "xxs", "iq2_xs": "xs", "iq2_s": "s"}[fmt]).astype("<u1").reshape(-1, 4).view("<u4").reshape(-1)
             h += _tab("IQ2_G", g)
         if fmt in ("iq1_s", "iq1_m"):
@@ -786,7 +811,9 @@ _KLD = {"q5_k": "ld_q5k(q4, (device const uint4*)mt, hi, {n}, {u}, UPR)", "q6_k"
         "q3_k": "ld_q3k(qs, mt, hi, {n}, {u}, UPR)", "iq3_xxs": "ld_iq3x(qs, mt, hi, {n}, {u}, UPR)", "iq3_s": "ld_iq3s(qs, mt, hi, {n}, {u}, UPR)",
         "q2_k": "ld_q2k(qs, mt, {n}, {u}, UPR)", "iq2_xxs": "ld_iq2xxs(qs, mt, hi, {n}, {u}, UPR)", "iq2_xs": "ld_iq2xs(qs, mt, {n}, {u}, UPR)", "iq2_s": "ld_iq2s(qs, mt, hi, {n}, {u}, UPR)",
         "iq1_s": "ld_iq1s(qs, mt, {n}, {u}, UPR)", "iq1_m": "ld_iq1m(qs, mt, {n}, {u}, UPR)"}
-_KTAB = {"iq2_xxs": ("IQ2_G", "uint", 512), "iq2_xs": ("IQ2_G", "uint", 1024), "iq2_s": ("IQ2_G", "uint", 2048), "iq1_s": ("IQ1_G", "ushort", 2048), "iq1_m": ("IQ1_G", "ushort", 2048)}
+IQ2S_SEED = os.environ.get("KYOJIN_IQ2S_SEED", "0") == "1"     # IQ2_S grid as 1024 ushort seeds rebuilt in registers (off: the full table is 2.1x faster at R1 since the wrapper cache)
+_KTAB = {"iq2_xxs": ("IQ2_G", "uint", 512), "iq2_xs": ("IQ2_G", "uint", 1024), "iq2_s": ("IQ2_G", "ushort", 1024) if IQ2S_SEED else ("IQ2_G", "uint", 2048),
+         "iq1_s": ("IQ1_G", "ushort", 2048), "iq1_m": ("IQ1_G", "ushort", 2048)}
 
 
 TGTAB = os.environ.get("KYOJIN_K_TGTAB", "0") == "1"       # experiment: grid tables of the 2-bit class in threadgroup memory
@@ -808,7 +835,7 @@ def ktab_arg(fmt):
 
 
 _KDEC = {"q5_k": "dec_q5k", "q6_k": "dec_q6k", "iq4_xs": "dec_iqxs", "q3_k": "dec_q3k", "iq3_xxs": "dec_iq3x", "iq3_s": "dec_iq3s", "q2_k": "dec_q2k",
-         "iq2_xxs": "dec_iq2xxs", "iq2_xs": "dec_iq2xs", "iq2_s": "dec_iq2s", "iq1_s": "dec_iq1s", "iq1_m": "dec_iq1m"}
+         "iq2_xxs": "dec_iq2xxs", "iq2_xs": "dec_iq2xs", "iq2_s": "dec_iq2s_sd" if IQ2S_SEED else "dec_iq2s", "iq1_s": "dec_iq1s", "iq1_m": "dec_iq1m"}
 
 
 def gemvk_inputs(fmt, gather=False, glu=False):
@@ -1042,7 +1069,7 @@ _FMMA_HI = {"q5_k": "uint", "q6_k": "uint2"}                                    
 _FMMA_KDEC = tuple(f for f in FORMATSK if f not in ("q5_k", "q6_k", "iq4_xs"))   # the 3- and 2-bit classes: the lane decodes its whole unit with the GEMV decoder (dec_*), any weight pairing works
 _FMMA_K = ("q5_k", "q6_k", "iq4_xs") + _FMMA_KDEC                              # no global scale input
 _FMMA_PAIR.update({f: "kdec" for f in _FMMA_KDEC})
-_DECP = {"iq3_xxs": "dp_iq3x", "iq3_s": "dp_iq3s", "iq2_xxs": "dp_iq2xxs", "iq2_xs": "dp_iq2xs", "iq2_s": "dp_iq2s", "q2_k": "dp_q2k", "iq1_s": "dp_iq1s", "iq1_m": "dp_iq1m"}
+_DECP = {"iq3_xxs": "dp_iq3x", "iq3_s": "dp_iq3s", "iq2_xxs": "dp_iq2xxs", "iq2_xs": "dp_iq2xs", "iq2_s": "dp_iq2s_sd" if IQ2S_SEED else "dp_iq2s", "q2_k": "dp_q2k", "iq1_s": "dp_iq1s", "iq1_m": "dp_iq1m"}
 # half2 decoders (dp_*) fill 16 pairs per unit; pair m = 4 q + t holds the weights below (the lane lays the unit out by what is cheap to unpack, xperm follows)
 _FMMA_LAYOUT.update({f: ("KG" if f in ("iq3_xxs", "iq3_s", "iq2_xxs", "iq2_xs", "iq2_s") else "K2" if f == "q2_k" else "K1" if f in ("iq1_s", "iq1_m") else "K") for f in _FMMA_KDEC})
 

@@ -17,6 +17,16 @@ def _fp8_pack(n, k, seed=0, scale=None):
     return FP.Pack("fp8", n, k, q, None, (r.uniform(0.01, 2.0, n) if scale is None else scale).astype(np.float32))
 
 
+def _fp8b_pack(n, k, seed=0, bn=128, bk=128):
+    """fp8b as the loader builds it: E4M3 bytes, the block scale of each 32-unit (half, constant over bn x bk blocks) and a power-of-two row scale."""
+    r = RNG(seed)
+    q = r.integers(0, 256, (n, k), dtype=np.uint8)
+    q[(q & 127) == 127] = 0x38
+    g = r.uniform(0.25, 2.0, (-(-n // bn), -(-k // bk))).astype(np.float32)
+    meta = g[np.arange(n) // bn][:, (np.arange(k // 32) * 32) // bk].astype(np.float16)
+    return FP.Pack("fp8b", n, k, q, meta, np.float32(2.0 ** -6))
+
+
 def _q8_pack(n, k, seed=0):
     return GF.to_pack("Q8_0", SY.random_blocks("Q8_0", n, k, RNG(seed)), k)
 
@@ -75,7 +85,7 @@ def _check(y, ref, tol=2e-3):
 
 
 def _pack(fmt, n, k, seed=0):
-    return _fp8_pack(n, k, seed) if fmt == "fp8" else _q8_pack(n, k, seed)
+    return _fp8_pack(n, k, seed) if fmt == "fp8" else _fp8b_pack(n, k, seed) if fmt == "fp8b" else _q8_pack(n, k, seed)
 
 
 @needs_gpu
@@ -97,13 +107,13 @@ def test_apply_matches_float32_reference(fmt, R):
 @pytest.mark.parametrize("fmt", FM.FORMATS8)
 @pytest.mark.parametrize("R", (1, 4, 16))
 def test_shapes_off_the_gemv_grid_take_the_decoded_path(fmt, R):
-    """n not a multiple of 16 or k not a multiple of 512: gemv_ok is False, the simdgroup-matrix kernel answers (any n, k % 32 == 0)."""
+    """n not a multiple of 16: gemv_ok is False, the simdgroup-matrix kernel answers (any n, k % 32 == 0); k off the 512 grid (k % 32 == 0) runs the GEMV's partial last chunk."""
     import mlx.core as mx
     from kyojin_mlx import foreign_linear as FL
     for n, k in ((24, 1024), (64, 288)):
         p = _pack(fmt, n, k, seed=n)
         d = FL.DevPack(p)
-        assert not d.gemv_ok()
+        assert d.gemv_ok() == (n % 16 == 0)
         x = RNG(6).standard_normal((R, k)).astype(np.float16)
         _check(d.apply(mx.array(x)), x.astype(np.float32) @ FP.dequant(p).T)
 
@@ -146,7 +156,9 @@ def test_overflow_saturates_never_inf(fmt, R):
         p.gscale = np.full(32, 1.0e5, np.float32)
     else:
         p.meta = np.full_like(p.meta, 1.0e4)
-        p.qs = np.full_like(p.qs, 100)
+        p.qs = np.full_like(p.qs, 100 if fmt == "q8_0" else 0x70)          # int8 100 / E4M3 256
+        if fmt == "fp8b":
+            p.gscale = np.float32(1.0)
     x = np.full((R, 512), 100.0, np.float16)
     y = np.array(FL.DevPack(p).apply(mx.array(x)), np.float32)
     assert np.isfinite(y).all() and np.abs(y).max() == 65504.0

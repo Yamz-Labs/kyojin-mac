@@ -262,6 +262,10 @@ def install(model, log=print) -> int:
             cls = mod.__class__
             if getattr(cls, "_foreign_moe", False):
                 continue
+            for g in (mod.gate, getattr(mod, "shared_expert_gate", None)):       # safetensors releases store the router in bf16 (GGUF: f32); the fused kernels read an f32 router
+                w = getattr(g, "weight", None)                                    # (E x H floats, ~1 MB a layer), else every block falls back to the stock call
+                if w is not None and w.dtype in (mx.bfloat16, mx.float16):
+                    g.weight = w.astype(mx.float32)
             mod.__class__ = type("Fused" + cls.__name__, (cls,), {"__call__": _fused_call, "_deferred_call": _deferred_call, "_stock_call": cls.__call__, "_foreign_moe": True})
             n += 1
     if n:

@@ -260,6 +260,7 @@ class Session:
     seed: int = 0
     key: object = None
     cache: object = None
+    tq_cross: int | None = None     # KYOJIN_TQ_FROM: the depth where this session's plain KV turns into TurboQuant (None: no conversion pending)
     pos: int = 0                    # prompt tokens already in the cache
     cached: int = 0                 # prompt tokens that came from a prefix snapshot
     hasher: object = None
@@ -1763,7 +1764,9 @@ class Engine:
         if self.prefix.refused:
             self.stats["pf_skip_snap_fallback"] += 1                  # a snapshot with stale decoder rings was passed over: the earlier whole one (or 0) is used
         self.stats["t_pf_lookup"] += t_lookup - t0
-        s.cache = snap if hit else self.backend.make_cache()
+        need = len(s.ids)                                              # KV format by depth (KYOJIN_TQ_FROM): on the prompt (clients rarely send max_tokens);
+        s.cache = self.backend.adapt_cache(snap, need) if hit else self.backend.make_cache_for(need)   # a plain session turns TurboQuant when it crosses (_tq_crossing)
+        s.tq_cross = self.backend.tq_cross_at(s.cache)
         s.pos = hit
         s.path = () if not hit else (seed.path if (seed is not None and hit == seed.end) else self.prefix.last_sig)
         if hit and self._spec_lookup:
@@ -2379,6 +2382,18 @@ class Engine:
             self.nxt = self._launch()
         leaving = {}
         self._consume(self.cur, leaving, self.nxt is None)
+        cross = self._tq_crossing()
+        if cross:                                                # KYOJIN_TQ_FROM: a member reached the depth: end the epoch, convert its KV, rebatch next tick
+            if self.nxt is not None:
+                self.cur, self.nxt = self.nxt, None
+                self._consume(self.cur, leaving, False)
+            self._dissolve(leaving)
+            for s in self.members:
+                if s in cross:
+                    s.cache, s.tq_cross = self.backend.to_tq(s.cache), None
+                    self._measure(s)
+                    self.stats["n_tq_converted"] += 1
+            return
         if leaving:
             if self.nxt is not None:
                 self.cur, self.nxt = self.nxt, None
@@ -2392,6 +2407,10 @@ class Engine:
         self.cur, self.nxt = self.nxt, None
         if self.cur is None:
             self.cur = self._launch_from_last()
+
+    def _tq_crossing(self) -> list:
+        """The members whose plain KV reached their TurboQuant depth (KYOJIN_TQ_FROM)."""
+        return [s for s in self.members if s.tq_cross is not None and s.n_prompt + s.n_gen >= s.tq_cross]
 
     def _lookahead_ok(self) -> bool:
         """No session is within one token of its end or of yielding its slot (the step launched ahead would be for nothing)."""

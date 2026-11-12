@@ -179,10 +179,17 @@ def fold_sdpa(q, k, v, scale):
     return o[:, :, :G * T].reshape(B, Hq, T, D)
 
 
+POOL_MIN = int(os.environ.get("KYOJIN_MU_POOL_MIN", "256"))   # shortest shared prefix worth a PoolKV: below it the tail copies + prefix check cost more
+                                                                # than reading the prefix once saves (8 users sharing only the ~20-token chat template: N8 -7..-26 %)
+_NO_POOL = False          # set by install() for models whose attention has learned sinks (gpt-oss): the pooled kernel has no sink term, RowsKV does
+
+
 def install(model=None) -> int:
     """Teach the mlx-lm Qwen attention to run its SDPA per user when its cache is a RowsKV, and make the model's dense linears
     row-invariant (idempotent). Returns the number of linears replaced."""
-    global _orig_sdpa, _mu_sdpa
+    global _orig_sdpa, _mu_sdpa, _NO_POOL
+    if model is not None and any(hasattr(m, "sinks") for _, m in model.named_modules()) and os.environ.get("KYOJIN_MU_POOL_SINKS", "1") == "0":
+        _NO_POOL = True                                       # KYOJIN_MU_POOL_SINKS=0: sink models stay on RowsKV (the pooled merge adds the sink term by default)
     from . import sdpa_dec as SD
     n = make_row_invariant(model) if model is not None else 0
     SD.install()
@@ -193,16 +200,18 @@ def install(model=None) -> int:
         return n
     _orig_sdpa = qwen3_next.scaled_dot_product_attention
 
-    def _row_sdpa(q, k, v, scale):
-        out = SD.route(q, k, v, None, scale, None)
-        return out if out is not None else mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=None)
+    def _row_sdpa(q, k, v, scale, sinks=None):
+        out = SD.route(q, k, v, None, scale, None, sinks)
+        return out if out is not None else mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=None, sinks=sinks)
 
     def sdpa(queries, keys, values, cache, scale, mask, sinks=None):
         if isinstance(cache, MA.PoolKV):
-            return cache.attend(queries, scale)
+            return cache.attend(queries, scale, sinks)
         if isinstance(cache, RowsKV):
+            if sinks is not None and any(isinstance(kk, kvwin.KVView) for kk in keys):
+                raise ValueError("attention sinks on a quantized KV window (KYOJIN_KVWIN / TurboQuant) are not supported: serve with --kv-mode fp16")
             outs = [keys[i].cache.attend(queries[i:i + 1], scale) if isinstance(keys[i], kvwin.KVView)
-                    else _row_sdpa(queries[i:i + 1], keys[i], values[i], scale) for i in range(len(keys))]
+                    else _row_sdpa(queries[i:i + 1], keys[i], values[i], scale, sinks) for i in range(len(keys))]
             return outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=0)
         out = SD.route(queries, keys, values, cache, scale, mask, sinks)       # split-K decode / verify attention (sdpa_dec.py)
         if out is not None:
@@ -297,6 +306,27 @@ def _same_prefix(col: list, P: int) -> bool:
     return bool(mx.all(k == k[:1]).item())
 
 
+def _mla_call(self, x, mask=None, cache=None):
+    """MLA attention (deepseek_v3 class: DeepSeek V2 / V3, Kimi, Moonlight, GLM-4.7-Flash lite) under a RowsKV: one user at a time through the stock
+    call on its own KVCache (the latent cache is multiplied as one array, q_pe @ k_pe.T); the MoE / MLP and the other layers stay batched."""
+    if isinstance(cache, RowsKV):
+        outs = [self._mla_stock(x[i:i + 1], None, c) for i, c in enumerate(cache.caches)]
+        return outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=0)
+    return self._mla_stock(x, mask, cache)
+
+
+def install_mla(model) -> int:
+    """Swap the call of every MLA attention module (kv_a_proj_with_mqa + embed_q). Returns the number of modules."""
+    n = 0
+    for _, mod in model.named_modules():
+        if hasattr(mod, "kv_a_proj_with_mqa") and hasattr(mod, "embed_q"):
+            cls = mod.__class__
+            if not getattr(cls, "_mla_rows", False):
+                mod.__class__ = type("Rows" + cls.__name__, (cls,), {"__call__": _mla_call, "_mla_stock": cls.__call__, "_mla_rows": True})
+            n += 1
+    return n
+
+
 def batch_caches(users: list[list], prefix_len: int | None = None) -> list:
     """Per-user prompt caches (each a list over layers) -> one cache list over layers for a batched decode step. Users forked (fork_cache) from one
     prompt cache share its prefix (prefix_len: None = from the fork records, 0 = off): with >= 2 users their full-attention layers become one
@@ -310,7 +340,7 @@ def batch_caches(users: list[list], prefix_len: int | None = None) -> list:
             out.append(ArraysCache.merge(col))
         elif generic and type(col[0]) is not KVCache and not isinstance(col[0], (KVCache, WinKVCache)) and hasattr(type(col[0]), "merge"):
             out.append(type(col[0]).merge(col))                       # KYOJIN_GENERIC_CACHE: the cache's own merge (mlx-vlm ArraysCache, CacheList, rotating)
-        elif P > 0 and MA.supported(col, P) and _same_prefix(col, P):
+        elif P >= max(POOL_MIN, 1) and not _NO_POOL and MA.supported(col, P) and _same_prefix(col, P):
             out.append(MA.PoolKV(col, P))
         else:
             out.append(RowsKV(col))

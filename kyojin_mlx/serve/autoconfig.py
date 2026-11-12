@@ -22,7 +22,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_SESSIONS = 4
+DEFAULT_SESSIONS = 4                       # floor of the derived default (and the value when memory is unknown)
+SESSIONS_CAP = 8                           # ceiling of the derived default (owner 11/11: N8 is the multi-user target)
 DEFAULT_CTX = 32768
 PREFILL_CHUNK = 8192                       # the engine's hard cap (serve.backends.MAX_PREFILL_CHUNK)
 LONG_CONTEXT_TOKENS = 16 * PREFILL_CHUNK   # from here a pack is served with the large chunk
@@ -209,7 +210,16 @@ def default_kv_disk_dir(pack: Pack) -> str:
 
 
 # ------------------------------------------------------------------------------------------------------------------ resolver
-def resolve_options(pack: Pack, *, sessions: int = DEFAULT_SESSIONS, ctx: int | None = None,
+def auto_sessions(per_session_bytes: float, kv_budget: int | None, max_rows: int = 16) -> int:
+    """Default --sessions: as many sessions as the KV budget holds at the TQ_FROM depth (one session's KV measured after load), between
+    DEFAULT_SESSIONS and SESSIONS_CAP (and the backend's row limit)."""
+    hi = max(DEFAULT_SESSIONS, min(SESSIONS_CAP, int(max_rows)))
+    if not kv_budget or per_session_bytes <= 0:
+        return DEFAULT_SESSIONS
+    return max(DEFAULT_SESSIONS, min(hi, int(kv_budget // per_session_bytes)))
+
+
+def resolve_options(pack: Pack, *, sessions: int | None = None, ctx: int | None = None,
                     prefill_chunk: int | None = None, prefix_block: int | None = None,
                     prefix_cache_mb: float | None = None, kv_disk: str | None = None,
                     no_kv_disk: bool = False, kv_disk_gib: float | None = None,
@@ -227,7 +237,7 @@ def resolve_options(pack: Pack, *, sessions: int = DEFAULT_SESSIONS, ctx: int | 
     depth = int(mtp_depth) if mtp_depth is not None else default_mtp_depth(pack)
     think = bool(thinking) if thinking is not None else pack.thinking
     effort = reasoning_effort or DEFAULT_REASONING_EFFORT
-    return {"sessions": int(sessions), "ctx": ctx, "prefill_chunk": chunk, "prefix_block": block,
+    return {"sessions": int(sessions) if sessions is not None else None, "ctx": ctx, "prefill_chunk": chunk, "prefix_block": block,
             "prefix_cache_mb": cache_mb, "kv_disk": disk, "kv_disk_gib": gib,
             "kv_disk_block": int(kv_disk_block), "mtp_depth": depth, "thinking": think,
             "reasoning_effort": effort}
@@ -254,7 +264,7 @@ def resolve_serve_args(args):
     depth = getattr(args, "mtp_depth", None)
     if depth is None and os.environ.get("KYOJIN_MTP_DEPTH") is not None:
         depth = int(os.environ["KYOJIN_MTP_DEPTH"])            # env is a convenience override; the CLI still wins
-    opts = resolve_options(pack, sessions=getattr(args, "sessions", DEFAULT_SESSIONS),
+    opts = resolve_options(pack, sessions=getattr(args, "sessions", None),
                            ctx=getattr(args, "ctx", None), prefill_chunk=getattr(args, "prefill_chunk", None),
                            prefix_block=getattr(args, "prefix_block", None),
                            prefix_cache_mb=getattr(args, "prefix_cache_mb", None),
@@ -277,7 +287,7 @@ def effective_config(args) -> dict:
     num = lambda v: int(v) if isinstance(v, float) and v.is_integer() else v   # noqa: E731
     return {"model": os.path.normpath(str(args.model)),
             "family": getattr(pack, "family", None),
-            "sessions": int(args.sessions), "ctx": int(args.ctx),
+            "sessions": int(args.sessions) if args.sessions is not None else "auto", "ctx": int(args.ctx),
             "prefill_chunk": args.prefill_chunk, "prefix_block": args.prefix_block,
             "prefix_cache_mb": num(args.prefix_cache_mb),
             "kv_disk": args.kv_disk, "kv_disk_gib": num(args.kv_disk_gib),

@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from jinja2.sandbox import ImmutableSandboxedEnvironment
+from jinja2 import nodes
+from jinja2.ext import Extension
 
 from . import ds41_chat, ds41_parse
 from .. import ds41_vision
@@ -72,15 +74,26 @@ def render_resume(family, body: dict) -> Rendered:
 
 
 # ------------------------------------------------------------------------------------------------ templates (qwen, glm)
+class _GenerationTag(Extension):
+    """{% generation %}...{% endgeneration %} (transformers' AssistantTracker): marks the assistant span for training masks; rendering keeps the body as is."""
+    tags = {"generation"}
+
+    def parse(self, parser):
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+        return nodes.Scope(body, lineno=lineno)
+
+
 def _template_env() -> Any:
     """Same environment as transformers' apply_chat_template (and the box servers)."""
-    env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
+    env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols", _GenerationTag])
     env.filters["tojson"] = lambda value, ensure_ascii=False, indent=None, separators=None, sort_keys=False: \
         json.dumps(value, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
 
     def raise_exception(msg):
         raise ChatError(str(msg))
     env.globals["raise_exception"] = raise_exception
+    env.globals["strftime_now"] = lambda fmt: __import__("datetime").datetime.now().strftime(fmt)     # transformers' global (gpt-oss harmony template)
     return env
 
 
@@ -390,6 +403,55 @@ class QwenFamily:
         return QwenParser(r.thinking_first, r.tools, r.parse_tools)
 
 
+# ------------------------------------------------------------------------------------------------ harmony (gpt-oss)
+H_MODES = {"<|channel|>analysis<|message|>": "reasoning", "<|channel|>final<|message|>": "content", "<|channel|>commentary<|message|>": "content"}
+H_DROP = ("<|end|>", "<|start|>assistant", "<|return|>", "<|call|>")
+
+
+class HarmonyParser:
+    """gpt-oss harmony output: the analysis channel streams as reasoning, the final (and commentary) channel as content; the turn markers
+    (<|end|>, <|start|>assistant, <|return|>, <|call|>) are dropped. A marker split over two pieces is held until it completes."""
+
+    def __init__(self, *_):
+        self.mode, self.buf, self.lead = "content", "", True
+        self.tags = list(H_MODES) + list(H_DROP)
+
+    def _emit(self, seg: str, out: list) -> None:
+        if self.lead:
+            seg = seg.lstrip()
+            self.lead = not seg
+        if seg:
+            out.append((self.mode, seg))
+
+    def feed(self, text: str, final: bool = False) -> list:
+        out: list = []
+        self.buf += text
+        while True:
+            hits = [(self.buf.find(t), t) for t in self.tags if t in self.buf]
+            if not hits:
+                keep = 0 if final else _partial_tag(self.buf, self.tags)
+                self._emit(self.buf[:len(self.buf) - keep], out)
+                self.buf = self.buf[len(self.buf) - keep:]
+                return out
+            pos, tag = min(hits)
+            seg = self.buf[:pos]
+            self._emit(seg.rstrip() if tag in H_MODES or tag == "<|end|>" else seg, out)
+            self.buf = self.buf[pos + len(tag):]
+            if tag in H_MODES:
+                self.mode, self.lead = H_MODES[tag], True
+
+    def finish(self) -> list:
+        return self.feed("", final=True)
+
+
+class HarmonyFamily(QwenFamily):
+    """QwenFamily rendering (the pack's own jinja template) with the harmony output parser."""
+    name = "harmony"
+
+    def parser(self, r: Rendered):
+        return HarmonyParser()
+
+
 # ------------------------------------------------------------------------------------------------ glm
 def glm_parse_completion(text: str) -> dict:
     """Split GLM think blocks and tool calls into OpenAI fields (tools/glm/serve.py parse_completion)."""
@@ -586,7 +648,7 @@ class GenericFamily(QwenFamily):
         return Rendered(prompt, False, False, tools, cut_texts=cuts)
 
 
-FAMILIES = {"qwen": QwenFamily, "glm": GlmFamily, "ds41": Ds41Family, "generic": GenericFamily}
+FAMILIES = {"qwen": QwenFamily, "glm": GlmFamily, "ds41": Ds41Family, "generic": GenericFamily, "harmony": HarmonyFamily}
 
 
 def family_of_gguf(model_type: str) -> str:

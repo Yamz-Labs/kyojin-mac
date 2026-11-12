@@ -19,7 +19,25 @@ needs_gpu = pytest.mark.skipif(not _gpu(), reason="no Metal GPU")
 E, TOP, H, I = 40, 6, 512, 512
 
 
+def _packs8(t, n, k, seed, count=E):
+    """FP8 experts as the safetensors loader builds them: fp8 (one scale per row) or fp8b (block scale per 32-unit over 128 x 128, power-of-two row scale)."""
+    from kyojin_mlx import foreign_pack as FP
+    out = []
+    for e in range(count):
+        r = RNG(seed + e)
+        q = r.integers(0, 256, (n, k), dtype=np.uint8)
+        q[(q & 127) == 127] = 0x38
+        if t == "FP8":
+            out.append(FP.Pack("fp8", n, k, q, None, r.uniform(5e-5, 2e-4, n).astype(np.float32)))
+        else:
+            g = r.uniform(64.0, 127.0, (-(-n // 128), -(-k // 128))).astype(np.float32)
+            out.append(FP.Pack("fp8b", n, k, q, g[np.arange(n) // 128][:, (np.arange(k // 32) * 32) // 128].astype(np.float16), np.float32(2.0 ** -20)))
+    return out
+
+
 def _packs(t, n, k, seed):
+    if t in ("FP8", "FP8B"):
+        return _packs8(t, n, k, seed)
     out = []
     _, be, bb = GF.TYPES_BY_NAME[t]
     for e in range(E):
@@ -53,7 +71,7 @@ def _block(types, norm, shared, seed=0):
 
 
 @needs_gpu
-@pytest.mark.parametrize("types", [("Q4_K", "Q4_K", "Q5_K"), ("Q5_K", "Q5_K", "Q6_K"), ("Q8_0", "Q8_0", "Q8_0"), ("IQ4_XS", "IQ4_XS", "Q4_K")])
+@pytest.mark.parametrize("types", [("Q4_K", "Q4_K", "Q5_K"), ("Q5_K", "Q5_K", "Q6_K"), ("Q8_0", "Q8_0", "Q8_0"), ("IQ4_XS", "IQ4_XS", "Q4_K"), ("FP8", "FP8", "FP8"), ("FP8B", "FP8B", "FP8B")])
 @pytest.mark.parametrize("T,norm", [(1, True), (4, True), (3, False)])
 def test_fused_block_matches_stock(types, T, norm, monkeypatch):
     import mlx.core as mx
@@ -144,7 +162,7 @@ def test_glu_down_is_bit_identical_to_silu_mul_then_down(t, monkeypatch):
 
 
 @needs_gpu
-@pytest.mark.parametrize("t", ["Q4_K", "Q5_K", "Q6_K", "Q8_0", "IQ4_XS", "Q4_0", "IQ4_NL", "Q3_K"])
+@pytest.mark.parametrize("t", ["Q4_K", "Q5_K", "Q6_K", "Q8_0", "IQ4_XS", "Q4_0", "IQ4_NL", "Q3_K", "FP8", "FP8B"])
 @pytest.mark.parametrize("n_exp,top,k_in,n_out", [(8, 2, 512, 512), (64, 4, 512, 1024), (128, 8, 1024, 512), (8, 8, 2048, 512), (256, 8, 512, 512)])
 def test_gather_pair_is_bit_identical_to_two_gathers(t, n_exp, top, k_in, n_out, monkeypatch):
     """gate | up in one launch (gather_pair) equals the two gathers bit for bit, across expert counts, top-k, hidden sizes and the three kernel families."""
@@ -152,9 +170,11 @@ def test_gather_pair_is_bit_identical_to_two_gathers(t, n_exp, top, k_in, n_out,
     from kyojin_mlx import foreign_linear as FL
     monkeypatch.setenv("KYOJIN_KSTORED", "2")
     monkeypatch.setenv("KYOJIN_FP8STORED", "2")
-    _, be, bb = GF.TYPES_BY_NAME[t]
+    _, be, bb = GF.TYPES_BY_NAME.get(t, (None, 0, 0))
 
     def mk(seed):
+        if t in ("FP8", "FP8B"):
+            return FL.DevPack(_packs8(t, n_out, k_in, seed, n_exp))
         out = []
         for e in range(n_exp):
             raw = SY.random_blocks(t, n_out, k_in, RNG(seed + e))
@@ -177,7 +197,7 @@ def test_gather_pair_is_bit_identical_to_two_gathers(t, n_exp, top, k_in, n_out,
 
 
 @needs_gpu
-@pytest.mark.parametrize("types", [("Q4_K", "Q4_K", "Q5_K"), ("Q5_K", "Q5_K", "Q6_K"), ("Q8_0", "Q8_0", "Q8_0"), ("IQ4_XS", "IQ4_XS", "Q4_K")])
+@pytest.mark.parametrize("types", [("Q4_K", "Q4_K", "Q5_K"), ("Q5_K", "Q5_K", "Q6_K"), ("Q8_0", "Q8_0", "Q8_0"), ("IQ4_XS", "IQ4_XS", "Q4_K"), ("FP8", "FP8", "FP8"), ("FP8B", "FP8B", "FP8B")])
 def test_prefill_sorted_gmm_matches_per_expert(types, monkeypatch):
     """Prefill slots (above GATHER_MAX): the sorted gathered matmul over the decoded stacks gives the per-expert path's output."""
     import mlx.core as mx
@@ -225,3 +245,24 @@ def test_dense_glu_down_is_bit_identical_to_silu_mul_then_apply(t, R):
     z = d.apply_glu(gu, gu, k, 2 * k)
     mx.eval(ref, y, z)
     assert np.array_equal(np.array(ref), np.array(y)) and np.array_equal(np.array(ref), np.array(z))
+
+
+@needs_gpu
+def test_bf16_router_gets_the_fused_route(monkeypatch):
+    """A safetensors release stores the router in bf16: install promotes it to f32, so the 1-row decode takes the fused kernels and matches the stock block."""
+    import mlx.core as mx
+    from kyojin_mlx import foreign_moe as FM
+    monkeypatch.setenv("KYOJIN_FP8STORED", "2")
+    blk = _block(("FP8B", "FP8B", "FP8B"), True, True)
+    blk.gate.weight = blk.gate.weight.astype(mx.bfloat16)
+    blk.shared_expert_gate.weight = blk.shared_expert_gate.weight.astype(mx.bfloat16)
+    x = mx.array(RNG(5).standard_normal((1, 1, H)).astype(np.float16))
+    ref = blk(x)
+    mx.eval(ref)
+    assert not FM._eligible(blk, x)
+    FM.install(type("M", (), {"named_modules": lambda s: [("b", blk)]})(), log=lambda *_: None)
+    assert blk.gate.weight.dtype == mx.float32 and FM._eligible(blk, x)
+    y = blk(x)
+    mx.eval(y)
+    r, f = np.array(ref, np.float32), np.array(y, np.float32)
+    assert np.abs(f - r).max() <= 2e-2 * np.abs(r).max()

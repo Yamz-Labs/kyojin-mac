@@ -689,14 +689,18 @@ def resolve_chunk(args, backend, log=print):
 CACHE_TIGHT_GIB = 4.0                                              # room after the weights under which the MLX buffer cache stays at its floor
 
 
+CACHE_FLOOR_MAX_MB = int(os.environ.get("KYOJIN_CACHE_FLOOR_MAX_MB", "2048"))
+
+
 def cache_limit_mb_for(weight_bytes: int, recommended_bytes: int = 0, room_bytes: float | None = None) -> int:
     """MLX buffer cache limit: weights / 10, between a floor and 16 GiB. A 256 MB cap made the 172 GiB DS4.1 pack prefill 40 % slower (21.5K tokens: 88 s vs
     52 s at 16 GiB, 29/10 train A/B). The floor follows the machine, not the weights: stale KV buffers fill a small limit, every recycle then evicts the hot
     per-step buffers and each step allocates them again (real 0.6B GGUF, 02/11: 18-21 ms a token at 256-512 MB, 5.4 ms at 1 GiB, same GPU work).
-    recommended_bytes / 32 = 7.6 GiB on a 256 GiB Mac, 256 MB on a 16 GiB one.
+    recommended_bytes / 32, capped at CACHE_FLOOR_MAX_MB: 2 GiB on a 256 GiB Mac (was 7.6 GiB: gpt-oss-20b served 22 GB vs 16 GB at 2 GiB, same speed at N1 /
+    N4 / N8 / pf8K, 12/11), 256 MB on a 16 GiB one.
     room_bytes (the GPU ceiling less the weights; None = unknown): under CACHE_TIGHT_GIB the KV, the prefill temporaries and the cache all live in that room, and the
     cache takes the floor. 16 GB Air, 27B GGUF (8.8 GiB, room 1.2 GiB): 899 MB of cache cost 0.66 GB of footprint for 2.5 % of the prefill speed (6K tokens, 163 vs 159 tok/s)."""
-    floor = max(256, recommended_bytes / 32 / 2 ** 20)
+    floor = max(256, min(CACHE_FLOOR_MAX_MB, recommended_bytes / 32 / 2 ** 20))
     if room_bytes is not None and room_bytes < CACHE_TIGHT_GIB * 2 ** 30:
         return int(floor)
     return int(min(16384, max(floor, weight_bytes / 10 / 2 ** 20)))
@@ -782,6 +786,8 @@ def build_app(args, log=print):
         from .. import ablit as AB
         src, out = os.environ["KYOJIN_ABLIT_MU_JOB"].split(":")
         AB.mu_job(backend, src, out, log=log)
+    if args.sessions is None:
+        args.sessions = _auto_sessions(backend, kv_budget, log)
     engine = Engine(backend, sessions=args.sessions, ctx=args.ctx, chunk=args.prefill_chunk, block=args.prefix_block,
                     prefix_bytes=int(args.prefix_cache_mb * 2 ** 20), decode_per_chunk=args.decode_per_chunk, log=log,
                     mtp_depth=args.mtp_depth, kv_budget=kv_budget, row_cost=args.row_cost, draft_cost=args.draft_cost, disk=disk,
@@ -821,7 +827,8 @@ def build_parser():
     ap.add_argument("model", nargs="?", help="pack directory, fixed defaults (--model PATH derives them from the pack)")
     ap.add_argument("--model", dest="model_opt", metavar="PATH", help="pack directory; options not given are derived from the pack")
     ap.add_argument("--host", default="127.0.0.1"); ap.add_argument("--port", type=int, default=8080)
-    ap.add_argument("--sessions", type=int, default=autoconfig.DEFAULT_SESSIONS, help="requests decoded together (also the most that prefill / wait for a slot at once)")
+    ap.add_argument("--sessions", type=int, default=None, help="requests decoded together (also the most that prefill / wait for a slot at once); default: derived "
+                    "from the KV budget and one session's KV at the TQ_FROM depth, 4..8")
     ap.add_argument("--ctx", type=int, default=None, help="context tokens one request may use (prompt + reply); default: the pack's max_position_embeddings, else 32768")
     ap.add_argument("--prefill-chunk", type=int, default=None, help="prefill chunk (tokens); a decode step runs between two chunks. Default: 8192 for a long-context pack, else automatic 2048 / 1024 / 256 by the free unified memory after the load")
     ap.add_argument("--prefix-block", type=int, default=None, help="prefix snapshots every N tokens (a multiple of the prefill chunk; default 512, or the chunk when larger)")
@@ -874,6 +881,36 @@ def build_parser():
     return ap
 
 
+
+def _row_kv(model: str) -> str | None:
+    """kv field of the modeldesc row of a pack directory (None: no config.json / no row)."""
+    try:
+        from .. import modeldesc
+        mt = json.load(open(os.path.join(model, "config.json"))).get("model_type", "")
+        row = modeldesc.backend_desc(mt)
+        return row.kv if row is not None else None
+    except (OSError, ValueError):
+        return None
+
+
+def _auto_sessions(backend, kv_budget, log) -> int:
+    """Default --sessions: one fresh session cache at the TQ_FROM depth is measured (256 prefilled tokens, scaled), then autoconfig.auto_sessions."""
+    import mlx.core as mx
+    from .. import tq
+    depth = tq.FROM if tq.FROM > 0 else 4096
+    try:
+        c = backend.make_cache_for(depth)
+        mx.eval(backend.prefill_chunk(c, [0] * 256))
+        per = backend.nbytes(c) / 256 * depth
+        del c
+    except Exception as e:                                    # a backend that cannot prefill a bare chunk here: the fixed default
+        log(f"sessions: {autoconfig.DEFAULT_SESSIONS} (KV per session not measured: {type(e).__name__})")
+        return autoconfig.DEFAULT_SESSIONS
+    n = autoconfig.auto_sessions(per, kv_budget, getattr(backend, "max_rows", 16))
+    log(f"sessions: {n} (one session ~{per / 2 ** 30:.2f} GiB of KV at {depth} tokens, budget "
+        + ("unknown" if not kv_budget else f"{kv_budget / 2 ** 30:.1f} GiB") + f"; {autoconfig.DEFAULT_SESSIONS}..{autoconfig.SESSIONS_CAP})")
+    return n
+
 def main(argv=None):
     ap = build_parser()
     args = ap.parse_args(argv)
@@ -885,6 +922,8 @@ def main(argv=None):
     args.model = gguf_serve_dir(args.model)                        # a GGUF without its config / tokenizer files: built from the metadata
     if args.model_opt:
         args.model_opt = args.model
+    if args.kv_mode == "default" and _row_kv(args.model) == "fp16":
+        args.kv_mode = "fp16"                                      # the row asks for a plain cache (attention sinks: the TurboQuant pool cannot serve them)
     if args.kv_mode == "default" and "KYOJIN_TQ" not in os.environ and not os.environ.get("KYOJIN_KVWIN", "").strip():
         args.kv_mode = "tq"                                        # TurboQuant is the default KV cache (28/10 owner; 9B 64K d4 +18 %, KL below k6v6)
     if args.kv_mode == "fp16":

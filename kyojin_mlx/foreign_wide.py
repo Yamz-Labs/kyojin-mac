@@ -76,6 +76,10 @@ def _blk_dec8(fmt: str):
     if fmt == "fp8":
         dec = ("const uint y_ = wd[j][2u * q + (t >> 1)] >> (8u * (t & 1u)); const half2 w2 = as_type<half2>(((y_ << 7) & 0x3F803F80u) | ((y_ << 8) & 0x80008000u));")
         extra, scale = "", "gs[n0 + nl] * 256.0f"
+    elif fmt == "fp8b":       # the fp8 bit trick (value / 256), times 256 x the unit's block scale: the weight itself in half, as the dense fp16 path holds it
+        dec = ("const uint y_ = wd[j][2u * q + (t >> 1)] >> (8u * (t & 1u));"
+               " const half2 w2 = as_type<half2>(((y_ << 7) & 0x3F803F80u) | ((y_ << 8) & 0x80008000u)) * S[j];")
+        extra, scale = "S[j] = half2(half(float(((device const half*)MTP)[ulong(rn) * UPR + uu]) * 256.0f));", "gs[n0 + nl]"
     else:
         dec = ("const uint y_ = wd[j][2u * q + (t >> 1)] >> (8u * (t & 1u));"
                " const half2 w2 = (as_type<half2>((y_ & 0x00FF00FFu) | 0x64006400u) - half2(1152.0h)) * S[j];")

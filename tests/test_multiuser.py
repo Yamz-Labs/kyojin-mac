@@ -112,6 +112,25 @@ def test_batch_caches_pools_forked_prefix():
     assert isinstance(MU.batch_caches(back)[0], MA.PoolKV)                        # the fork records survive unbatch
 
 
+def test_short_shared_prefix_stays_rows():
+    """Users that share only a short prefix (the chat template, ~20 tokens) keep private caches: a PoolKV below POOL_MIN costs more than it saves."""
+    from mlx_lm.models.cache import KVCache
+    from kyojin_mlx import sdpa_dec as SD
+    if not SD.nax_ok():
+        pytest.skip("needs the NAX tiles")
+    base = KVCache()
+    x = mx.random.normal((1, 4, 20, 64)).astype(mx.float16)
+    base.update_and_fetch(x, x)
+    users = []
+    for u in range(3):
+        f = MU.fork_cache([base])
+        t = mx.random.normal((1, 4, 40 + u, 64)).astype(mx.float16)
+        f[0].update_and_fetch(t, t)
+        users.append(f)
+    assert MU.POOL_MIN > 20
+    assert isinstance(MU.batch_caches([MU.fork_cache(f) for f in users])[0], MU.RowsKV)
+
+
 Q35 = os.environ.get("KYOJIN_Q35")
 PROMPTS = os.environ.get("KYOJIN_MU_PROMPTS")
 

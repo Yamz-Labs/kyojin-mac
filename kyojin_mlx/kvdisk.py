@@ -198,6 +198,13 @@ class GenericAdapter:
         cache = make_cache()
         meta, last_fixed = parts[-1][1], parts[-1][0]
         for i, (e, m) in enumerate(zip(cache, meta["entries"])):
+            if m["kind"] == "kv" and type(e).__name__ != "KVCache":    # a plain-KV checkpoint (KYOJIN_TQ_FROM short session) under a TurboQuant default
+                from mlx_lm.models.cache import KVCache
+                e = cache[i] = KVCache()
+            if m["kind"] == "win" and type(e).__name__ == "KVCache":
+                raise ValueError("kv checkpoint kinds differ from the cache (win vs plain): refused")
+            if any((m["kind"] == "kv" and f"g.kv.{i}.k" not in t) or (m["kind"] == "win" and not any(k.startswith(f"g.win.{i}.") for k in t)) for t, _ in parts):
+                raise ValueError("kv checkpoint chain mixes cache kinds: refused")
             if m["kind"] == "kv":
                 ks = [t[f"g.kv.{i}.k"] for t, _ in parts]
                 vs = [t[f"g.kv.{i}.v"] for t, _ in parts]

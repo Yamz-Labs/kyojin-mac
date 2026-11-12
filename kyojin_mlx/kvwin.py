@@ -268,19 +268,32 @@ def config():
     return dict(kbits=f[0], vbits=f[1], group_size=f[2], sink=f[3], window=f[4], f32=os.environ.get(ENV + "_F32", "0") == "1")
 
 
-def make_prompt_cache(model, cfg: dict | None = None):
-    """mlx-lm make_prompt_cache with the full-attention KVCache layers swapped for WinKVCache when the switch (or cfg) is on."""
+def make_prompt_cache(model, cfg: dict | None = None, plain: bool = False):
+    """mlx-lm make_prompt_cache with the full-attention KVCache layers swapped for WinKVCache when the switch (or cfg) is on. plain: the stock caches
+    (a short session under KYOJIN_TQ_FROM)."""
     cache = _mlx_make_prompt_cache(model)
+    if plain:
+        return cache
+    mla = _mla_layers(model, len(cache))                     # an MLA layer caches (latent, k_pe), widths 512 / 64: the K = V head-dim pools do not apply, it keeps its KVCache
     from . import tq                                         # KYOJIN_TQ=kbits:vbits:sink:window: TurboQuant pool (+ the same fp16 overlay)
     tcfg = tq.config() if cfg is None else None
     if tcfg is not None:
         install()
-        return [tq.TQKVCache(**tcfg) if type(c) is KVCache else c for c in cache]
+        return [tq.TQKVCache(**tcfg) if type(c) is KVCache and i not in mla else c for i, c in enumerate(cache)]
     cfg = cfg if cfg is not None else config()
     if cfg is None:
         return cache
     install()
-    return [WinKVCache(**cfg) if type(c) is KVCache else c for c in cache]
+    return [WinKVCache(**cfg) if type(c) is KVCache and i not in mla else c for i, c in enumerate(cache)]
+
+
+def _mla_layers(model, n: int) -> set:
+    """Indices of the cache entries whose layer runs MLA attention (kv_a_proj_with_mqa), when the trunk has one cache per layer."""
+    inner = getattr(model, "language_model", model)
+    layers = getattr(getattr(inner, "model", inner), "layers", None)
+    if layers is None or len(layers) != n:
+        return set()
+    return {i for i, l in enumerate(layers) if hasattr(getattr(l, "self_attn", None), "kv_a_proj_with_mqa")}
 
 
 def bytes_per_token(D: int, kbits: int, vbits: int, group_size: int, sink: int, window: int, ctx: int, kvh: int = 1) -> float:
