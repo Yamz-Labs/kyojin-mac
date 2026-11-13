@@ -60,6 +60,19 @@ One warm-up discarded, then one measured run.
 Memory: one resident copy of the weights. The 35B GGUF is a 20.8 GiB file and uses 21.6-22.0 GB in MLX.
 DeepSeek V4.1 uses 176-178 GB at 8K context and 187 GB at 983K.
 
+## New in 1.9.6
+
+Lower load memory for GGUF K-quant models. Measured on a Mac Studio.
+
+| change | effect | off |
+|---|---|---|
+| big GGUF K-quant tensors are repacked in row slabs of 4M weights (the bytes are the same as the whole-tensor repack for all 18 types) | the host temporaries of the repack (4-16 bytes per weight, ~8 GiB on a 150K-vocabulary head) are gone: Qwen3-8B Q4_K_M load 13.0 -> 6.4 GiB, Qwen 27B Q4_K_M 23-26 -> 19-20 GB after load | - |
+| the draft (MTP) head of a GGUF is not decoded when MTP is off | less memory and a faster load with MTP off | - |
+
+- Release gate against 1.9.5 (2 passes in swapped order, real server, temperature 0, md5 per prompt, memory after load, at the end
+  and at the peak): Qwen 35B-A3B UD-Q4_K_XL GGUF, Qwen 27B NVFP4 and Qwen 27B Q4_K_M GGUF (MTP on and off) same outputs and same speed
+  for 1, 4 and 8 users; steady and peak memory not higher; DeepSeek V4.1 Flash same speed.
+
 ## New in 1.9.5
 
 mlx-vlm 0.7.12 architectures. Measured on a Mac Studio.
