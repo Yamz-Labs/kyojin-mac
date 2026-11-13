@@ -1238,7 +1238,8 @@ def emb_stored_all() -> bool:
     return os.environ.get("KYOJIN_GGUF_EMB_STORED", "1") not in ("0", "")
 
 
-def _read_gguf(path, arch) -> _Src:
+def _read_gguf(path, arch, mtp=True) -> _Src:
+    """mtp=False: the draft-head blocks (nextn) are not read at all (they would sit decoded in fp16, ~0.8 GiB on a 27B, with nothing to use them)."""
     g = GF.GgufFile(GF.find_gguf(path))
     src = _Src()
     A = ARCHS[arch]
@@ -1251,9 +1252,11 @@ def _read_gguf(path, arch) -> _Src:
         if hf is None:
             src.notes.append(f"{name}: draft-head block, not used by the {arch} class (skipped, as llama.cpp does)")
             continue
+        head = hf.startswith("mtp.")
+        if head and not mtp:
+            continue
         xf = XF.plan(name, A.xform, g.kv, ti.ne[-1] if len(ti.ne) == 2 else (ti.ne[0] if len(ti.ne) == 1 else None))
         raw = g.raw(name)
-        head = hf.startswith("mtp.")
         rows = xf.rows if (xf is not None and xf.rows is not None and raw.ndim == 2) else None      # rows are independent in every GGUF type: permute the stored blocks, nothing is decoded
         is_w = is_linear(hf, len(ti.ne), arch)
         if embed_stored(hf, ti, arch, g) and not head:                       # token embedding kept as stored (StoredEmbedding): no fp16 table
@@ -1336,7 +1339,7 @@ def install_rope_freqs(model, ff: mx.array) -> int:
     return n
 
 
-def load_foreign(path, dtype=mx.float16, log=print):
+def load_foreign(path, dtype=mx.float16, log=print, mtp=True):
     """(model, config) for a directory (or .gguf file) in a foreign format. The model class is mlx-lm's for config['model_type'], the quantised linears are
     ForeignLinear, MoE experts ForeignSwitchGLU; non-quantised tensors are kept as stored (bf16 -> `dtype`)."""
     from mlx.utils import tree_unflatten
@@ -1352,7 +1355,7 @@ def load_foreign(path, dtype=mx.float16, log=print):
         cfg_path = os.path.join(d, "config.json")
         config = json.load(open(cfg_path)) if os.path.exists(cfg_path) else gguf_config(gf)
         gf.close()
-        src = _read_gguf(path, arch)
+        src = _read_gguf(path, arch, mtp)
     else:
         config = json.load(open(os.path.join(d, "config.json")))
         src = _read_safetensors(d)

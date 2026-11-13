@@ -465,8 +465,35 @@ def _grid_bytes(tab):
 
 
 # ---------------------------------------------------------------------------------------------------------------- repack for the Metal kernels
+PACK_SLAB_ELEMS = 1 << 22                                                          # weights per to_pack slab: the bit-field repack makes uint32 temporaries of 4 bytes per weight
+
+
 def to_pack(tname: str, raw, k: int):
-    """raw blocks of a KERNEL_TYPES tensor [n, row_bytes] -> foreign_pack.Pack (the same bits, in the order the kernels read)."""
+    """raw blocks of a KERNEL_TYPES tensor [n, row_bytes] -> foreign_pack.Pack (the same bits, in the order the kernels read). Rows are independent in every
+    GGUF type, so a tensor of more than PACK_SLAB_ELEMS weights (the 248K x 5120 output head) is repacked in row slabs written into one preallocated pack: the
+    uint32 temporaries of the K-quant bit splits (4-12 bytes per weight, 8 GiB on a 150K-vocab head) never exist whole. Same bytes as the whole-tensor call."""
+    from . import foreign_pack as FP
+    raw = np.asarray(raw)
+    n = raw.shape[0]
+    rows = max(1, PACK_SLAB_ELEMS // k)
+    if raw.ndim != 2 or n <= rows:
+        return _to_pack_whole(tname, raw, k)
+    first = _to_pack_whole(tname, raw[:rows], k)
+    alloc = lambda a: None if a is None else np.empty((n,) + a.shape[1:], a.dtype)           # noqa: E731
+    qs, meta, extra = alloc(first.qs), alloc(first.meta), {key: alloc(v) for key, v in first.extra.items()}
+    for i in range(0, n, rows):
+        pk = first if i == 0 else _to_pack_whole(tname, raw[i:i + rows], k)
+        j = i + pk.qs.shape[0]
+        qs[i:j] = pk.qs
+        if meta is not None:
+            meta[i:j] = pk.meta
+        for key in extra:
+            extra[key][i:j] = pk.extra[key]
+        del pk
+    return FP.Pack(first.fmt, n, k, qs, meta, first.gscale, extra)
+
+
+def _to_pack_whole(tname: str, raw, k: int):
     from . import foreign_pack as FP
     if tname not in KERNEL_TYPES + KERNEL_TYPES8 + KERNEL_TYPESK:
         raise GgufTypeError(f"GGUF type {tname} has no Metal kernel (kernel types: {', '.join(KERNEL_TYPES)})")

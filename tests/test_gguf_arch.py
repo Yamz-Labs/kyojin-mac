@@ -384,6 +384,16 @@ def test_qwen35_loader_does_not_turn_conv1d_into_a_linear(tmp_path):
     assert not any(k.startswith("model.layers.4") for k in list(src.dense) + list(src.packs)) and set(src.mtp) >= {"mtp.fc.weight", "mtp.norm.weight"}
 
 
+def test_qwen35_mtp_off_does_not_read_the_draft_head(tmp_path):
+    """mtp=False: the nextn block is not decoded to fp16 and kept; the trunk tensors are the same as with the head."""
+    from kyojin_mlx import foreign_linear as FL
+    p = tmp_path / "m.gguf"
+    _write(p, _hf_qwen35())
+    on, off = FL._read_gguf(str(p), "qwen35"), FL._read_gguf(str(p), "qwen35", mtp=False)
+    assert on.mtp and not off.mtp
+    assert sorted(on.dense) == sorted(off.dense) and sorted(on.packs) == sorted(off.packs) and sorted(on.embed) == sorted(off.embed)
+
+
 def test_gguf_has_mtp(tmp_path):
     p, q = tmp_path / "with.gguf", tmp_path / "without.gguf"
     _write(p, _hf_qwen35())

@@ -1061,7 +1061,7 @@ def load_q35(path: str, mtp: bool | None = None, mtp_head: str | None = None, lo
     pack has an `mtp/` sidecar or `mtp_head` names one; mtp=False turns it off)."""
     from .. import foreign_linear as FL
     if FL.is_foreign(path):                                       # GGUF / NVFP4 / MXFP4 served as stored (foreign_linear); never reached for an EXL3 or MLX pack
-        model, cfg = FL.load_foreign(path, log=log)
+        model, cfg = FL.load_foreign(path, log=log, mtp=mtp is not False)
         from .q35mlx import Q35MlxBackend, find_mtp_dir
         heads = FL.take_mtp(model) if mtp is not False else None            # the nextn block of a GGUF: draft head from the file itself
         d = find_mtp_dir(path, mtp_head) if mtp is not False and heads is None else None      # a draft head shipped next to the weights (NVFP4 + MTP repos)
