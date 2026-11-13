@@ -60,6 +60,20 @@ One warm-up discarded, then one measured run.
 Memory: one resident copy of the weights. The 35B GGUF is a 20.8 GiB file and uses 21.6-22.0 GB in MLX.
 DeepSeek V4.1 uses 176-178 GB at 8K context and 187 GB at 983K.
 
+## New in 1.9.7
+
+Qwen3 MoE GGUF files load. Measured on a Mac Studio.
+
+| change | effect | off |
+|---|---|---|
+| GGUF architecture `qwen3moe` maps to mlx-lm's `qwen3_moe` model (it named a `qwen3moe` module that does not exist) | Qwen3-30B-A3B and other Qwen3 MoE GGUF files load and serve | - |
+| the cached serve directory of a GGUF file is rebuilt once (key v6) | a machine that tried such a file before gets the corrected config | - |
+
+- Qwen3-30B-A3B-Instruct-2507 Q8_0 GGUF, 8 sessions, same session as llama.cpp Metal (`-np 8`), tok/s: N1 160-162 vs 138-139, N4 346-361 vs
+  292, N8 421-471 vs 388, N8 with 8 different prompts 319-333 vs 316-317, prefill 8K 2.02-2.23 s vs 3.28 s.
+- Release gate against 1.9.6 (2 passes in swapped order, real server, temperature 0, md5 per prompt): Qwen 35B-A3B UD-Q4_K_XL GGUF same
+  outputs and same speed for 1, 4 and 8 users; the Qwen3-30B-A3B Q8_0 GGUF loads (1.9.6 refused it) with stable outputs.
+
 ## New in 1.9.6
 
 Lower load memory for GGUF K-quant models. Measured on a Mac Studio.
