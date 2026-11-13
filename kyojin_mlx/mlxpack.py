@@ -31,3 +31,18 @@ def is_mlx_pack(path) -> bool:
         return "quantization" in json.load(open(os.path.join(path, "config.json")))
     except Exception:
         return False
+
+
+def is_plain_pack(path) -> bool:
+    """A plain bf16 / fp16 / fp32 HF checkpoint: config.json without quantization / quantization_config (also in text_config), safetensors next to it.
+    mlx-lm reads it as stored (no EXL3 / foreign-format loader involved)."""
+    import glob
+    import json
+    try:
+        cfg = json.load(open(os.path.join(path, "config.json")))
+    except Exception:
+        return False
+    for c in (cfg, cfg.get("text_config") or {}):
+        if "quantization" in c or "quantization_config" in c:
+            return False
+    return bool(glob.glob(os.path.join(path, "*.safetensors")))

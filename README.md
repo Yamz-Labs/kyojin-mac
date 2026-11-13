@@ -60,6 +60,25 @@ One warm-up discarded, then one measured run.
 Memory: one resident copy of the weights. The 35B GGUF is a 20.8 GiB file and uses 21.6-22.0 GB in MLX.
 DeepSeek V4.1 uses 176-178 GB at 8K context and 187 GB at 983K.
 
+## New in 1.9.4
+
+Any architecture, served by default. Measured on a Mac Studio.
+
+A model type without its own row is now served by default through the generic backend (the stock mlx-lm / mlx-vlm model class with the
+engine's per-user caches and multi-user batching) and the Jinja chat family (the pack's own chat template). Before 1.9.4 it needed
+`KYOJIN_BACKEND_FALLBACK=1` / `KYOJIN_CHAT_FALLBACK=1`; models that have a row take the same path as in 1.9.3 (same outputs).
+
+| change | effect | off |
+|---|---|---|
+| generic backend + Jinja chat family on by default; the per-user attention hook covers every attention module; mlx-lm weight remap on the generic load; plain bf16 packs (no quantization config) load | Ministral 3 3B, Phi-4-mini, Llama 3.2 1B bf16, SmolLM3 3B, Gemma 3 270M bf16, Gemma 4 E2B, Nemotron 3 Nano 4B bf16 serve (1 user 95 to 572 tok/s, 4 users 357 to 1064); 4-bit packs give the same first 96 greedy tokens as stock mlx_lm | `KYOJIN_BACKEND_FALLBACK=0`, `KYOJIN_CHAT_FALLBACK=0` |
+| caches the code does not list (a model's own rotating cache, cache lists, state-only caches) fork and persist through their own state | Gemma / SSM caches serve several users | `KYOJIN_GENERIC_CACHE=0` |
+| TurboQuant KV keeps a plain cache on layers whose head size has no codebook | Gemma 4 (global layers of head size 512) no longer fails on the first token | - |
+| tool calls of the Jinja family: Mistral `[TOOL_CALLS]`, Llama `<\|python_tag\|>`, Gemma 4 `<\|tool_call>`; `tools` passed as none when the request has none; a thinking block the model opens itself goes to `reasoning` | tool calls parsed on Ministral 3, Llama 3.2, Gemma 4, Nemotron 3 Nano | - |
+
+- Release gate against fleet-1.9.3 (real server, temperature 0, 3 fixed prompts, md5 per prompt): Qwen 35B-A3B UD-Q4_K_XL GGUF and Qwen 27B NVFP4
+  same outputs and same speed (3 passes on the 27B), DeepSeek V4.1 Flash same outputs at 131K and 983K context; gpt-oss-20b same outputs.
+- bf16 Gemma 3 / Nemotron outputs drift from stock mlx_lm after 20 to 70 tokens (different attention accumulation order); outputs stay coherent.
+
 ## New in 1.9.3
 
 MLX-format checkpoints, 8-bit linears with several rows, day-one rows. Measured on a Mac Studio through the real server (temperature 0, 3 fixed

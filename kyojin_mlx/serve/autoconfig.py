@@ -277,6 +277,7 @@ def resolve_serve_args(args):
     for key, value in opts.items():
         setattr(args, key, value)
     args._pack = pack
+    args._mtp_auto = depth is None                              # the depth below is the pack's guess, not the user's request
     args._resolved = True
     return args
 

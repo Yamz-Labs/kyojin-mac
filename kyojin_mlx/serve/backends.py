@@ -1071,7 +1071,7 @@ def load_q35(path: str, mtp: bool | None = None, mtp_head: str | None = None, lo
         return be, cfg
     from .. import mlxpack, packcheck
     packcheck.check_pack(path, log=log)                           # header-only (KYOJIN_DESC_STRICT=1 raises); the draft head is checked where it is loaded
-    if mlxpack.is_mlx_pack(path):
+    if mlxpack.is_mlx_pack(path) or mlxpack.is_plain_pack(path):          # a plain bf16 / fp16 HF checkpoint is read by mlx-lm as stored (unquantized linears)
         import json
         from .q35mlx import Q35MlxBackend, find_mtp_dir
         model, _ = mlxpack.load(path)
@@ -1138,9 +1138,18 @@ class GenericBackend(Q35Backend):
         return None if self.pack is None else {"arch": self.arch, "pack": kvdisk.pack_fingerprint(self.pack)}
 
 
+def _mlx_lm_classes(cfg: dict):
+    """The mlx-lm model / args classes of a config, resolved the way mlx_lm.load does (remap table, architecture remap). ModuleNotFoundError when mlx-lm has
+    no class for it, so load_generic falls to the mlx-vlm loader."""
+    from mlx_lm import utils
+    try:
+        return utils._get_classes(cfg)
+    except ValueError as e:
+        raise ModuleNotFoundError(str(e)) from e
+
+
 def load_generic(path: str, log=print) -> GenericBackend:
     import contextlib
-    import importlib
     import json
     from pathlib import Path
     cfg = json.load(open(os.path.join(path, "config.json")))
@@ -1155,9 +1164,17 @@ def load_generic(path: str, log=print) -> GenericBackend:
         try:
             if want_vision:
                 raise ModuleNotFoundError("visiongen: mlx-vlm class")
-            importlib.import_module(f"mlx_lm.models.{mt}")
             from mlx_lm.utils import load_model
-            model, _ = load_model(Path(tpath), strict=True)
+            _mlx_lm_classes(cfg)                                              # mlx-lm's own resolution (MODEL_REMAPPING: mistral -> llama, minimax_m2 -> minimax, gemma4_unified -> gemma4, falcon_mamba -> mamba ...)
+            try:
+                model, _ = load_model(Path(tpath), strict=True)
+            except ValueError as e:                                           # the mlx-lm class and the pack disagree on the parameters (config keys the class defaults differently): the mlx-vlm class of the type gets its turn
+                from mlx_vlm.utils import load_model as load_vlm_model
+                try:
+                    model = load_vlm_model(Path(tpath), lazy=False)
+                except Exception:
+                    raise e from None
+                log(f"[kyojin] mlx-lm class refused the pack ({str(e).splitlines()[0][:80]}); serving the mlx-vlm class")
         except ModuleNotFoundError:
             from mlx_vlm.utils import load_model as load_vlm_model
             model = load_vlm_model(Path(tpath), lazy=False)
@@ -1294,7 +1311,7 @@ def load_backend(path: str, kind: str | None = None, **kw) -> tuple[Backend, dic
         if auto:                                            # DS4.1 / GLM: MTP stays opt-in (--mtp-depth N) as before (ModelDesc.mtp_auto False); a row that sets it gets the draft head when the pack carries it
             mtp = bool(row is not None and row.mtp_auto and has_mtp_tensors(mtp_head or path, prefix))
         return load_vlm(path, mtp=bool(mtp), **kw)
-    if (row is not None and row.backend == "generic") or os.environ.get("KYOJIN_BACKEND_FALLBACK", "0") != "0":   # generic row or no row: the per-user cache / multiuser plumbing on the stock model class
+    if (row is not None and row.backend == "generic") or os.environ.get("KYOJIN_BACKEND_FALLBACK", "1") != "0":   # generic row or no row: the per-user cache / multiuser plumbing on the stock model class
         be = load_generic(path, log=kw.get("log", print))
         if os.environ.get("KYOJIN_MTPGEN", "0") != "0" and mtp is not False:       # flag mtpgen: the pack's own draft head, any layout mtpgen knows
             from .. import mtpgen

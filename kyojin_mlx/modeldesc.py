@@ -115,7 +115,7 @@ GENERIC_STOPS = ("<|eot_id|>", "<|eot|>", "<|im_end|>", "<|end|>", "<end_of_turn
 
 def stop_tokens_of(server: str) -> tuple:
     """Stop-token strings of the chat family `server` ("qwen" / "glm" / "ds41"): the row that selects that family."""
-    if server == "generic":                    # a bare GGUF of a mapped architecture: the ids of the file's own metadata (generation_config.json) plus the end-of-turn tokens llama.cpp treats as
+    if server in ("generic", "jinja"):         # a pack with no row (Jinja fallback family), or a bare GGUF of a mapped architecture: the ids of the file's own metadata (generation_config.json) plus the end-of-turn tokens llama.cpp treats as
         return GENERIC_STOPS                   # end of generation by their text (llama-vocab.cpp special_eog_ids, lines 3266-3296), which the metadata does not always carry (gemma, GLM)
     for d in DESCS:
         if d.server == server:

@@ -279,12 +279,32 @@ def make_prompt_cache(model, cfg: dict | None = None, plain: bool = False):
     tcfg = tq.config() if cfg is None else None
     if tcfg is not None:
         install()
-        return [tq.TQKVCache(**tcfg) if type(c) is KVCache and i not in mla else c for i, c in enumerate(cache)]
+        skip = mla | _tq_unsupported_layers(model, len(cache), tcfg["kbits"], tcfg["vbits"])
+        return [tq.TQKVCache(**tcfg) if type(c) is KVCache and i not in skip else c for i, c in enumerate(cache)]
     cfg = cfg if cfg is not None else config()
     if cfg is None:
         return cache
     install()
     return [WinKVCache(**cfg) if type(c) is KVCache and i not in mla else c for i, c in enumerate(cache)]
+
+
+def _tq_unsupported_layers(model, n: int, kbits: int, vbits: int) -> set:
+    """Indices of the cache entries whose attention head_dim has no TurboQuant codebook / rotation (Gemma 4 global layers: 512 next to 256 on the sliding ones): those layers
+    keep their plain KVCache. Cache entry i belongs to layer i (models that share KV between layers have fewer entries than layers, the shared ones come last)."""
+    from . import tq
+    inner = getattr(model, "language_model", model)
+    layers = getattr(getattr(inner, "model", inner), "layers", None)
+    if layers is None or len(layers) < n:
+        return set()
+    out = set()
+    for i in range(n):
+        for name in ("self_attn", "attn", "attention"):
+            d = getattr(getattr(layers[i], name, None), "head_dim", None)
+            if isinstance(d, int):
+                if not (tq.supported(d, kbits) and tq.supported(d, vbits)):
+                    out.add(i)
+                break
+    return out
 
 
 def _mla_layers(model, n: int) -> set:

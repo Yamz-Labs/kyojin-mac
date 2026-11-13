@@ -105,11 +105,13 @@ def test_ds41_reply_every_cut():
     every_cut(lambda: P.StreamParser(True, True), text, got)
 
 
-def test_family_names():
+def test_family_names(monkeypatch):
     assert family_of("qwen3_5") == "qwen" and family_of("glm5_next") == "glm" and family_of("deepseek_v41") == "ds41"
+    assert family_of("llama") == "jinja"                                      # no row: the pack's own template + the <tool_call> parser (KYOJIN_CHAT_FALLBACK is on by default)
+    monkeypatch.setenv("KYOJIN_CHAT_FALLBACK", "0")
     with pytest.raises(ValueError):
         family_of("llama")
-    assert set(FAMILIES) == {"qwen", "glm", "ds41", "generic"}
+    assert set(FAMILIES) == {"qwen", "glm", "ds41", "generic", "jinja", "harmony"}
 
 
 # ------------------------------------------------------------------------------------------------ rendering

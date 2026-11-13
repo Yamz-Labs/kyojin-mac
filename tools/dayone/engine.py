@@ -47,10 +47,12 @@ def text_cfg(cfg: dict) -> dict:
 def code_of(cfg: dict):
     """(package, module, config class) of the model code for cfg['model_type']: mlx-lm first, mlx-vlm second."""
     mt = cfg["model_type"]
+    from mlx_lm.utils import MODEL_REMAPPING
+    mlx_lm_mt = MODEL_REMAPPING.get(mt, mt)                   # mlx-lm's own resolution (mistral -> llama, falcon_mamba -> mamba ...), as load_generic does
     order = (("mlx_vlm", "ModelConfig"), ("mlx_lm", "ModelArgs")) if "vision_config" in cfg else (("mlx_lm", "ModelArgs"), ("mlx_vlm", "ModelConfig"))
     for pkg, cls in order:
         try:
-            mod = importlib.import_module(f"{pkg}.models.{mt}")
+            mod = importlib.import_module(f"{pkg}.models.{mlx_lm_mt if pkg == 'mlx_lm' else mt}")
         except ModuleNotFoundError:
             continue
         return pkg, mod, getattr(mod, cls)

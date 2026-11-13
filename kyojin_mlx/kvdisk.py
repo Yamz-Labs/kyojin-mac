@@ -189,7 +189,7 @@ class GenericAdapter:
                 metas.append(dict(kind="state", sk=_enc(e.state, fixed, f"st.{i}"), meta=list(ms) if isinstance(ms, (list, tuple)) else ms,
                                   meta_is_seq=isinstance(ms, (list, tuple))))
         offs = [int(getattr(e, "offset", 0)) for e in cache]
-        if os.environ.get("KYOJIN_GENERIC_CACHE", "0") != "0":
+        if os.environ.get("KYOJIN_GENERIC_CACHE", "1") != "0":
             known = [o for o in map(_offset_of, cache) if o is not None]
             return fixed, grow, rows, dict(entries=metas, offset=max(known) if known else None, offsets=[o or 0 for o in map(_offset_of, cache)])
         return fixed, grow, rows, dict(entries=metas, offset=max(offs) if offs else 0, offsets=offs)
