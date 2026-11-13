@@ -403,7 +403,13 @@ def test_generic_chat_family_uses_the_file_template_and_the_file_stop_ids(tmp_pa
     assert SV.stop_token_ids(d, cfg, tok, "generic") == {2}                   # eos from tokenizer.ggml.eos_token_id
     from kyojin_mlx.serve import autoconfig as AC
     assert AC.family_of_pack(cfg, d) == "generic"
-    assert AC.family_of_pack({"model_type": "llama"}) is None               # a safetensors llama pack: unchanged (no family)
+    assert AC.family_of_pack({"model_type": "llama"}) == "jinja"           # a safetensors llama pack: the Jinja fallback family (KYOJIN_CHAT_FALLBACK on by default)
+    mp = pytest.MonkeyPatch()
+    mp.setenv("KYOJIN_CHAT_FALLBACK", "0")
+    try:
+        assert AC.family_of_pack({"model_type": "llama"}) is None           # opt-out: no family
+    finally:
+        mp.undo()
 
 
 def test_rotating_cache_forks_and_continues_like_the_original():

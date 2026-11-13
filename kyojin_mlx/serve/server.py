@@ -726,6 +726,9 @@ def build_app(args, log=print):
     backend, cfg = load_backend(args.model, mtp=mtp, mtp_head=args.mtp_head, ced=not args.no_ced, ced_tail=ced_tail, log=log)
     if args.mtp_depth is None or getattr(backend, "foreign", False):     # read as stored: no draft head path yet (load_q35 logged it)
         args.mtp_depth = backend.default_mtp_depth if backend.supports_spec else 0
+    elif args.mtp_depth > 0 and not backend.supports_spec and getattr(args, "_mtp_auto", False):
+        log(f"mtp: the pack carries draft tensors the {backend.kind} backend cannot use (plain checkpoint, no mtp/ sidecar); serving without speculative decode")
+        args.mtp_depth = 0
     elif args.mtp_depth > 0 and not backend.supports_spec:
         raise SystemExit("--mtp-depth needs the pack's draft head (mtp.* tensors, a Qwen3.5 mlx pack: its mtp/ sidecar, tools/mtp_sidecar.py, or --mtp-head DIR)")
     for k in ("row_cost", "draft_cost"):
@@ -819,7 +822,7 @@ def _family_name(model: str, cfg: dict) -> str:
 def _thinking_key(fam_name: str) -> str:
     """Chat-template kwarg that switches thinking (the modeldesc row of the family)."""
     from .. import modeldesc
-    return next((d.thinking_key for d in modeldesc.DESCS if d.server == fam_name), "enable_thinking" if fam_name == "generic" else "thinking")
+    return next((d.thinking_key for d in modeldesc.DESCS if d.server == fam_name), "enable_thinking" if fam_name in ("generic", "jinja") else "thinking")
 
 
 def build_parser():

@@ -129,6 +129,15 @@ _orig_sdpa = None
 _mu_sdpa = None
 
 
+def _shares_kv(model) -> bool:
+    """A layer of the model reads the keys / values of an earlier layer (gemma4 `shared_kv` argument)."""
+    for _, m in model.named_modules():
+        code = getattr(type(m).__dict__.get("__call__"), "__code__", None)
+        if code is not None and "shared_kv" in code.co_varnames[:code.co_argcount]:
+            return True
+    return False
+
+
 def configure(mode: str | None = None) -> str:
     """Pick the EXL3 linear path of the batched decode rows (env KYOJIN_MU_MODE, default "default"):
     exact   rows are bitwise equal to the solo run: <= 4 rows the fused GEMV, 5..16 rows ONE 8-row GEMV launch (ROW_SPLIT_MAX=16, no NAX);
@@ -190,6 +199,8 @@ def install(model=None) -> int:
     global _orig_sdpa, _mu_sdpa, _NO_POOL
     if model is not None and any(hasattr(m, "sinks") for _, m in model.named_modules()) and os.environ.get("KYOJIN_MU_POOL_SINKS", "1") == "0":
         _NO_POOL = True                                       # KYOJIN_MU_POOL_SINKS=0: sink models stay on RowsKV (the pooled merge adds the sink term by default)
+    if model is not None and _shares_kv(model):
+        _NO_POOL = True                                       # layers that read the keys of an earlier layer (gemma4 KV sharing): PoolKV hands out no keys, RowsKV does
     from . import sdpa_dec as SD
     n = make_row_invariant(model) if model is not None else 0
     SD.install()
@@ -207,7 +218,7 @@ def install(model=None) -> int:
     def sdpa(queries, keys, values, cache, scale, mask, sinks=None):
         if isinstance(cache, MA.PoolKV):
             return cache.attend(queries, scale, sinks)
-        if isinstance(cache, RowsKV):
+        if isinstance(cache, RowsKV) or isinstance(keys, (list, tuple)):          # a KV-sharing layer (gemma4 shared_kv) gets the per-user key list of an earlier layer, with no cache of its own
             if sinks is not None and any(isinstance(kk, kvwin.KVView) for kk in keys):
                 raise ValueError("attention sinks on a quantized KV window (KYOJIN_KVWIN / TurboQuant) are not supported: serve with --kv-mode fp16")
             outs = [keys[i].cache.attend(queries[i:i + 1], scale) if isinstance(keys[i], kvwin.KVView)
@@ -225,16 +236,52 @@ def install(model=None) -> int:
     return n
 
 
+def _delegating_sdpa(orig):
+    """A module's own sdpa under per-user caches: PoolKV / RowsKV go to the per-user attention, every other cache to the function the module had (unchanged)."""
+    def sdpa(queries, keys, values, cache, scale, mask, sinks=None):
+        if isinstance(cache, (MA.PoolKV, RowsKV)) or isinstance(keys, (list, tuple)):
+            return _mu_sdpa(queries, keys, values, cache, scale, mask, sinks)
+        return orig(queries, keys, values, cache, scale, mask, sinks)
+    sdpa._kyojin_mu = True
+    sdpa._kyojin_orig = orig
+    return sdpa
+
+
+def _sdpa_compatible(fn) -> bool:
+    import inspect
+    try:
+        names = list(inspect.signature(fn).parameters)
+    except (TypeError, ValueError):
+        return False
+    return names[:6] == ["queries", "keys", "values", "cache", "scale", "mask"]
+
+
 def _route_module(model) -> None:
-    """The per-user attention also serves the module of a text-only class (Qwen3, Qwen3-MoE read as stored)."""
-    mod = sys.modules.get(type(model).__module__) if model is not None else None
+    """The per-user attention also serves the module that holds the attention call: the module of the model class (text-only Qwen3 / Qwen3-MoE read as
+    stored) and the module of every class in the model tree and its bases (mistral3 / ministral3 / smollm3 / gemma4_unified reuse the attention of llama.py,
+    gemma4_text.py ...). The module keeps its own sdpa function for every other cache; a module whose sdpa has another signature stays stock."""
+    if model is None:
+        return
+    mod = sys.modules.get(type(model).__module__)
     if mod is not None and hasattr(mod, "scaled_dot_product_attention"):
         mod.scaled_dot_product_attention = _mu_sdpa
-    if model is not None and os.environ.get("KYOJIN_VISIONGEN", "0") != "0" and "language_model" in model:     # flag visiongen: an mlx-vlm wrapper (llava ...) keeps its attention in the text module's own sdpa
+    if os.environ.get("KYOJIN_VISIONGEN", "0") != "0" and "language_model" in model:     # flag visiongen: an mlx-vlm wrapper (llava ...) keeps its attention in the text module's own sdpa
         for _, m in model.language_model.named_modules():
             sub = sys.modules.get(type(m).__module__)
             if sub is not None and hasattr(sub, "scaled_dot_product_attention") and sub.scaled_dot_product_attention is not _mu_sdpa:
                 sub.scaled_dot_product_attention = _mu_sdpa
+    seen = {type(model).__module__}
+    for _, m in model.named_modules():
+        for c in type(m).__mro__:
+            name = c.__module__
+            if name in seen or name in ("builtins", "mlx.nn.layers.base"):
+                continue
+            seen.add(name)
+            sub = sys.modules.get(name)
+            fn = getattr(sub, "scaled_dot_product_attention", None) if sub is not None else None
+            if fn is None or fn is _mu_sdpa or getattr(fn, "_kyojin_mu", False) or not _sdpa_compatible(fn):
+                continue
+            sub.scaled_dot_product_attention = _delegating_sdpa(fn)
 
 
 # ---------------------------------------------------------------------------------------------- caches
@@ -264,9 +311,9 @@ def fork_cache(cache: list) -> list:
     nested forks included): batch_caches reads them to store and read the shared prefix once (PoolKV). Assumes a fork never trims below its fork
     point (batch_caches also checks the last prefix key of every user)."""
     out = []
-    generic = os.environ.get("KYOJIN_GENERIC_CACHE", "0") != "0"
+    generic = os.environ.get("KYOJIN_GENERIC_CACHE", "1") != "0"
     for c in cache:
-        if generic and type(c) is not KVCache and not isinstance(c, (WinKVCache, ArraysCache)):
+        if generic and type(c) not in (KVCache, RotatingKVCache) and not isinstance(c, (WinKVCache, ArraysCache)):
             n = _fork_any(c)                                          # a subclass of KVCache keeps its class (plain KVCache() would drop its own update path)
         elif isinstance(c, KVCache):
             n = KVCache()
@@ -287,7 +334,7 @@ def fork_cache(cache: list) -> list:
         elif isinstance(c, ArraysCache):
             n = ArraysCache(len(c.cache))
             n.cache = [x[...] if x is not None else None for x in c.cache]
-        elif os.environ.get("KYOJIN_GENERIC_CACHE", "0") != "0":
+        elif os.environ.get("KYOJIN_GENERIC_CACHE", "1") != "0":
             n = _fork_any(c)
         else:
             raise TypeError(f"fork_cache: unsupported cache {type(c).__name__}")
@@ -332,13 +379,13 @@ def batch_caches(users: list[list], prefix_len: int | None = None) -> list:
     prompt cache share its prefix (prefix_len: None = from the fork records, 0 = off): with >= 2 users their full-attention layers become one
     PoolKV (prefix stored and read once per step for all users, mu_attn.py) where its kernel runs, else one private KVCache per user (RowsKV)."""
     out = []
-    generic = os.environ.get("KYOJIN_GENERIC_CACHE", "0") != "0"
+    generic = os.environ.get("KYOJIN_GENERIC_CACHE", "1") != "0"
     for col in zip(*users):
         col = list(col)
         P = (shared_prefix(col) if prefix_len is None else prefix_len) if len(col) > 1 and type(col[0]) is KVCache else 0
         if isinstance(col[0], ArraysCache):
             out.append(ArraysCache.merge(col))
-        elif generic and type(col[0]) is not KVCache and not isinstance(col[0], (KVCache, WinKVCache)) and hasattr(type(col[0]), "merge"):
+        elif generic and type(col[0]) is not RotatingKVCache and type(col[0]) is not KVCache and not isinstance(col[0], (KVCache, WinKVCache)) and hasattr(type(col[0]), "merge"):
             out.append(type(col[0]).merge(col))                       # KYOJIN_GENERIC_CACHE: the cache's own merge (mlx-vlm ArraysCache, CacheList, rotating)
         elif P >= max(POOL_MIN, 1) and not _NO_POOL and MA.supported(col, P) and _same_prefix(col, P):
             out.append(MA.PoolKV(col, P))

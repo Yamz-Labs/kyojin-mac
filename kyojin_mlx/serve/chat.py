@@ -230,7 +230,8 @@ def _complete_calls(index0: int, calls: list) -> list:
 
 # ------------------------------------------------------------------------------------------------ qwen
 TOOL_OPEN, TOOL_CLOSE = "<tool_call>", "</tool_call>"
-THINK_CLOSE = "</think>"
+THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
+CHANNEL_OPEN, CHANNEL_CLOSE = "<|channel>thought\n", "<channel|>"             # Gemma 4's thinking block
 _FUNC_RE = re.compile(r"<function=([^>\s]+)\s*>(.*?)(?:</function>|$)", re.S)
 _PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>\n?(.*?)\n?</parameter>", re.S)
 EFFORT_ALIASES = {"high": "xhigh", "minimal": "low"}
@@ -254,7 +255,9 @@ class Splitter:
     From <tool_call> to </tool_call> everything is held for parse_tool_calls(); text after the close is content again.
     Whitespace at the edges of a piece (the newlines around </think> and <tool_call>) is dropped."""
 
-    def __init__(self, reasoning_first: bool):
+    def __init__(self, reasoning_first: bool, think_open: bool = False):
+        self.think_open = think_open                       # the model itself opens the <think> block (SmolLM3 /think, Gemma 4 channel; no <think> in the generation prompt)
+        self.closers = [THINK_CLOSE]
         self.mode = "reasoning" if reasoning_first else "content"
         self.buf = ""
         self.ws = ""
@@ -292,8 +295,9 @@ class Splitter:
                 self.buf, self.tool_text = self.tool_text[end:], self.tool_text[:end]
                 self.mode, self.lead, self.after_call = "content", True, True
                 continue
-            tags = [TOOL_OPEN] + ([THINK_CLOSE] if self.mode == "reasoning" else [])
-            hits = [(self.buf.find(t), t) for t in tags if t in self.buf]
+            opens = self.think_open and self.mode == "content" and not self.said and not self.tool_text    # only as the very first thing the model says
+            tags = [TOOL_OPEN] + (self.closers if self.mode == "reasoning" else []) + ([THINK_OPEN, CHANNEL_OPEN] if opens else [])
+            hits = [(self.buf.find(t), t) for t in tags if t in self.buf and (t not in (THINK_OPEN, CHANNEL_OPEN) or not self.buf[:self.buf.find(t)].strip())]
             if hits:
                 pos, tag = min(hits)
                 self._emit(self.buf[:pos], out)
@@ -302,6 +306,9 @@ class Splitter:
                 if tag == TOOL_OPEN:
                     self.mode, self.tool_from = "tool", len(self.tool_text)
                     self.tool_text += TOOL_OPEN
+                elif tag in (THINK_OPEN, CHANNEL_OPEN):
+                    self.mode, self.lead, self.think_open = "reasoning", True, False
+                    self.closers = [CHANNEL_CLOSE if tag == CHANNEL_OPEN else THINK_CLOSE]
                 else:
                     self.mode, self.lead = "content", True
                 continue
@@ -340,8 +347,8 @@ def parse_tool_calls(tool_text: str, tools: list | None) -> list:
 
 
 class QwenParser:
-    def __init__(self, reasoning_first: bool, tools: list | None, parse_tools: bool = True):
-        self.sp, self.tools, self.parse_tools = Splitter(reasoning_first), tools, parse_tools
+    def __init__(self, reasoning_first: bool, tools: list | None, parse_tools: bool = True, think_open: bool = False):
+        self.sp, self.tools, self.parse_tools = Splitter(reasoning_first, think_open), tools, parse_tools
 
     def feed(self, text: str) -> list:
         return [(k, t) for k, t in self.sp.feed(text)]
@@ -351,6 +358,150 @@ class QwenParser:
         if self.parse_tools:
             ev += _complete_calls(0, parse_tool_calls(self.sp.tool_text, self.tools))
         return ev
+
+
+# Tool-call text of families with no row of their own: Mistral / Ministral "[TOOL_CALLS]name[ARGS]{json}" (or a JSON array), Llama 3.x "<|python_tag|>{json}" or a bare
+# JSON object, Gemma 4 "<|tool_call>call:name{key:<|"|>text<|"|>}<tool_call|>". The text is held back from the first marker on and read once at the end; text that is not a call of
+# one of the request's tools goes out as content, unchanged.
+_CALL_MARKERS = ("[TOOL_CALLS]", "<|python_tag|>", "<|tool_call>")
+
+
+def _json_calls(text: str, names: set) -> list:
+    """{"name"|"function": ..., "arguments"|"parameters": ...} objects (one, several separated by ';' or newlines, or a JSON array) -> [(name, args)]."""
+    dec, i, out = json.JSONDecoder(), 0, []
+    text = text.strip()
+    while i < len(text):
+        if text[i] in "; \n\t":
+            i += 1
+            continue
+        try:
+            obj, i = dec.raw_decode(text, i)
+        except json.JSONDecodeError:
+            return []
+        for o in obj if isinstance(obj, list) else [obj]:
+            if not isinstance(o, dict):
+                return []
+            fn = o.get("function")
+            name = o.get("name") or (fn if isinstance(fn, str) else (fn or {}).get("name") if isinstance(fn, dict) else None)
+            args = o.get("arguments", o.get("parameters", (fn or {}).get("arguments", {}) if isinstance(fn, dict) else {}))
+            if name not in names:
+                return []
+            out.append((name, args))
+    return out
+
+
+def _gemma_value(text: str):
+    """Gemma 4 call arguments `{k:<|"|>text<|"|>,n:3,flag:true,l:[1,2]}` -> python value (JSON once keys and strings are quoted)."""
+    strs: list = []
+
+    def keep(m):
+        strs.append(m.group(1))
+        return f"\x00{len(strs) - 1}\x00"
+    t = re.sub(r'<\|"\|>(.*?)<\|"\|>', keep, text, flags=re.S)
+    t = re.sub(r'([{,]\s*)([A-Za-z_][\w.-]*)\s*:', r'\1"\2":', t)
+    t = re.sub(r"\x00(\d+)\x00", lambda m: json.dumps(strs[int(m.group(1))], ensure_ascii=False), t)
+    return json.loads(t)
+
+
+def parse_format_calls(held: str, names: set) -> list:
+    """The held text (from the first marker or bare '{') to [(name, args)]; [] when it is not a call of one of the tools."""
+    calls: list = []
+    if held.startswith("[TOOL_CALLS]"):
+        for part in held.split("[TOOL_CALLS]")[1:]:
+            part = part.strip()
+            if "[ARGS]" in part:
+                name, _, a = part.partition("[ARGS]")
+                try:
+                    args = json.loads(a.strip())
+                except json.JSONDecodeError:
+                    return []
+                if name.strip() not in names:
+                    return []
+                calls.append((name.strip(), args))
+            else:
+                got = _json_calls(part, names)
+                if not got:
+                    return []
+                calls += got
+    elif held.startswith("<|tool_call>"):
+        for part in held.split("<|tool_call>")[1:]:
+            m = re.match(r"\s*call:([^\s{]+)\s*(\{.*\})\s*(?:<tool_call\|>)?\s*$", part, re.S)
+            if not m or m.group(1) not in names:
+                return []
+            try:
+                calls.append((m.group(1), _gemma_value(m.group(2))))
+            except (json.JSONDecodeError, ValueError):
+                return []
+    else:
+        body = held[len("<|python_tag|>"):] if held.startswith("<|python_tag|>") else held
+        calls = _json_calls(body, names)
+    return calls
+
+
+class FormatQwenParser(QwenParser):
+    """QwenParser plus the call formats above, for the fallback (no row) chat family."""
+
+    def __init__(self, reasoning_first: bool, tools: list | None, parse_tools: bool = True, think_open: bool = False):
+        super().__init__(reasoning_first, tools, parse_tools, think_open)
+        self.names = {t.get("function", t).get("name") for t in (tools or [])} if parse_tools else set()
+        self.buf, self.held, self.said = "", None, False
+
+    def _content(self, text: str, out: list) -> None:
+        if self.held is not None:
+            self.held += text
+            return
+        self.buf += text
+        hits = [(self.buf.find(m), m) for m in _CALL_MARKERS if m in self.buf]
+        if hits:
+            pos = min(hits)[0]
+            self._flush(self.buf[:pos], out)
+            self.held, self.buf = self.buf[pos:], ""
+        elif not self.said and self.buf.lstrip().startswith("{"):             # Llama 3.x answers a tool request with a bare JSON object
+            self.held, self.buf = self.buf, ""
+        else:
+            keep = _partial_tag(self.buf, list(_CALL_MARKERS))
+            self._flush(self.buf[:len(self.buf) - keep], out)
+            self.buf = self.buf[len(self.buf) - keep:]
+
+    def _flush(self, text: str, out: list) -> None:
+        if text:
+            out.append(("content", text))
+            self.said = self.said or bool(text.strip())
+
+    def feed(self, text: str) -> list:
+        ev = super().feed(text)
+        if not self.names:
+            return ev
+        out: list = []
+        for k, t in ev:
+            if k == "content":
+                self._content(t, out)
+            else:
+                out.append((k, t))
+        return out
+
+    def finish(self) -> list:
+        ev = super().finish()
+        if not self.names:
+            return ev
+        out: list = []
+        for e in ev:
+            if e[0] == "content":
+                self._content(e[1], out)
+            else:
+                out.append(e)
+        held, tail = self.held, self.buf
+        self.held, self.buf = None, ""
+        if held is not None:
+            calls = parse_format_calls(held.strip(), self.names)
+            if calls:
+                n0 = sum(1 for e in out if e[0] == "tool_start")
+                out += _complete_calls(n0, [{"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
+                                              "function": {"name": n, "arguments": a if isinstance(a, str) else json.dumps(a, ensure_ascii=False)}} for n, a in calls])
+            else:
+                self._flush(held, out)
+        self._flush(tail, out)
+        return out
 
 
 class QwenFamily:
@@ -621,6 +772,25 @@ class Ds41Family:
         return ds41_parse.StreamParser(r.thinking_first, r.parse_tools, r.tools)
 
 
+class JinjaFamily(QwenFamily):
+    """KYOJIN_CHAT_FALLBACK: a model_type with no modeldesc row. The pack's own chat template with the tokenizer's special tokens (bos_token, eos_token ...) as template
+    variables, the way transformers' apply_chat_template passes them: the server encodes a rendered prompt without special tokens, so a template that prints
+    {{ bos_token }} (Gemma, Llama, Mistral) must see it or the model never reads a BOS. Tool calls and <think> are parsed as the Qwen family does."""
+    name = "jinja"
+
+    def __init__(self, tokenizer, model_dir: str, template: str | None = None, defaults: dict | None = None):
+        super().__init__(tokenizer, model_dir, template, defaults)
+        self.tokens = {k: v for k, v in (getattr(tokenizer, "special_tokens_map", None) or {}).items() if isinstance(v, str)}
+
+    def template_kwargs(self, body: dict) -> dict:
+        # none_tools: a request without tools renders `tools=None`, as transformers' apply_chat_template does (Llama 3.x tests `tools is not none` and would
+        # otherwise put its tool-calling system prompt into every plain chat: the model then answers with a <|python_tag|>{"name": ...} call)
+        return {**self.tokens, **super().template_kwargs(body), "none_tools": True}
+
+    def parser(self, r: Rendered):
+        return FormatQwenParser(r.thinking_first, r.tools, r.parse_tools, think_open=True)
+
+
 class GenericFamily(QwenFamily):
     """A bare GGUF of an architecture with no family of its own (llama, mistral3, gemma, glm4, glm4_moe, deepseek_v3 ...): the prompt is the file's own
     tokenizer.chat_template (tokenizer_config.json written from the metadata), stop ids come from the file (generation_config.json), nothing is assumed about the
@@ -648,7 +818,7 @@ class GenericFamily(QwenFamily):
         return Rendered(prompt, False, False, tools, cut_texts=cuts)
 
 
-FAMILIES = {"qwen": QwenFamily, "glm": GlmFamily, "ds41": Ds41Family, "generic": GenericFamily, "harmony": HarmonyFamily}
+FAMILIES = {"qwen": QwenFamily, "glm": GlmFamily, "ds41": Ds41Family, "generic": GenericFamily, "jinja": JinjaFamily, "harmony": HarmonyFamily}
 
 
 def family_of_gguf(model_type: str) -> str:
@@ -664,6 +834,6 @@ def family_of(model_type: str) -> str:
     row = modeldesc.chat_desc(model_type)
     if row is not None:
         return row.server
-    if os.environ.get("KYOJIN_CHAT_FALLBACK", "0") != "0":              # no row: the pack's own template + the <tool_call> parser (QwenFamily)
-        return "qwen"
+    if os.environ.get("KYOJIN_CHAT_FALLBACK", "1") != "0":              # no row: the pack's own template (with the tokenizer's special tokens) + the <tool_call> parser
+        return "jinja"
     raise ValueError(f"no chat family for model_type {model_type!r}")

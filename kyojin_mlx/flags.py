@@ -562,16 +562,16 @@ FLAGS: dict[str, Flag] = {
                             "evals instead of 3); 0 = keep KYOJIN_BOUND_EVERY", kind="int", attrs=(("bound_layers", "TTFT_BOUND_EVERY", int),)),
     "kv_disk_off": Flag("KYOJIN_KV_DISK_OFF", "0", "bench: the disk KV tier neither answers nor writes, the same as --no-kv-disk without a model reload (tools/mu2_ab.py, tools/kvmem_ab.py)", kind="bool"),
     "kv_disk_ro": Flag("KYOJIN_KV_DISK_RO", "0", "bench: the disk KV tier answers lookups and writes nothing, so the same prompt can prefill its tail once per arm from one checkpoint (tools/depth_ab.py). Read per save"),
-    "generic_cache": Flag("KYOJIN_GENERIC_CACHE", "0", "cache classes the code does not list (a model's own RotatingKVCache / CacheList / KVCache subclass / pure state cache): multiuser.fork_cache copies "
+    "generic_cache": Flag("KYOJIN_GENERIC_CACHE", "1", "cache classes the code does not list (a model's own RotatingKVCache / CacheList / KVCache subclass / pure state cache): multiuser.fork_cache copies "
                           "them through their own state / meta_state / from_state instead of raising TypeError, and kvdisk.GenericAdapter reads the token count of a CacheList from its members and "
                           "takes the caller's b for a model whose caches carry no offset at all (a pure SSM) instead of raising 'cache holds 0 tokens'. The listed classes take the same branches "
-                          "as before: output bit-identical. 0 = the errors. Read per call (tools/dayone)"),
-    "backend_fallback": Flag("KYOJIN_BACKEND_FALLBACK", "0", "serve.backends.load_backend: a model_type with no modeldesc row is served by GenericBackend (the Q35Backend per-user cache / multiuser plumbing "
+                          "as before (mlx-lm KVCache, RotatingKVCache, ArraysCache, WinKVCache): output bit-identical. On by default; 0 = the errors. Read per call (tools/dayone)"),
+    "backend_fallback": Flag("KYOJIN_BACKEND_FALLBACK", "1", "serve.backends.load_backend: a model_type with no modeldesc row is served by GenericBackend (the Q35Backend per-user cache / multiuser plumbing "
                              "on the stock mlx-lm / mlx-vlm class, no Qwen step regions, no draft head, no kvwin) instead of ValueError. Described models keep their backend: output "
-                             "bit-identical. 0 = ValueError. Read per call (tools/dayone)"),
-    "chat_fallback": Flag("KYOJIN_CHAT_FALLBACK", "0", "serve.chat.family_of: a model_type with no modeldesc row gets the Jinja family (the pack's own chat template + the XML / JSON "
+                             "bit-identical. On by default; 0 = ValueError (opt-out). Read per call (tools/dayone)"),
+    "chat_fallback": Flag("KYOJIN_CHAT_FALLBACK", "1", "serve.chat.family_of: a model_type with no modeldesc row gets the Jinja family (the pack's own chat template + the XML / JSON "
                           "<tool_call> parser, the \"qwen\" family) instead of ValueError, so a new family can render a prompt and parse a tool call before it has a row. Rows keep their "
-                          "family: output bit-identical for every described model. 0 = ValueError. Read per call (tools/dayone)"),
+                          "family: output bit-identical for every described model. On by default; 0 = ValueError (opt-out). Read per call (tools/dayone)"),
     "mtpgen": Flag("KYOJIN_MTPGEN", "0", "serve.backends.load_backend (generic fallback path): a pack whose config declares a draft head (num_nextn_predict_layers / mtp_num_hidden_layers / num_mtp_layers) gets "
                    "kyojin_mlx.mtpgen: the head is read from model_mtp.safetensors or the shards, built from the trunk's own layer class, and driven through the Backend verify / commit contract "
                    "(KV trim, or fork + rerun of the kept rows for GDN / SSM state). Refused with a logged reason when the layout is unknown or the trunk fails the verify-4 contract. "
