@@ -502,3 +502,11 @@ def test_gguf_serve_dir_follows_the_files_it_copies(tmp_path):
     d2 = gguf_serve_dir(str(m / "x.gguf"), cache)
     assert d2 != d1 and '"a":22' in open(os.path.join(d2, "config.json")).read()
     assert gguf_serve_dir(str(m / "x.gguf"), cache) == d2
+
+
+def test_gguf_arch_model_types_exist_in_mlx_lm():
+    """Every mapped GGUF architecture names an mlx-lm model module (qwen3moe once mapped to 'qwen3moe', which mlx-lm calls 'qwen3_moe')."""
+    import importlib.util
+    from kyojin_mlx import foreign_names as N
+    missing = [f"{a}: {A.model_type}" for a, A in N.ARCHS.items() if importlib.util.find_spec(f"mlx_lm.models.{A.model_type}") is None]
+    assert not missing, missing

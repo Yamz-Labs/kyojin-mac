@@ -92,7 +92,7 @@ ARCHS: dict[str, Arch] = {
     "qwen2moe": Arch("qwen2_moe", ("Qwen2MoeForCausalLM",), blk={**_BLK0, **_MOE, **_SHEXP}, xform="qwen2moe", config="qwen2moe"),
     "glm4": Arch("glm4", ("Glm4ForCausalLM",), blk=dict(_GLM4), skip_nextn=True, config="glm4"),
     "gemma3": Arch("gemma3_text", ("Gemma3ForCausalLM",), blk=dict(_GEMMA3), xform="gemma3", config="gemma3"),
-    "qwen3moe": Arch("qwen3moe", ("Qwen3MoeForCausalLM",), blk={**_BLK, **_MOE}, config="qwen3moe"),
+    "qwen3moe": Arch("qwen3_moe", ("Qwen3MoeForCausalLM",), blk={**_BLK, **_MOE}, config="qwen3moe"),
     "qwen35": Arch("qwen3_5", ("Qwen3_5ForConditionalGeneration",), blk=dict(_BLK35), exact=dict(_EXACT35), mtp=dict(_MTP35),
                    dense=("conv1d.weight",), xform="qwen35", config="qwen35"),
     "qwen35moe": Arch("qwen3_5_moe", ("Qwen3_5MoeForConditionalGeneration",), blk=dict(_BLK35MOE), exact=dict(_EXACT35), dense=("conv1d.weight",), skip_nextn=True,
@@ -561,7 +561,7 @@ def gguf_serve_dir(path: str, cache: str | None = None) -> str:
     st = os.stat(src)
     side = "".join(f"|{f}:{os.stat(os.path.join(d, f)).st_size}:{os.stat(os.path.join(d, f)).st_mtime_ns}"          # the cached directory copies these: an edited one must not hit a stale build
                     for f in _SERVE_FILES + ("generation_config.json",) if os.path.isfile(os.path.join(d, f)))
-    key = hashlib.sha1(f"v5|{src}|{st.st_size}|{st.st_mtime_ns}{side}".encode()).hexdigest()[:16]
+    key = hashlib.sha1(f"v6|{src}|{st.st_size}|{st.st_mtime_ns}{side}".encode()).hexdigest()[:16]
     root = cache or os.environ.get("KYOJIN_GGUF_CACHE") or os.path.expanduser("~/.cache/kyojin_mlx/gguf")
     out = os.path.join(root, f"{os.path.basename(src)[:-5]}-{key}")
     if os.path.isdir(out):
