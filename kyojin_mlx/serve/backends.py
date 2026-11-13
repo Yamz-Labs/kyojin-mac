@@ -258,14 +258,18 @@ class Q35Backend(Backend):
             ns["tq"] = tq.config()                                                                   # (absent when off: the namespace of existing checkpoints is unchanged)
         return ns
 
+    def _cache_model(self):
+        """The module whose `make_cache` (or layer list) defines the caches. The model itself."""
+        return self.model
+
     def make_cache(self):
         from .. import kvwin
-        return kvwin.make_prompt_cache(self.model)  # KYOJIN_KVWIN unset = mlx-lm make_prompt_cache, unchanged
+        return kvwin.make_prompt_cache(self._cache_model())  # KYOJIN_KVWIN unset = mlx-lm make_prompt_cache, unchanged
 
     def make_cache_for(self, need):
         from .. import kvwin, tq
         if tq.FROM > 0 and need <= tq.FROM and tq.config() is not None:
-            return kvwin.make_prompt_cache(self.model, plain=True)     # KYOJIN_TQ_FROM: short session, plain fp16 KV (TurboQuant pays off from ~FROM tokens on)
+            return kvwin.make_prompt_cache(self._cache_model(), plain=True)     # KYOJIN_TQ_FROM: short session, plain fp16 KV (TurboQuant pays off from ~FROM tokens on)
         return self.make_cache()
 
     def adapt_cache(self, cache, need):
@@ -1102,13 +1106,14 @@ class GenericBackend(Q35Backend):
     kind = "generic"
     vision = None                                   # flag visiongen: the model's GenVision (visiongen.py), set by load_generic
 
-    def make_cache(self):
-        """A vlm wrapper without make_cache (mlx-vlm qwen4_exp: the language model has it): the language model's own caches, so its linear-attention layers get
-        their state cache (mlx-lm's default would hand them plain KVCaches). Models with their own make_cache, or none anywhere: the Q35Backend line, unchanged."""
+    def _cache_model(self):
+        """A vlm wrapper without make_cache (mlx-vlm qwen4_exp: the language model has it): the language model defines the caches, so its linear-attention
+        layers get their state cache (mlx-lm's default would hand them plain KVCaches), in make_cache and in the short-session plain path alike. Models with
+        their own make_cache, or none anywhere: the Q35Backend line, unchanged."""
         lm = self.model.language_model if "language_model" in self.model else None
         if not hasattr(self.model, "make_cache") and lm is not None and hasattr(lm, "make_cache"):
-            return lm.make_cache()
-        return super().make_cache()
+            return lm
+        return self.model
 
     def _embed_kw(self):
         import inspect

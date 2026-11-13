@@ -27,7 +27,9 @@ SYNTH = {
 HF = {"ministral3": "optimum-intel-internal-testing/tiny-random-ministral3",
       "gemma4": "optimum-intel-internal-testing/tiny-random-gemma4",
       "gemma4_unified": "optimum-intel-internal-testing/tiny-random-gemma4-unified-it",
-      "olmo3": "trl-internal-testing/tiny-Olmo3ForCausalLM"}
+      "olmo3": "trl-internal-testing/tiny-Olmo3ForCausalLM",
+      "qwen4_exp": "tiny-random/qwen3.8-flash-next",                  # mlx-vlm >= 0.7.x only: GDN + QSA caches from the language model
+      "lfm3": "tiny-random/lfm3"}                                      # mlx-vlm >= 0.7.12 only; attention takes position_ids as a 4th positional argument
 
 
 @pytest.fixture(autouse=True)
@@ -142,6 +144,11 @@ def hf_pack():
 @pytest.mark.parametrize("name", sorted(HF))
 def test_public_tiny_random_packs(name, hf_pack):
     """ministral3 (llama.py attention under a mistral3 wrapper), gemma4 (KV-sharing layers, rotating windows), gemma4_unified (remap), olmo3."""
+    if name in ("qwen4_exp", "lfm3"):
+        mlx_vlm = pytest.importorskip("mlx_vlm")
+        import importlib.util
+        if importlib.util.find_spec(f"mlx_vlm.models.{name}") is None:
+            pytest.skip(f"mlx-vlm {getattr(mlx_vlm, '__version__', '?')} has no {name} class")
     be = _two_row_step(hf_pack(name))
     assert type(be).__name__ == "GenericBackend"
 
@@ -249,3 +256,19 @@ def test_fallback_parser_splits_the_gemma4_thought_channel():
     assert ("".join(e[1] for e in ev if e[0] == "reasoning"), [e[3] for e in ev if e[0] == "tool_start"]) == ("Plan it.", ["get_weather"])
     ev = _run(CH.FormatQwenParser(False, None, True, think_open=True), ["<|channel>thought\n<channel|>Hi."])      # thinking off: empty block, then the answer
     assert [e for e in ev if e[0] == "content"] == [("content", "Hi.")]
+
+
+def test_tq_step_wrapper_passes_extra_positional_arguments_to_the_original():
+    """The patched attention __call__ keeps its original when the caller passes a 4th positional argument (mlx-vlm lfm3: position_ids); the original used to be a
+    default argument and was overwritten by it (TypeError: 'NoneType' object is not callable at the first token)."""
+    from kyojin_mlx import tq_step
+
+    class Attn:
+        def __call__(self, x, mask=None, cache=None, position_ids=None):
+            return ("orig", position_ids)
+
+    wrapped = tq_step._wrap_call(Attn.__call__)
+    x = mx.zeros((1, 1, 4))
+    assert wrapped(Attn(), x, None, None, 7) == ("orig", 7)
+    assert wrapped(Attn(), x, None, None) == ("orig", None)
+    assert wrapped(Attn(), x, None, None, position_ids=3) == ("orig", 3)
