@@ -279,23 +279,27 @@ def install(model) -> int:
         cls = type(m)
         if cls in _patched or not all(hasattr(m, a) for a in _REQ) or None in _heads(m):
             continue
-        orig = cls.__call__
-
-        def call(self, x, mask=None, cache=None, _orig=orig, **kw):
-            if cache is not None and x.shape[1] == 1 and not kw:
-                cs = cache.caches if hasattr(cache, "caches") else [cache]                  # RowsKV: one private cache per user (row b of the batch)
-                if len(cs) == x.shape[0] and all(type(c) is TQ.TQKVCache for c in cs):
-                    qp, kp = self.q_proj(x), self.k_proj(x)                                  # lazy: unused when the stock chain runs below
-                    Hq, Hk = _heads(self)
-                    D = kp.shape[-1] // Hk
-                    gated = qp.shape[-1] == 2 * Hq * D
-                    if qp.shape[-1] in (Hq * D, 2 * Hq * D) and all(ok(c, self, qp[b:b + 1], gated) for b, c in enumerate(cs)):    # gated q (Qwen3.5 / 3.6) or plain q (Qwen3)
-                        vp = self.v_proj(x)
-                        outs = [step(c, self, qp[b:b + 1], kp[b:b + 1], vp[b:b + 1], self.scale, gated=gated) for b, c in enumerate(cs)]
-                        return self.o_proj(outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=0))
-            return _orig(self, x, mask, cache, **kw)
-
-        cls.__call__ = call
+        cls.__call__ = _wrap_call(cls.__call__)
         _patched.add(cls)
         n += 1
     return n
+
+
+def _wrap_call(orig):
+    """The patched __call__ of one attention class. `orig` is closed over, not a default argument: an attention that takes a 4th positional argument (mlx-vlm
+    lfm3 passes position_ids) would otherwise overwrite it."""
+    def call(self, x, mask=None, cache=None, *args, **kw):
+        if cache is not None and x.shape[1] == 1 and not kw and not args:
+            cs = cache.caches if hasattr(cache, "caches") else [cache]                  # RowsKV: one private cache per user (row b of the batch)
+            if len(cs) == x.shape[0] and all(type(c) is TQ.TQKVCache for c in cs):
+                qp, kp = self.q_proj(x), self.k_proj(x)                                  # lazy: unused when the stock chain runs below
+                Hq, Hk = _heads(self)
+                D = kp.shape[-1] // Hk
+                gated = qp.shape[-1] == 2 * Hq * D
+                if qp.shape[-1] in (Hq * D, 2 * Hq * D) and all(ok(c, self, qp[b:b + 1], gated) for b, c in enumerate(cs)):    # gated q (Qwen3.5 / 3.6) or plain q (Qwen3)
+                    vp = self.v_proj(x)
+                    outs = [step(c, self, qp[b:b + 1], kp[b:b + 1], vp[b:b + 1], self.scale, gated=gated) for b, c in enumerate(cs)]
+                    return self.o_proj(outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=0))
+        return orig(self, x, mask, cache, *args, **kw)
+
+    return call

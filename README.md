@@ -60,6 +60,21 @@ One warm-up discarded, then one measured run.
 Memory: one resident copy of the weights. The 35B GGUF is a 20.8 GiB file and uses 21.6-22.0 GB in MLX.
 DeepSeek V4.1 uses 176-178 GB at 8K context and 187 GB at 983K.
 
+## New in 1.9.5
+
+mlx-vlm 0.7.12 architectures. Measured on a Mac Studio.
+
+Built on mlx-vlm 0.7.12 (was 0.7.10; mlx-lm 0.32.2 unchanged).
+
+| change | effect | off |
+|---|---|---|
+| the generic backend takes the per-user caches from the language model on every path (a vision wrapper without its own cache factory included) | Qwen 4 experimental (`qwen4_exp`) decodes instead of failing on the first step (checked on a tiny random pack; no full pack fits the disk yet); its draft head is not used (speculative depth 0) | - |
+| the TurboQuant attention wrapper forwards extra positional arguments | LFM3 serves: LFM3-1.7B 4-bit coherent, tool call parsed, 1 user 168.6 tok/s, 4 users 507 tok/s | - |
+| the tokenizer loads with `trust_remote_code=False` | a pack with custom tokenizer code no longer waits for a yes/no answer on the terminal | - |
+
+- Release gate against fleet-1.9.4 (3 passes, real server, temperature 0, md5 per prompt): Qwen 35B-A3B UD-Q4_K_XL GGUF and Qwen 27B NVFP4 same
+  outputs and same speed; DeepSeek V4.1 Flash same outputs at 131K and 983K context; Qwen3.5-2B 4-bit and gpt-oss-20b same outputs.
+
 ## New in 1.9.4
 
 Any architecture, served by default. Measured on a Mac Studio.

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kyojin-mlx"
-version = "1.9.4"
+version = "1.9.5"
 description = "Kyojin for Apple Silicon: MLX and Metal kernels, OpenAI-compatible server for GGUF, EXL3 and MLX models"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,7 +12,7 @@ license = { text = "Apache-2.0" }
 dependencies = [
   "mlx>=0.32.4",
   "mlx-lm>=0.32.2",
-  "mlx-vlm==0.7.10",
+  "mlx-vlm==0.7.12",
   "numpy",
   "jinja2",
   "safetensors",

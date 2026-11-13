@@ -758,7 +758,7 @@ def build_app(args, log=print):
         log(f"kvwin: quantized KV pool + fp16 overlay {kvwin.config()} (KYOJIN_KVWIN, opt-in)")
     tdir = Path(args.tokenizer or args.model)
     if (tdir / "tokenizer_config.json").is_file():
-        tok = AutoTokenizer.from_pretrained(str(tdir))
+        tok = AutoTokenizer.from_pretrained(str(tdir), trust_remote_code=False)     # a pack with an auto_map (lfm3) made transformers ask "run the custom code? [y/N]" on stdin; the pack's code is never run
     else:                                                          # a bare tokenizer.json (DS4.1 reference dir)
         from transformers import PreTrainedTokenizerFast
         tok = PreTrainedTokenizerFast(tokenizer_file=str(tdir / "tokenizer.json"))
