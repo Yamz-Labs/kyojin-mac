@@ -10,6 +10,12 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 from kyojin_mlx import multiuser as MU                                   # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _pool_allowed(monkeypatch):
+    """install() of a sink / KV-sharing model in an earlier test (test_generic_arch) leaves the module-wide _NO_POOL set."""
+    monkeypatch.setattr(MU, "_NO_POOL", False)
+
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="needs Metal")
 
 
@@ -99,7 +105,8 @@ def test_batch_caches_pools_forked_prefix():
     solo = [MU.fork_cache(f) for f in users]
     bc = MU.batch_caches([MU.fork_cache(f) for f in users])
     assert isinstance(bc[0], MA.PoolKV) and bc[0].P == 300
-    assert isinstance(MU.batch_caches([MU.fork_cache(f) for f in users], prefix_len=0)[0], MU.RowsKV)
+    z = MU.batch_caches([MU.fork_cache(f) for f in users], prefix_len=0)[0]       # no shared prefix asked: pooled tails (POOL_ZERO) or per-user
+    assert (isinstance(z, MA.PoolKV) and z.P == 0) if MU.POOL_ZERO else isinstance(z, MU.RowsKV)
     nk = mx.random.normal((3, 4, 1, 64)).astype(mx.float16)
     bc[0].update_and_fetch(nk, nk)
     back = MU.unbatch_caches(bc, 3)
@@ -113,7 +120,8 @@ def test_batch_caches_pools_forked_prefix():
 
 
 def test_short_shared_prefix_stays_rows():
-    """Users that share only a short prefix (the chat template, ~20 tokens) keep private caches: a PoolKV below POOL_MIN costs more than it saves."""
+    """Users that share only a short prefix (the chat template, ~20 tokens) do not get a shared-prefix PoolKV (below POOL_MIN it costs more than it
+    saves): with POOL_ZERO their whole caches are pooled tails (P = 0, one attention launch for all users), without it each keeps a private cache."""
     from mlx_lm.models.cache import KVCache
     from kyojin_mlx import sdpa_dec as SD
     if not SD.nax_ok():
@@ -128,7 +136,9 @@ def test_short_shared_prefix_stays_rows():
         f[0].update_and_fetch(t, t)
         users.append(f)
     assert MU.POOL_MIN > 20
-    assert isinstance(MU.batch_caches([MU.fork_cache(f) for f in users])[0], MU.RowsKV)
+    from kyojin_mlx import mu_attn as MA
+    c = MU.batch_caches([MU.fork_cache(f) for f in users])[0]
+    assert (isinstance(c, MA.PoolKV) and c.P == 0) if MU.POOL_ZERO else isinstance(c, MU.RowsKV)
 
 
 Q35 = os.environ.get("KYOJIN_Q35")

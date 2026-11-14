@@ -296,14 +296,24 @@ def _tq_unsupported_layers(model, n: int, kbits: int, vbits: int) -> set:
     layers = getattr(getattr(inner, "model", inner), "layers", None)
     if layers is None or len(layers) < n:
         return set()
+    # attention modules without a head_dim attribute (glm4_moe, phimoe): the model-wide value from the args (head_dim, else hidden / heads)
+    args = getattr(model, "args", None) or getattr(inner, "args", None)
+    targs = getattr(args, "text_config", None) or args
+    get = (lambda k: targs.get(k)) if isinstance(targs, dict) else (lambda k: getattr(targs, k, None))
+    dflt = get("head_dim")
+    if not isinstance(dflt, int) and isinstance(get("hidden_size"), int) and isinstance(get("num_attention_heads"), int) and get("num_attention_heads"):
+        dflt = get("hidden_size") // get("num_attention_heads")
     out = set()
     for i in range(n):
+        d = None
         for name in ("self_attn", "attn", "attention"):
-            d = getattr(getattr(layers[i], name, None), "head_dim", None)
-            if isinstance(d, int):
-                if not (tq.supported(d, kbits) and tq.supported(d, vbits)):
-                    out.add(i)
+            m = getattr(layers[i], name, None)
+            if m is not None:
+                d = getattr(m, "head_dim", None)
+                d = d if isinstance(d, int) else dflt
                 break
+        if isinstance(d, int) and not (tq.supported(d, kbits) and tq.supported(d, vbits)):
+            out.add(i)
     return out
 
 

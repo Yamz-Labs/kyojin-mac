@@ -60,6 +60,19 @@ One warm-up discarded, then one measured run.
 Memory: one resident copy of the weights. The 35B GGUF is a 20.8 GiB file and uses 21.6-22.0 GB in MLX.
 DeepSeek V4.1 uses 176-178 GB at 8K context and 187 GB at 983K.
 
+## New in 1.9.8
+
+Faster decode for several users on dense models; FP8 packs with any block size load. Measured on a Mac Studio.
+
+| change | effect | off |
+|---|---|---|
+| users without a shared prefix decode their attention in one pooled kernel instead of one kernel per user | 8 users on Qwen3-8B UD-IQ3_XXS GGUF: N8 646-649 -> 701-704 tok/s (+8 %), N8 with 8 different prompts 522-524 -> 548-551 (+5 %) | `KYOJIN_MU_POOL_ZERO=0` |
+| FP8 packs dequantize with their own `weight_block_size` (mlx-lm assumed 128); the model class keeps its own `sanitize` after the load | FP8 DeepSeek-V3 packs with another block size load and serve | - |
+
+- Same session as llama.cpp Metal (`-np 8`) on the 8B: N8 701-704 vs 677-703 tok/s.
+- Release gate against 1.9.7 (4 passes on the 8B, 2 on the 35B, swapped order, real server, temperature 0, md5 per prompt): same outputs on
+  Qwen3-8B UD-IQ3_XXS GGUF and Qwen 35B-A3B UD-Q4_K_XL GGUF; 1-user speed and prefill 8K unchanged; the 35B (MoE) multi-user cells unchanged.
+
 ## New in 1.9.7
 
 Qwen3 MoE GGUF files load. Measured on a Mac Studio.
