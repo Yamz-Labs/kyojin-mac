@@ -779,8 +779,16 @@ class JinjaFamily(QwenFamily):
     name = "jinja"
 
     def __init__(self, tokenizer, model_dir: str, template: str | None = None, defaults: dict | None = None):
-        super().__init__(tokenizer, model_dir, template, defaults)
+        try:
+            super().__init__(tokenizer, model_dir, template, defaults)
+        except ChatError as e:                       # a base pack without a chat template still serves raw completions; chat requests get the error
+            self.template, self.defaults, self.vision, self.no_template = None, defaults or {}, None, str(e)
         self.tokens = {k: v for k, v in (getattr(tokenizer, "special_tokens_map", None) or {}).items() if isinstance(v, str)}
+
+    def render(self, body: dict) -> Rendered:
+        if self.template is None:
+            raise ChatError(f"{self.no_template}: /v1/chat/completions needs one, /v1/completions works")
+        return super().render(body)
 
     def template_kwargs(self, body: dict) -> dict:
         # none_tools: a request without tools renders `tools=None`, as transformers' apply_chat_template does (Llama 3.x tests `tools is not none` and would

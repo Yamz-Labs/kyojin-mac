@@ -188,6 +188,7 @@ def fold_sdpa(q, k, v, scale):
     return o[:, :, :G * T].reshape(B, Hq, T, D)
 
 
+POOL_ZERO = os.environ.get("KYOJIN_MU_POOL_ZERO", "1") == "1"   # users without a shared prefix (real chats): PoolKV with P = 0 (one attention launch for all users) instead of one RowsKV attention per user; 0 = off
 POOL_MIN = int(os.environ.get("KYOJIN_MU_POOL_MIN", "256"))   # shortest shared prefix worth a PoolKV: below it the tail copies + prefix check cost more
                                                                 # than reading the prefix once saves (8 users sharing only the ~20-token chat template: N8 -7..-26 %)
 _NO_POOL = False          # set by install() for models whose attention has learned sinks (gpt-oss): the pooled kernel has no sink term, RowsKV does
@@ -389,6 +390,8 @@ def batch_caches(users: list[list], prefix_len: int | None = None) -> list:
             out.append(type(col[0]).merge(col))                       # KYOJIN_GENERIC_CACHE: the cache's own merge (mlx-vlm ArraysCache, CacheList, rotating)
         elif P >= max(POOL_MIN, 1) and not _NO_POOL and MA.supported(col, P) and _same_prefix(col, P):
             out.append(MA.PoolKV(col, P))
+        elif POOL_ZERO and len(col) > 1 and not _NO_POOL and MA.supported(col, 0):
+            out.append(MA.PoolKV(col, 0))                             # no shared prefix: still one attention launch for all users (tails pooled)
         else:
             out.append(RowsKV(col))
     return out

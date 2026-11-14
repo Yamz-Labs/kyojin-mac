@@ -1147,10 +1147,40 @@ def _mlx_lm_classes(cfg: dict):
     """The mlx-lm model / args classes of a config, resolved the way mlx_lm.load does (remap table, architecture remap). ModuleNotFoundError when mlx-lm has
     no class for it, so load_generic falls to the mlx-vlm loader."""
     from mlx_lm import utils
+    from .. import mlxpack
+    mlxpack.remap_text_types()
     try:
         return utils._get_classes(cfg)
     except ValueError as e:
         raise ModuleNotFoundError(str(e)) from e
+
+
+def _fp8_block_sanitize(cls, cfg: dict):
+    """FP8 packs whose quantization_config.weight_block_size is not [128, 128] (mlx-lm's deepseek_v3 / glm_moe_dsa sanitize dequantize with a
+    hard-coded 128 block): the class's sanitize first gets the weight_scale_inv pairs dequantized with the pack's own block, then runs as is.
+    Returns the original sanitize (to restore) or None when the pack needs nothing."""
+    qc = cfg.get("quantization_config") or {}
+    bs = qc.get("weight_block_size")
+    if qc.get("quant_method") != "fp8" or not bs or list(bs) == [128, 128]:
+        return None
+    import mlx.core as mx
+    bm, bn = int(bs[0]), int(bs[1])
+
+    def deq(w, s):
+        w = mx.from_fp8(w, dtype=mx.bfloat16)
+        m, n = w.shape
+        pm, pn = (-m) % bm, (-n) % bn
+        w = mx.pad(w, ((0, pm), (0, pn))).reshape((m + pm) // bm, bm, (n + pn) // bn, bn)
+        return (w * s[:, None, :, None]).reshape(m + pm, n + pn)[:m, :n].astype(mx.bfloat16)
+
+    orig = getattr(cls, "sanitize", None)
+
+    def sanitize(self, weights):
+        done = {k[:-len("_scale_inv")]: deq(weights[k[:-len("_scale_inv")]], v) for k, v in weights.items() if k.endswith("weight_scale_inv")}
+        weights = {k: done.get(k, v) for k, v in weights.items() if not k.endswith("weight_scale_inv")}
+        return orig(self, weights) if orig is not None else weights
+    cls.sanitize = sanitize
+    return orig if orig is not None else False
 
 
 def load_generic(path: str, log=print) -> GenericBackend:
@@ -1170,7 +1200,8 @@ def load_generic(path: str, log=print) -> GenericBackend:
             if want_vision:
                 raise ModuleNotFoundError("visiongen: mlx-vlm class")
             from mlx_lm.utils import load_model
-            _mlx_lm_classes(cfg)                                              # mlx-lm's own resolution (MODEL_REMAPPING: mistral -> llama, minimax_m2 -> minimax, gemma4_unified -> gemma4, falcon_mamba -> mamba ...)
+            mcls = _mlx_lm_classes(cfg)[0]                                   # mlx-lm's own resolution (MODEL_REMAPPING: mistral -> llama, minimax_m2 -> minimax, gemma4_unified -> gemma4, falcon_mamba -> mamba ...)
+            prev = _fp8_block_sanitize(mcls, cfg)
             try:
                 model, _ = load_model(Path(tpath), strict=True)
             except ValueError as e:                                           # the mlx-lm class and the pack disagree on the parameters (config keys the class defaults differently): the mlx-vlm class of the type gets its turn
@@ -1180,6 +1211,11 @@ def load_generic(path: str, log=print) -> GenericBackend:
                 except Exception:
                     raise e from None
                 log(f"[kyojin] mlx-lm class refused the pack ({str(e).splitlines()[0][:80]}); serving the mlx-vlm class")
+            finally:
+                if prev is False:
+                    del mcls.sanitize
+                elif prev is not None:
+                    mcls.sanitize = prev
         except ModuleNotFoundError:
             from mlx_vlm.utils import load_model as load_vlm_model
             model = load_vlm_model(Path(tpath), lazy=False)
