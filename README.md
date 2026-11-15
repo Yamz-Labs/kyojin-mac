@@ -38,7 +38,7 @@ To add a model see `docs/ADD_A_MODEL.md` and `docs/NEW_MODEL.md`. To convert to 
 
 ## Speed
 
-Kyojin 1.8.9 on a Mac Studio M3 Ultra, 256 GB. Served through the real server, real text, tokens per second.
+Kyojin 1.8.9 on a Mac Studio M5 Ultra, 256 GB. Served through the real server, real text, tokens per second.
 One warm-up discarded, then one measured run.
 
 | Model and cell | tok/s |
