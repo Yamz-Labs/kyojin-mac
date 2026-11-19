@@ -10,7 +10,7 @@ Per point L (prompt length in tokens, calibrated on the server's own prompt_toke
   * decode: for L <= --plain-max one more request with the filler only and --decode-tokens generated tokens (ignore_eos when the server accepts it): decode tok/s at depth L.
     Above --plain-max the decode figure is taken from the passkey requests (their 32 tokens) to keep the 1M points affordable.
 Timings come from the response `timings` (llama.cpp keys: prompt_per_second, predicted_per_second); when absent the client wall time is used and flagged."""
-import argparse, json, os, sys, time, urllib.request, urllib.error, random, zlib
+import argparse, hashlib, json, os, statistics, sys, time, urllib.request, urllib.error, random, zlib
 
 NEEDLE = "The pass key is {key}. Remember it. {key} is the pass key."
 QUESTION = "\n\nWhat is the pass key mentioned in the text above? Answer with the number only."
@@ -128,20 +128,29 @@ def main():
     p.add_argument("--plain-max", type=int, default=131072); p.add_argument("--extra-json", default=""); p.add_argument("--timeout", type=int, default=7200)
     p.add_argument("--pk-tokens", type=int, default=256, help="max_tokens of the passkey request (the model may think first)"); p.add_argument("--warm", type=int, default=0, help="throwaway decode requests (other filler) before each measured one: first-seen chunk shapes compile on the server")
     p.add_argument("--pf-rep", type=int, default=0, help="repeat the decode point's prompt N times (8 tokens) and report that prefill as the warm figure (prefill_cold_tok_s keeps the first)")
+    p.add_argument("--reps", type=int, default=1, help="decode requests per point (each on its own text offset; the first one is the same text as with --reps 1): the point reports the median decode and prefill speed, the single requests stay in decode_reps")
     p.add_argument("--seed", type=int, default=7); p.add_argument("--ctx", type=int, default=0, help="server context: prompts are capped at ctx - (max_tokens + 512)")
     a = p.parse_args()
     os.makedirs(a.out, exist_ok=True)
     corpus = filler_text(a.filler)
+    fsha = hashlib.sha256(corpus.encode("utf-8")).hexdigest()[:16]               # text id: the same files give the same prompts for the same tag
     st = {"cpt": calibrate(a, corpus)}
     rnd = random.Random(a.seed)
-    print(f"curve_points: filler {len(corpus)} chars, {st['cpt']:.3f} chars / token", flush=True)
+    print(f"curve_points: filler {len(corpus)} chars (sha {fsha}), {st['cpt']:.3f} chars / token", flush=True)
     for L in [int(x) for x in a.points.split(",")]:
-        res = {"L": L, "tag": a.tag, "passkey": [], "t0": time.strftime("%Y-%m-%d %H:%M:%S")}
+        res = {"L": L, "tag": a.tag, "filler_sha": fsha, "filler_chars": len(corpus), "passkey": [], "t0": time.strftime("%Y-%m-%d %H:%M:%S")}
         try:
             if L <= a.plain_max:
                 for w in range(a.warm):
                     fit(a, st, L, lambda n: make_text(corpus, n, f"warm{w}{L}{a.tag}") + "\nContinue the text with a long story.", 8)
                 res["decode"] = fit(a, st, L, lambda n: make_text(corpus, n, f"dec{L}{a.tag}") + "\nContinue the text with a long story.", a.decode_tokens, ignore_eos=True, rep=getattr(a, "pf_rep", 0))
+                if a.reps > 1:
+                    res["decode_reps"] = [res["decode"]]
+                    for k in range(1, a.reps):
+                        res["decode_reps"].append(fit(a, st, L, lambda n: make_text(corpus, n, f"dec{L}{a.tag}r{k}") + "\nContinue the text with a long story.", a.decode_tokens, ignore_eos=True, rep=getattr(a, "pf_rep", 0)))
+                    for key in ("prefill_tok_s", "decode_tok_s"):
+                        v = [r[key] for r in res["decode_reps"] if r.get(key)]
+                        if v: res["decode"][key + "_median"] = statistics.median(v)
                 print(f"RESULTS curve {a.tag} L={L} decode: prompt {res['decode'].get('prompt_tokens')} prefill {res['decode'].get('prefill_tok_s')} decode {res['decode'].get('decode_tok_s')} tok/s, cold prefill {res['decode'].get('prefill_cold_tok_s')}, io disk MB cold/warm {res['decode'].get('io_cold_disk_mb')}/{res['decode'].get('io_disk_mb')}, pagein MB cold/warm {res['decode'].get('io_cold_pagein_mb')}/{res['decode'].get('io_pagein_mb')}", flush=True)
             for d in [float(x) for x in a.depths.split(",") if x.strip()]:
                 key = "%06d" % rnd.randrange(10 ** 6)

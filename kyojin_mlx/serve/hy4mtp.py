@@ -147,15 +147,18 @@ class Hy4MtpBackend(Hy4Backend):
 
 
 def install(be, gpath: str, log=print):
-    """Hy4Backend `be` -> Hy4MtpBackend with the head of the GGUF at `gpath`; refused head: `be` unchanged (plain decode), with the reason logged."""
+    """Hy4Backend `be` -> Hy4MtpBackend with the head of the GGUF at `gpath`; refused head: stops with the reason (HY4_ALLOW_SLOW=1: `be` unchanged, plain decode, reason logged)."""
     from .. import foreign_gguf as GF
     from ..foreign_skeleton_rows import ROWS
     g = GF.GgufFile(gpath)
     try:
         gpu = mx.default_device() == mx.gpu
         head = M.build_head(g, be.model, row=ROWS["hy_v4_flash"], dtype=mx.float32, expert_dtype=mx.bfloat16 if gpu else mx.float32, log=log)
-    except (M.HeadRefused, Exception) as e:                           # noqa: BLE001 - any failure of an optional head serves plain
-        log(f"[kyojin] KYOJIN_HY4_MTP: head refused ({type(e).__name__}: {e}); plain decode")
+    except (M.HeadRefused, Exception) as e:                           # noqa: BLE001
+        msg = f"KYOJIN_HY4_MTP is on but the MTP head was refused ({type(e).__name__}: {e})"
+        if os.environ.get("HY4_ALLOW_SLOW") != "1":                  # the shipped speed needs the head: stop instead of serving plain without notice
+            raise RuntimeError(msg + ". Fix the model file, or set HY4_ALLOW_SLOW=1 to serve plain decode anyway.") from e
+        log(f"[kyojin] {msg}; plain decode (HY4_ALLOW_SLOW=1)")
         return be
     finally:
         g.close()
