@@ -25,7 +25,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 
-from . import moe_sumoe as SU, exl3_linear as EL, headlast as HL, fqfuse as FQF, kernels as KN, metal_nax as NX, moe as M, tuning as TN
+from . import fired as FD, moe_sumoe as SU, exl3_linear as EL, headlast as HL, fqfuse as FQF, kernels as KN, metal_nax as NX, moe as M, tuning as TN
 from . import fired as FD
 from . import ablate as AZ
 from . import archs as _AR
@@ -105,7 +105,8 @@ def _head_last_row(model) -> None:
     """The LM head of a prompt chunk costs 2 * hidden * vocab flops per row (DS4.1: 1.3 GFLOP, 5 % of the whole prefill) and a [rows, vocab] logits tensor for
     nothing when the caller reads `logits[:, -1]` only. Inside `headlast.last_row()`, chunks above LAST_ROW_MIN rows get the logits of their last row only ([B, 1, vocab])."""
     head = getattr(model.language_model, "head", None)
-    if head is None:                                                            # GLM / draft models: no DS4.1 head module, every row as before
+    if head is None:
+        _head_last_row_glm(model.language_model)                                # GLM: the head is inside LanguageModel.__call__ (lm_head applied to every hidden row)
         return
     cls = head.__class__
     orig = cls.__call__
@@ -116,6 +117,29 @@ def _head_last_row(model) -> None:
         return orig(self, x, *a, **k)
 
     head.__class__ = type(cls.__name__, (cls,), {"__call__": __call__})
+
+
+def _head_last_row_glm(lm) -> None:
+    """GLM-5.x (mlx_vlm glm5_next LanguageModel): the stock call applies lm_head to all rows of a prompt chunk (8192 rows: 1.0e13 flop, 0.5 s per 8K chunk, G0 profile).
+    Inside `headlast.last_row()` a chunk above LAST_ROW_MIN rows runs the model with num_logits_to_keep=1 (the stock slice of the hidden rows before the head), so the
+    logits are [B, 1, vocab]; hidden_sink (MTP / drafter taps) still holds every row."""
+    cls = lm.__class__
+    if not cls.__module__.startswith("mlx_vlm.models.glm5_next") or getattr(cls, "_kyojin_head_last", False):
+        return
+    orig = cls.__call__
+
+    def __call__(self, inputs=None, cache=None, inputs_embeds=None, **kwargs):
+        ids = kwargs.get("input_ids")                                       # the backend passes input_ids= (G5g: `inputs` is None there, the head ran on every row)
+        x = inputs if inputs is not None else (ids if ids is not None else inputs_embeds)
+        if (HL.active() and x is not None and x.ndim >= 2 and x.shape[1] > HL.LAST_ROW_MIN and not kwargs.get("num_logits_to_keep")
+                and not kwargs.get("skip_logits")):
+            kwargs["num_logits_to_keep"] = 1
+            FD.fire("head_last")
+        elif FD.AUDIT and x is not None and x.ndim >= 2:           # flag audit: a prompt-sized chunk that kept every row, and why
+            FD.fb("head_last", f"rows<={HL.LAST_ROW_MIN}" if x.shape[1] <= HL.LAST_ROW_MIN else "outside_scope" if not HL.active() else "caller_keeps_logits")
+        return orig(self, inputs, cache, inputs_embeds, **kwargs)
+
+    lm.__class__ = type(cls.__name__, (cls,), {"__call__": __call__, "_kyojin_head_last": True, "__module__": cls.__module__})
 
 
 def pf_min_rows(moe: M.MoeGather) -> int:
@@ -230,12 +254,15 @@ def _install_linear_hook():
     global _hooked
     if _hooked:
         return
+    from . import glm_dense_rows as GDR
     L = importlib.import_module("mlx_vlm.models.linear")
     orig = L.native_batch_linear
 
     def native_batch_linear(module, x):
         if isinstance(module, (Exl3Linear, ConcatLinear)):
             return module(x)
+        if (GDR.ENABLED or GDR.VROWS) and GDR.route(module, x):                    # flags glm_dense_rows / glm_vrows: one GEMV launch for the verify rows instead of tokenwise's L
+            return GDR.call(module, x)
         return orig(module, x)
 
     L.native_batch_linear = native_batch_linear
@@ -406,11 +433,11 @@ def build_moe(old, moe_parent, st: dict, mspec, materialize: bool = True, rep: d
         limit = getattr(limit, part)
     limit = float(limit)
     topk = int(moe_parent.gate.top_k)
-    kw = dict(limit=limit, wpre=mspec.weight_before_down, fq=mspec.fake_quant_fp8, alpha=mspec.alpha, beta=mspec.beta)
+    kw = dict(limit=limit, wpre=mspec.weight_before_down, fq=mspec.fake_quant_fp8, alpha=mspec.alpha, beta=mspec.beta, act=mspec.act)
     new_moe = _moe_module(old, M.MoeGather(st["gate"], st["up"], st["down"], topk, **kw), mspec.convention)
     new_moe.msh = None
     if SU.SUMOE and hasattr(moe_parent, "shared_experts") and not hasattr(moe_parent, "shared_expert_gate"):
-        ext = SU.wire_shared(st["gate"], st["up"], st["down"], moe_parent.shared_experts, limit, mspec.alpha, mspec.beta)
+        ext = SU.wire_shared(st["gate"], st["up"], st["down"], moe_parent.shared_experts, limit, mspec.alpha, mspec.beta, mspec.act)
         if ext is not None:
             if materialize:
                 mx.eval(*[a for s in ext for a in (s.words, s.offset, s.k, s.suh, s.svh)])
@@ -424,6 +451,26 @@ def build_moe(old, moe_parent, st: dict, mspec, materialize: bool = True, rep: d
             if rep is not None:
                 rep["sumoe_layers"] = rep.get("sumoe_layers", 0) + 1
     return new_moe
+
+
+def install_glm_pf(model) -> dict:
+    """GLM-5.x served as stored (foreign_linear: the branch of serve.backends that never goes through patch_model): the prompt-side hooks of G5b, each behind its own flag
+    (lm_head on the last row inside headlast.last_row(), DSA latent-space attention, one-kernel mHC mix + prompt expand, fused indexer selection)."""
+    rep = {}
+    if HL.ENABLED:
+        _head_last_row(model)
+        rep["head_last"] = 1
+    from . import glm_dsa_pf, glm_pf_glue, glm_pf_idx, glm_pf_untile, kda_pf
+    rep["glm_dsa_pf"] = glm_dsa_pf.install(model)
+    from . import glm_fuse_dsa
+    rep["glm_fuse_dsa"] = glm_fuse_dsa.install()                                 # flag KYOJIN_GLM_FUSE_DSA (G10c): DSA decode of 2..4 rows (verify) on the one-row kernels; before rows.enable
+    from . import glm_lean_cache
+    rep["glm_lean_cache"] = glm_lean_cache.install()                             # flag KYOJIN_GLM_LEAN_CACHE (BP-CACHE): BatchPoolingCache.update_and_fetch's per-session loop -> one scatter
+    rep["glm_pf_hc"] = glm_pf_glue.install(model)
+    rep["glm_pf_idx"] = glm_pf_idx.install(model)
+    rep["glm_kda_pf"] = kda_pf.install(model)
+    rep["glm_pf_untile"] = glm_pf_untile.install(model)
+    return rep
 
 
 def patch_model(model, pack_dir: str, spec: ArchSpec | None = None, config: dict | None = None, materialize: bool = True,
@@ -522,6 +569,16 @@ def patch_model(model, pack_dir: str, spec: ArchSpec | None = None, config: dict
     rep["prefill_attn"] = F.install(spec, only=F.PREFILL_IMPLS)                  # prompt-time kernels (no decode-side replacement; rows.enable installs the rest)
     from . import ds_pf_attn
     rep["ds_pf"] = ds_pf_attn.install(model)                                    # DS4.1 prefill attention (S > 1); no-op for other architectures
+    from . import glm_dsa_pf
+    rep["glm_dsa_pf"] = glm_dsa_pf.install(model)                               # GLM-5.x DSA prefill attention in latent space on the NAX kernels (KYOJIN_GLM_DSA_PF); no-op for other architectures
+    from . import glm_fuse_dsa
+    rep["glm_fuse_dsa"] = glm_fuse_dsa.install()                                 # flag KYOJIN_GLM_FUSE_DSA (G10c); no-op when off
+    from . import glm_lean_cache
+    rep["glm_lean_cache"] = glm_lean_cache.install()                             # flag KYOJIN_GLM_LEAN_CACHE (BP-CACHE); no-op when off
+    from . import glm_pf_glue
+    rep["glm_pf_hc"] = glm_pf_glue.install(model)                               # GLM-5.x prompt mHC: one mix kernel + the DS4.1 prompt expand (KYOJIN_GLM_PF_HC); no-op for other architectures
+    from . import glm_pf_idx
+    rep["glm_pf_idx"] = glm_pf_idx.install(model)                               # GLM-5.x prompt indexer: fused NAX score kernel + exact radix top-k (KYOJIN_GLM_PF_IDX); no-op for other architectures
     from . import bound_layers as BL
     rep["bound_layers"] = BL.install(model)                                     # prompt chunks: evaluate every few layers instead of one graph over the whole model
     from . import longctx

@@ -1,0 +1,2277 @@
+{
+ "reference": "transformers 5.21.0 render_jinja_template",
+ "gguf": "Hy4-flash-Q3_K-00001-of-00002.gguf",
+ "template_sha256": "09a8ba8fb355300da43229ff491a47d64c98dcfd79eb5881b3c88738953c7b51",
+ "template": "{#- ----------‑‑‑ special token variables ‑‑‑---------- -#}\n{%- set HYTK = ':6124c78e' %}\n{%- set hy_start_token = '<｜hy_start{}｜>'.format(HYTK) %}\n{%- set hy_middle_token = '<｜hy_middle{}｜>'.format(HYTK) %}\n{%- set hy_end_token = '<｜hy_end{}｜>'.format(HYTK) %}\n{%- set image_start_token = '<｜hy_image▁start{}｜>'.format(HYTK) %}\n{%- set image_pad_token = '<｜hy_image▁pad{}｜>'.format(HYTK) %}\n{%- set image_end_token = '<｜hy_image▁end{}｜>'.format(HYTK) %}\n{%- set video_start_token = '<｜hy_video▁start{}｜>'.format(HYTK) %}\n{%- set video_pad_token = '<｜hy_video▁pad{}｜>'.format(HYTK) %}\n{%- set video_end_token = '<｜hy_video▁end{}｜>'.format(HYTK) %}\n{%- set think_begin_token = '<think{}>'.format(HYTK) %}\n{%- set think_end_token = '</think{}>'.format(HYTK) %}\n{%- set toolcalls_begin_token = '<tool_calls{}>'.format(HYTK) %}\n{%- set toolcalls_end_token = '</tool_calls{}>'.format(HYTK) %}\n{%- set toolcall_begin_token = '<tool_call{}>'.format(HYTK) %}\n{%- set toolcall_end_token = '</tool_call{}>'.format(HYTK) %}\n{%- set argkey_begin_token = '<arg_key{}>'.format(HYTK) %}\n{%- set argkey_end_token = '</arg_key{}>'.format(HYTK) %}\n{%- set argvalue_begin_token = '<arg_value{}>'.format(HYTK) %}\n{%- set argvalue_end_token = '</arg_value{}>'.format(HYTK) %}\n{%- set toolresponse_begin_token = '<tool_response{}>'.format(HYTK) %}\n{%- set toolresponse_end_token = '</tool_response{}>'.format(HYTK) %}\n{%- set reasoning_mode_token = '<｜reasoning_mode{}｜>'.format(HYTK) %}\n\n{#- ----------‑‑‑ hyperparameters variables ‑‑‑---------- -#}\n{%- if not add_generation_prompt is defined %}\n    {%- set add_generation_prompt = false %}\n{%- endif %}\n{%- if not preserved_thinking is defined %}\n    {%- if not tools %}\n        {%- set preserved_thinking = false %}\n    {%- else %}\n        {%- set preserved_thinking = true %}\n    {%- endif %}\n{%- endif %}\n\n{%- if not reasoning_effort is defined %}\n    {%- set reasoning_effort = 'high' %}\n{%- elif reasoning_effort not in ['max', 'high', 'low', 'no_think'] %}\n    {%- if reasoning_effort is none %}\n        {{- raise_exception('reasoning_effort error : None, should be no_think/low/high/max') }}\n    {%- else %}\n        {{- raise_exception('reasoning_effort error : ' + reasoning_effort + ', should be no_think/low/high/max') }}\n    {%- endif %}\n{%- endif %}\n\n{%- if fallback_strategy is defined and fallback_strategy == 'reasoning_toolcall_retry' %}\n    {%- set reasoning_effort = 'high' %}\n    {%- set add_generation_prompt = false %}\n{%- endif %}\n{%- if not raw_last_assistant is defined %}\n    {%- set raw_last_assistant = false %}\n{%- endif %}\n{%- if not add_vision_id is defined %}\n    {%- set add_vision_id = false %}\n{%- endif %}\n{%- set image_count = namespace(value=0) %}\n{%- set video_count = namespace(value=0) %}\n\n{%- macro tool_to_json(tool) -%}\n    {%- set ns_tool = namespace(first=true) -%}\n    {{- '{' -}}\n    {%- for k, v in tool.items() -%}\n        {%- if k != 'defer_loading' and k != 'strict' -%}\n            {%- if not ns_tool.first -%}{{- ', ' -}}{%- endif -%}\n            {%- set ns_tool.first = false -%}\n            {{- '\"' ~ k ~ '\": ' ~ (v | tojson(ensure_ascii=False)) -}}\n        {%- endif -%}\n    {%- endfor -%}\n    {{- '}' -}}\n{%- endmacro -%}\n\n{%- macro render_content(content, do_vision_count=true, is_system_content=false) -%}\n    {%- if content is string -%}\n        {{- content -}}\n    {%- elif content is iterable and content is not mapping -%}\n        {%- for item in content -%}\n            {%- if item is mapping and item.type == 'text' -%}\n                {{- item.text -}}\n            {%- elif item is mapping and ('image' in item or 'image_url' in item or item.type in ['image', 'image_url']) -%}\n                {%- if is_system_content -%}\n                    {{- raise_exception('System message cannot contain images.') -}}\n                {%- endif -%}\n                {%- if do_vision_count -%}\n                    {%- set image_count.value = image_count.value + 1 -%}\n                {%- endif -%}\n                {%- if add_vision_id -%}\n                    {{- 'Picture ' ~ image_count.value ~ ': ' -}}\n                {%- endif -%}\n                {{- image_start_token ~ image_pad_token ~ image_end_token -}}\n            {%- elif item is mapping and ('video' in item or 'video_url' in item or item.type in ['video', 'video_url']) -%}\n                {%- if is_system_content -%}\n                    {{- raise_exception('System message cannot contain videos.') -}}\n                {%- endif -%}\n                {%- if do_vision_count -%}\n                    {%- set video_count.value = video_count.value + 1 -%}\n                {%- endif -%}\n                {%- if add_vision_id -%}\n                    {{- 'Video ' ~ video_count.value ~ ': ' -}}\n                {%- endif -%}\n                {{- video_start_token ~ video_pad_token ~ video_end_token -}}\n            {%- elif item is string -%}\n                {{- item -}}\n            {%- else -%}\n                {{- item | string -}}\n            {%- endif -%}\n        {%- endfor -%}\n    {%- elif content is none -%}\n        {{- '' -}}\n    {%- else -%}\n        {{- content | string -}}\n    {%- endif -%}\n{%- endmacro -%}\n\n{%- macro render_tools_prompt() -%}\n    {{- '# Tools\\n\\nYou may call one or more functions to assist with the user query.' -}}\n    {{- '\\n\\nYou are provided with function signatures within <tools></tools> XML tags:' -}}\n    {{- '\\n<tools>\\n' -}}\n    {%- set tool_ns = namespace(first=true) -%}\n    {%- for tool in tools -%}\n        {%- set t = tool['function'] if tool is mapping and 'function' in tool else tool -%}\n        {%- if t.defer_loading is not defined or not t.defer_loading -%}\n            {%- if not tool_ns.first -%}{{- '\\n' -}}{%- endif -%}\n            {%- set tool_ns.first = false -%}\n            {{- tool_to_json(t) -}}\n        {%- endif -%}\n    {%- endfor -%}\n    {{- '\\n</tools>\\n\\n' -}}\n    {{- 'For function call returns, you should first print ' ~ toolcalls_begin_token -}}\n    {{- '\\nFor each function call, you should return object like:\\n' -}}\n    {{- toolcall_begin_token ~ '{function-name}' -}}\n    {{- argkey_begin_token ~ '{arg-key-1}' ~ argkey_end_token -}}\n    {{- argvalue_begin_token ~ '{arg-value-1}' ~ argvalue_end_token -}}\n    {{- argkey_begin_token ~ '{arg-key-2}' ~ argkey_end_token -}}\n    {{- argvalue_begin_token ~ '{arg-value-2}' ~ argvalue_end_token -}}\n    {{- '...' -}}\n    {{- toolcall_end_token -}}\n    {{- '\\nAt the end of function call returns, you should print ' ~ toolcalls_end_token -}}\n{%- endmacro -%}\n\n{#- adjacent tool_search_output parts share one <tools> block, so a tool search result has the same shape as the tools prompt -#}\n{%- macro render_tool_response(message) -%}\n    {%- set content = message['content'] -%}\n    {{- toolresponse_begin_token -}}\n    {%- if content is string -%}\n        {{- content -}}\n    {%- elif content is iterable and content is not mapping -%}\n        {%- set tools_ns = namespace(open=false) -%}\n        {%- for item in content -%}\n            {%- set is_search_output = item is mapping and item.type is defined and item.type == 'tool_search_output' -%}\n            {%- if is_search_output and not tools_ns.open -%}\n                {{- '<tools>\\n' -}}\n                {%- set tools_ns.open = true -%}\n            {%- elif not is_search_output and tools_ns.open -%}\n                {{- '</tools>' -}}\n                {%- set tools_ns.open = false -%}\n            {%- endif -%}\n            {%- if is_search_output -%}\n                {%- if item.tools is defined and item.tools is iterable -%}\n                    {%- for tool in item.tools -%}\n                        {%- set t = tool['function'] if tool is mapping and 'function' in tool else tool -%}\n                        {{- tool_to_json(t) ~ '\\n' -}}\n                    {%- endfor -%}\n                {%- endif -%}\n            {%- elif item is mapping and item.output is defined -%}\n                {{- render_content(item.output) -}}\n            {%- else -%}\n                {{- render_content([item]) -}}\n            {%- endif -%}\n        {%- endfor -%}\n        {%- if tools_ns.open -%}\n            {{- '</tools>' -}}\n        {%- endif -%}\n    {%- else -%}\n        {{- render_content(content) -}}\n    {%- endif -%}\n    {{- toolresponse_end_token -}}\n{%- endmacro -%}\n\n{#- consecutive tool messages are clustered into a single tool message whose content is the list of the original tool messages; the result is written to merged_ns.messages (a macro cannot return a list) -#}\n{%- set merged_ns = namespace(messages=[]) %}\n{%- macro merge_tool_responses(messages) -%}\n    {%- set merge_ns = namespace(result=[], cluster=[]) -%}\n    {%- for message in messages -%}\n        {%- if message['role'] == 'tool' -%}\n            {%- set merge_ns.cluster = merge_ns.cluster + [message] -%}\n        {%- else -%}\n            {%- if merge_ns.cluster -%}\n                {%- set merge_ns.result = merge_ns.result + [{'role': 'tool', 'content': merge_ns.cluster}] -%}\n                {%- set merge_ns.cluster = [] -%}\n            {%- endif -%}\n            {%- set merge_ns.result = merge_ns.result + [message] -%}\n        {%- endif -%}\n    {%- endfor -%}\n    {%- if merge_ns.cluster -%}\n        {%- set merge_ns.result = merge_ns.result + [{'role': 'tool', 'content': merge_ns.cluster}] -%}\n    {%- endif -%}\n    {%- set merged_ns.messages = merge_ns.result -%}\n{%- endmacro -%}\n\n{#- render one tool cluster, reordered to follow the tool_call order of the preceding assistant turn; any missing / ambiguous id falls back to the original tool message order for the whole cluster -#}\n{%- macro render_tool_responses(tool_messages, tool_call_ids) -%}\n    {%- set order_ns = namespace(ordered=[], matched=true) -%}\n    {%- if tool_call_ids and tool_call_ids | length == tool_messages | length -%}\n        {%- for tool_call_id in tool_call_ids -%}\n            {%- set hit_ns = namespace(count=0, message=none) -%}\n            {%- for tool_message in tool_messages -%}\n                {%- set message_id = tool_message['tool_call_id'] if tool_message['tool_call_id'] is defined else tool_message['id'] -%}\n                {%- if message_id is defined and message_id == tool_call_id -%}\n                    {%- set hit_ns.count = hit_ns.count + 1 -%}\n                    {%- set hit_ns.message = tool_message -%}\n                {%- endif -%}\n            {%- endfor -%}\n            {%- if hit_ns.count == 1 -%}\n                {%- set order_ns.ordered = order_ns.ordered + [hit_ns.message] -%}\n            {%- else -%}\n                {%- set order_ns.matched = false -%}\n            {%- endif -%}\n        {%- endfor -%}\n    {%- else -%}\n        {%- set order_ns.matched = false -%}\n    {%- endif -%}\n    {%- for tool_message in (order_ns.ordered if order_ns.matched else tool_messages) -%}\n        {{- render_tool_response(tool_message) -}}\n    {%- endfor -%}\n{%- endmacro -%}\n\n{%- set _ = merge_tool_responses(messages) %}\n{%- set normed_messages = merged_ns.messages %}\n\n{%- set ns = namespace(last_user_index=-1, has_leading_system=false) %}\n{%- if normed_messages and normed_messages[0].role == 'system' %}\n    {%- set ns.has_leading_system = true %}\n{%- endif %}\n{%- for message in normed_messages %}\n    {%- if message['role'] == 'user' %}\n        {%- set ns.last_user_index = loop.index0 %}\n    {%- endif %}\n{%- endfor %}\n\n{#- no leading system: synthesize one for tools and/or reasoning_mode -#}\n{%- if not ns.has_leading_system %}\n    {{- hy_start_token ~ 'system' ~ hy_middle_token -}}\n    {%- if tools %}\n        {{- render_tools_prompt() -}}\n    {%- endif %}\n    {{- reasoning_mode_token ~ 'reasoning_effort:' ~ reasoning_effort -}}\n    {{- hy_end_token -}}\n{%- endif %}\n\n{%- set last_ns = namespace(last_is_assistant=false) %}\n{%- set prev_ns = namespace(tool_call_ids=[]) %}\n{%- for message in normed_messages %}\n    {%- if message['role'] == 'system' %}\n        {{- hy_start_token ~ 'system' ~ hy_middle_token -}}\n        {#- tools / reasoning_mode only attach to the leading system (messages[0]) -#}\n        {%- if loop.first %}\n            {%- if tools %}\n                {{- render_tools_prompt() -}}\n            {%- endif %}\n            {%- set content = render_content(message['content']) -%}\n            {%- if tools and content -%}\n                {{- '\\n\\n' -}}\n            {%- endif -%}\n            {{- content -}}\n            {{- reasoning_mode_token ~ 'reasoning_effort:' ~ reasoning_effort -}}\n        {%- else %}\n            {{- render_content(message['content']) -}}\n        {%- endif %}\n        {{- hy_end_token -}}\n    {%- elif message['role'] == 'user' %}\n        {{- hy_start_token ~ 'user' ~ hy_middle_token -}}\n        {{- render_content(message['content']) -}}\n        {{- hy_end_token -}}\n    {%- elif message['role'] == 'assistant' %}\n        {%- set content_body = render_content(message['content']) -%}\n        {#- 'reasoning' takes precedence, fall back to 'reasoning_content' when it is empty -#}\n        {%- set reasoning_text = '' %}\n        {%- if message['reasoning'] is defined and message['reasoning'] is string and message['reasoning'] %}\n            {%- set reasoning_text = message['reasoning'] %}\n        {%- elif message['reasoning_content'] is defined and message['reasoning_content'] is string and message['reasoning_content'] %}\n            {%- set reasoning_text = message['reasoning_content'] %}\n        {%- endif %}\n        {#- no_think overrides preserved_thinking: history is always emitted with empty think tags -#}\n        {%- if reasoning_effort != 'no_think' and (preserved_thinking or loop.index0 > ns.last_user_index) and reasoning_text %}\n            {%- set content = think_begin_token ~ reasoning_text ~ think_end_token ~ content_body %}\n        {%- else %}\n            {%- set content = think_begin_token ~ think_end_token ~ content_body %}\n        {%- endif %}\n        {{- hy_start_token ~ 'assistant' ~ hy_middle_token -}}\n        {%- if message['tool_calls'] is defined and message['tool_calls'] %}\n            {#- remember the tool_call ids of this turn to order the following tool responses; an incomplete id set means \"do not reorder\" -#}\n            {%- set ids_ns = namespace(ids=[], complete=true) %}\n            {%- for tool in message['tool_calls'] %}\n                {%- set tool_call_id = tool['id'] if tool['id'] is defined and tool['id'] else tool['tool_call_id'] %}\n                {%- if tool_call_id is defined and tool_call_id %}\n                    {%- set ids_ns.ids = ids_ns.ids + [tool_call_id] %}\n                {%- else %}\n                    {%- set ids_ns.complete = false %}\n                {%- endif %}\n            {%- endfor %}\n            {%- set prev_ns.tool_call_ids = ids_ns.ids if ids_ns.complete else [] %}\n            {{- content -}}\n            {{- toolcalls_begin_token -}}\n            {%- for tool in message['tool_calls'] -%}\n                {%- set func = tool['function'] if tool is mapping and 'function' in tool else tool -%}\n                {%- set arguments = func['arguments'] -%}\n                {{- toolcall_begin_token ~ func['name'] -}}\n                {%- for key, value in arguments.items() -%}\n                    {{- argkey_begin_token ~ key ~ argkey_end_token -}}\n                    {%- if value is not string -%}\n                        {%- set value = value | tojson(ensure_ascii=False) -%}\n                    {%- endif -%}\n                    {{- argvalue_begin_token ~ value ~ argvalue_end_token -}}\n                {%- endfor -%}\n                {{- toolcall_end_token -}}\n            {%- endfor -%}\n            {{- toolcalls_end_token -}}\n        {%- else %}\n            {%- if loop.last and raw_last_assistant %}\n                {{- content_body -}}\n            {%- else %}\n                {{- content -}}\n            {%- endif %}\n        {%- endif %}\n        {#- continuation / prefill: last assistant is still open, do not close with hy_end -#}\n        {%- if not (loop.last and raw_last_assistant) and not (loop.last and fallback_strategy is defined and fallback_strategy == 'reasoning_toolcall_retry') %}\n            {{- hy_end_token -}}\n        {%- endif %}\n    {%- elif message['role'] == 'tool' %}\n        {{- hy_start_token ~ 'tool' ~ hy_middle_token -}}\n        {{- render_tool_responses(message['content'], prev_ns.tool_call_ids) -}}\n        {{- hy_end_token -}}\n    {%- else %}\n        {{- hy_start_token ~ message['role'] ~ hy_middle_token -}}\n        {{- render_content(message['content']) -}}\n        {{- hy_end_token -}}\n    {%- endif %}\n    {%- if message['role'] != 'assistant' or not (message['tool_calls'] is defined and message['tool_calls']) %}\n        {%- set prev_ns.tool_call_ids = [] %}\n    {%- endif %}\n    {%- if loop.last and message['role'] == 'assistant' %}\n        {%- set last_ns.last_is_assistant = true %}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {%- if not last_ns.last_is_assistant %}\n        {%- if reasoning_effort == 'no_think' %}\n            {{- hy_start_token ~ 'assistant' ~ hy_middle_token ~ think_begin_token ~ think_end_token -}}\n        {%- else %}\n            {{- hy_start_token ~ 'assistant' ~ hy_middle_token ~ think_begin_token -}}\n        {%- endif %}\n    {%- endif %}\n{%- endif %}\n",
+ "cases": [
+  {
+   "name": "user_only",
+   "body": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ]
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "tools": null,
+    "kwargs": {}
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "system_user",
+   "body": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a careful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ]
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a careful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "tools": null,
+    "kwargs": {}
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜>You are a careful assistant.<｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "multi_turn",
+   "body": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a careful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "It is 18 C and sunny."
+     },
+     {
+      "role": "user",
+      "content": "And tomorrow?"
+     }
+    ]
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a careful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "It is 18 C and sunny."
+     },
+     {
+      "role": "user",
+      "content": "And tomorrow?"
+     }
+    ],
+    "tools": null,
+    "kwargs": {}
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜>You are a careful assistant.<｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>It is 18 C and sunny.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>And tomorrow?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "history_reasoning_dropped",
+   "body": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "18 C.",
+      "reasoning_content": "The user wants Paris weather."
+     },
+     {
+      "role": "user",
+      "content": "Thanks!"
+     }
+    ]
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "18 C.",
+      "reasoning_content": "The user wants Paris weather."
+     },
+     {
+      "role": "user",
+      "content": "Thanks!"
+     }
+    ],
+    "tools": null,
+    "kwargs": {}
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>18 C.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Thanks!<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "history_reasoning_preserved",
+   "body": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "18 C.",
+      "reasoning_content": "The user wants Paris weather."
+     },
+     {
+      "role": "user",
+      "content": "Thanks!"
+     }
+    ],
+    "chat_template_kwargs": {
+     "preserved_thinking": true
+    }
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "18 C.",
+      "reasoning_content": "The user wants Paris weather."
+     },
+     {
+      "role": "user",
+      "content": "Thanks!"
+     }
+    ],
+    "tools": null,
+    "kwargs": {
+     "preserved_thinking": true
+    }
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>The user wants Paris weather.</think:6124c78e>18 C.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Thanks!<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "clear_thinking_false",
+   "body": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "18 C.",
+      "reasoning_content": "Paris."
+     },
+     {
+      "role": "user",
+      "content": "ok"
+     }
+    ],
+    "clear_thinking": false
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "18 C.",
+      "reasoning_content": "Paris."
+     },
+     {
+      "role": "user",
+      "content": "ok"
+     }
+    ],
+    "tools": null,
+    "kwargs": {
+     "preserved_thinking": true
+    }
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>Paris.</think:6124c78e>18 C.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>ok<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "reasoning_field_openrouter",
+   "body": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "18 C.",
+      "reasoning": "OpenRouter spelling."
+     },
+     {
+      "role": "user",
+      "content": "ok"
+     }
+    ],
+    "chat_template_kwargs": {
+     "preserved_thinking": true
+    }
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "18 C.",
+      "reasoning": "OpenRouter spelling."
+     },
+     {
+      "role": "user",
+      "content": "ok"
+     }
+    ],
+    "tools": null,
+    "kwargs": {
+     "preserved_thinking": true
+    }
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>OpenRouter spelling.</think:6124c78e>18 C.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>ok<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "effort_low",
+   "body": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "reasoning_effort": "low"
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "tools": null,
+    "kwargs": {
+     "reasoning_effort": "low"
+    }
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:low<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "effort_high",
+   "body": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "chat_template_kwargs": {
+     "reasoning_effort": "high"
+    }
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "tools": null,
+    "kwargs": {
+     "reasoning_effort": "high"
+    }
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "effort_max",
+   "body": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a careful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "reasoning_effort": "max"
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a careful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "tools": null,
+    "kwargs": {
+     "reasoning_effort": "max"
+    }
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜>You are a careful assistant.<｜reasoning_mode:6124c78e｜>reasoning_effort:max<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "effort_no_think",
+   "body": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "reasoning_effort": "no_think"
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "tools": null,
+    "kwargs": {
+     "reasoning_effort": "no_think"
+    }
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:no_think<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>"
+  },
+  {
+   "name": "enable_thinking_false",
+   "body": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a careful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "chat_template_kwargs": {
+     "enable_thinking": false
+    }
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a careful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "tools": null,
+    "kwargs": {
+     "reasoning_effort": "no_think"
+    }
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜>You are a careful assistant.<｜reasoning_mode:6124c78e｜>reasoning_effort:no_think<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>"
+  },
+  {
+   "name": "effort_none",
+   "body": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "reasoning_effort": "none"
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "tools": null,
+    "kwargs": {
+     "reasoning_effort": "no_think"
+    }
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:no_think<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>"
+  },
+  {
+   "name": "reasoning_object_off",
+   "body": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "reasoning": {
+     "enabled": false
+    }
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "tools": null,
+    "kwargs": {
+     "reasoning_effort": "no_think"
+    }
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:no_think<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>"
+  },
+  {
+   "name": "effort_medium_alias",
+   "body": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "reasoning_effort": "medium"
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "tools": null,
+    "kwargs": {
+     "reasoning_effort": "high"
+    }
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "no_think_history",
+   "body": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "18 C.",
+      "reasoning_content": "Hidden."
+     },
+     {
+      "role": "user",
+      "content": "ok"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Current weather of a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "c",
+           "f"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "description": "Web search.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "limit": {
+          "type": "integer"
+         },
+         "filters": {
+          "type": "object"
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "safe": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ],
+    "thinking": {
+     "type": "disabled"
+    }
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "18 C.",
+      "reasoning_content": "Hidden."
+     },
+     {
+      "role": "user",
+      "content": "ok"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Current weather of a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "c",
+           "f"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "description": "Web search.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "limit": {
+          "type": "integer"
+         },
+         "filters": {
+          "type": "object"
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "safe": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ],
+    "kwargs": {
+     "reasoning_effort": "no_think"
+    }
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather of a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"search\", \"description\": \"Web search.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}, \"filters\": {\"type\": \"object\"}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"safe\": {\"type\": \"boolean\"}}, \"required\": [\"query\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:no_think<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>18 C.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>ok<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>"
+  },
+  {
+   "name": "tools_user",
+   "body": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Current weather of a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "c",
+           "f"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "description": "Web search.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "limit": {
+          "type": "integer"
+         },
+         "filters": {
+          "type": "object"
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "safe": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Current weather of a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "c",
+           "f"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "description": "Web search.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "limit": {
+          "type": "integer"
+         },
+         "filters": {
+          "type": "object"
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "safe": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ],
+    "kwargs": {}
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather of a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"search\", \"description\": \"Web search.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}, \"filters\": {\"type\": \"object\"}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"safe\": {\"type\": \"boolean\"}}, \"required\": [\"query\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "tools_system_user",
+   "body": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a careful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Current weather of a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "c",
+           "f"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "description": "Web search.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "limit": {
+          "type": "integer"
+         },
+         "filters": {
+          "type": "object"
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "safe": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a careful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Current weather of a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "c",
+           "f"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "description": "Web search.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "limit": {
+          "type": "integer"
+         },
+         "filters": {
+          "type": "object"
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "safe": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ],
+    "kwargs": {}
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather of a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"search\", \"description\": \"Web search.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}, \"filters\": {\"type\": \"object\"}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"safe\": {\"type\": \"boolean\"}}, \"required\": [\"query\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e>\n\nYou are a careful assistant.<｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "tools_empty_system",
+   "body": {
+    "messages": [
+     {
+      "role": "system",
+      "content": ""
+     },
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Current weather of a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "c",
+           "f"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "description": "Web search.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "limit": {
+          "type": "integer"
+         },
+         "filters": {
+          "type": "object"
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "safe": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "system",
+      "content": ""
+     },
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Current weather of a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "c",
+           "f"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "description": "Web search.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "limit": {
+          "type": "integer"
+         },
+         "filters": {
+          "type": "object"
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "safe": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ],
+    "kwargs": {}
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather of a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"search\", \"description\": \"Web search.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}, \"filters\": {\"type\": \"object\"}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"safe\": {\"type\": \"boolean\"}}, \"required\": [\"query\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "tool_call_and_result",
+   "body": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a careful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Paris\", \"unit\": \"c\"}"
+        }
+       }
+      ],
+      "reasoning_content": "I should call get_weather."
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "{\"temp\": 18, \"sky\": \"sunny\"}"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Current weather of a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "c",
+           "f"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "description": "Web search.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "limit": {
+          "type": "integer"
+         },
+         "filters": {
+          "type": "object"
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "safe": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a careful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": {
+          "city": "Paris",
+          "unit": "c"
+         }
+        }
+       }
+      ],
+      "reasoning_content": "I should call get_weather."
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "{\"temp\": 18, \"sky\": \"sunny\"}"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Current weather of a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "c",
+           "f"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "description": "Web search.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "limit": {
+          "type": "integer"
+         },
+         "filters": {
+          "type": "object"
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "safe": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ],
+    "kwargs": {}
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather of a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"search\", \"description\": \"Web search.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}, \"filters\": {\"type\": \"object\"}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"safe\": {\"type\": \"boolean\"}}, \"required\": [\"query\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e>\n\nYou are a careful assistant.<｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>I should call get_weather.</think:6124c78e><tool_calls:6124c78e><tool_call:6124c78e>get_weather<arg_key:6124c78e>city</arg_key:6124c78e><arg_value:6124c78e>Paris</arg_value:6124c78e><arg_key:6124c78e>unit</arg_key:6124c78e><arg_value:6124c78e>c</arg_value:6124c78e></tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>tool<｜hy_middle:6124c78e｜><tool_response:6124c78e>{\"temp\": 18, \"sky\": \"sunny\"}</tool_response:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "tool_call_content_and_result",
+   "body": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "Let me check.",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Paris\", \"unit\": \"c\"}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "18 C"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Current weather of a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "c",
+           "f"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "description": "Web search.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "limit": {
+          "type": "integer"
+         },
+         "filters": {
+          "type": "object"
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "safe": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "Let me check.",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": {
+          "city": "Paris",
+          "unit": "c"
+         }
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "18 C"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Current weather of a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "c",
+           "f"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "description": "Web search.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "limit": {
+          "type": "integer"
+         },
+         "filters": {
+          "type": "object"
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "safe": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ],
+    "kwargs": {}
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather of a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"search\", \"description\": \"Web search.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}, \"filters\": {\"type\": \"object\"}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"safe\": {\"type\": \"boolean\"}}, \"required\": [\"query\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>Let me check.<tool_calls:6124c78e><tool_call:6124c78e>get_weather<arg_key:6124c78e>city</arg_key:6124c78e><arg_value:6124c78e>Paris</arg_value:6124c78e><arg_key:6124c78e>unit</arg_key:6124c78e><arg_value:6124c78e>c</arg_value:6124c78e></tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>tool<｜hy_middle:6124c78e｜><tool_response:6124c78e>18 C</tool_response:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "parallel_calls_results_reordered",
+   "body": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Paris\", \"unit\": \"c\"}"
+        }
+       },
+       {
+        "id": "call_2",
+        "type": "function",
+        "function": {
+         "name": "search",
+         "arguments": "{\"query\": \"météo Paris\", \"limit\": 3, \"filters\": {\"site\": \"meteo.fr\", \"days\": [1, 2]}, \"tags\": [\"fr\", \"météo\"], \"safe\": true}"
+        }
+       }
+      ],
+      "reasoning_content": "Two calls."
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_2",
+      "content": "3 results"
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "18 C"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Current weather of a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "c",
+           "f"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "description": "Web search.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "limit": {
+          "type": "integer"
+         },
+         "filters": {
+          "type": "object"
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "safe": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": {
+          "city": "Paris",
+          "unit": "c"
+         }
+        }
+       },
+       {
+        "id": "call_2",
+        "type": "function",
+        "function": {
+         "name": "search",
+         "arguments": {
+          "query": "météo Paris",
+          "limit": 3,
+          "filters": {
+           "site": "meteo.fr",
+           "days": [
+            1,
+            2
+           ]
+          },
+          "tags": [
+           "fr",
+           "météo"
+          ],
+          "safe": true
+         }
+        }
+       }
+      ],
+      "reasoning_content": "Two calls."
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_2",
+      "content": "3 results"
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "18 C"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Current weather of a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "c",
+           "f"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "description": "Web search.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "limit": {
+          "type": "integer"
+         },
+         "filters": {
+          "type": "object"
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "safe": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ],
+    "kwargs": {}
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather of a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"search\", \"description\": \"Web search.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}, \"filters\": {\"type\": \"object\"}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"safe\": {\"type\": \"boolean\"}}, \"required\": [\"query\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>Two calls.</think:6124c78e><tool_calls:6124c78e><tool_call:6124c78e>get_weather<arg_key:6124c78e>city</arg_key:6124c78e><arg_value:6124c78e>Paris</arg_value:6124c78e><arg_key:6124c78e>unit</arg_key:6124c78e><arg_value:6124c78e>c</arg_value:6124c78e></tool_call:6124c78e><tool_call:6124c78e>search<arg_key:6124c78e>query</arg_key:6124c78e><arg_value:6124c78e>météo Paris</arg_value:6124c78e><arg_key:6124c78e>limit</arg_key:6124c78e><arg_value:6124c78e>3</arg_value:6124c78e><arg_key:6124c78e>filters</arg_key:6124c78e><arg_value:6124c78e>{\"site\": \"meteo.fr\", \"days\": [1, 2]}</arg_value:6124c78e><arg_key:6124c78e>tags</arg_key:6124c78e><arg_value:6124c78e>[\"fr\", \"météo\"]</arg_value:6124c78e><arg_key:6124c78e>safe</arg_key:6124c78e><arg_value:6124c78e>true</arg_value:6124c78e></tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>tool<｜hy_middle:6124c78e｜><tool_response:6124c78e>18 C</tool_response:6124c78e><tool_response:6124c78e>3 results</tool_response:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "tool_loop_then_answer_then_user",
+   "body": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a careful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Paris\", \"unit\": \"c\"}"
+        }
+       }
+      ],
+      "reasoning_content": "Call it."
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "18 C"
+     },
+     {
+      "role": "assistant",
+      "content": "It is 18 C in Paris.",
+      "reasoning_content": "Got 18."
+     },
+     {
+      "role": "user",
+      "content": "Search météo too, 3 results."
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Current weather of a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "c",
+           "f"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "description": "Web search.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "limit": {
+          "type": "integer"
+         },
+         "filters": {
+          "type": "object"
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "safe": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ],
+    "reasoning_effort": "low"
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a careful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": {
+          "city": "Paris",
+          "unit": "c"
+         }
+        }
+       }
+      ],
+      "reasoning_content": "Call it."
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "18 C"
+     },
+     {
+      "role": "assistant",
+      "content": "It is 18 C in Paris.",
+      "reasoning_content": "Got 18."
+     },
+     {
+      "role": "user",
+      "content": "Search météo too, 3 results."
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Current weather of a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "c",
+           "f"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "description": "Web search.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "limit": {
+          "type": "integer"
+         },
+         "filters": {
+          "type": "object"
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "safe": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ],
+    "kwargs": {
+     "reasoning_effort": "low"
+    }
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather of a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"search\", \"description\": \"Web search.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}, \"filters\": {\"type\": \"object\"}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"safe\": {\"type\": \"boolean\"}}, \"required\": [\"query\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e>\n\nYou are a careful assistant.<｜reasoning_mode:6124c78e｜>reasoning_effort:low<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>Call it.</think:6124c78e><tool_calls:6124c78e><tool_call:6124c78e>get_weather<arg_key:6124c78e>city</arg_key:6124c78e><arg_value:6124c78e>Paris</arg_value:6124c78e><arg_key:6124c78e>unit</arg_key:6124c78e><arg_value:6124c78e>c</arg_value:6124c78e></tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>tool<｜hy_middle:6124c78e｜><tool_response:6124c78e>18 C</tool_response:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>Got 18.</think:6124c78e>It is 18 C in Paris.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Search météo too, 3 results.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "tools_preserved_off",
+   "body": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Paris\", \"unit\": \"c\"}"
+        }
+       }
+      ],
+      "reasoning_content": "Hidden thought."
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "18 C"
+     },
+     {
+      "role": "user",
+      "content": "ok"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Current weather of a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "c",
+           "f"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "description": "Web search.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "limit": {
+          "type": "integer"
+         },
+         "filters": {
+          "type": "object"
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "safe": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ],
+    "chat_template_kwargs": {
+     "preserved_thinking": false
+    }
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": {
+          "city": "Paris",
+          "unit": "c"
+         }
+        }
+       }
+      ],
+      "reasoning_content": "Hidden thought."
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "18 C"
+     },
+     {
+      "role": "user",
+      "content": "ok"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Current weather of a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "type": "string",
+          "enum": [
+           "c",
+           "f"
+          ]
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "description": "Web search.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "limit": {
+          "type": "integer"
+         },
+         "filters": {
+          "type": "object"
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "safe": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ],
+    "kwargs": {
+     "preserved_thinking": false
+    }
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather of a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"search\", \"description\": \"Web search.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"limit\": {\"type\": \"integer\"}, \"filters\": {\"type\": \"object\"}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"safe\": {\"type\": \"boolean\"}}, \"required\": [\"query\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e><tool_calls:6124c78e><tool_call:6124c78e>get_weather<arg_key:6124c78e>city</arg_key:6124c78e><arg_value:6124c78e>Paris</arg_value:6124c78e><arg_key:6124c78e>unit</arg_key:6124c78e><arg_value:6124c78e>c</arg_value:6124c78e></tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>tool<｜hy_middle:6124c78e｜><tool_response:6124c78e>18 C</tool_response:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>ok<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "second_system_mid",
+   "body": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a careful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "system",
+      "content": "Answer in French."
+     },
+     {
+      "role": "user",
+      "content": "Encore ?"
+     }
+    ]
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a careful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "system",
+      "content": "Answer in French."
+     },
+     {
+      "role": "user",
+      "content": "Encore ?"
+     }
+    ],
+    "tools": null,
+    "kwargs": {}
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜>You are a careful assistant.<｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜>Answer in French.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Encore ?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "unicode",
+   "body": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Écris « bonjour » en chinois 你好 et un emoji 🙂, puis du code: def f(x): return {x: 1}"
+     }
+    ]
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Écris « bonjour » en chinois 你好 et un emoji 🙂, puis du code: def f(x): return {x: 1}"
+     }
+    ],
+    "tools": null,
+    "kwargs": {}
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Écris « bonjour » en chinois 你好 et un emoji 🙂, puis du code: def f(x): return {x: 1}<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "text_parts",
+   "body": {
+    "messages": [
+     {
+      "role": "system",
+      "content": [
+       {
+        "type": "text",
+        "text": "Be brief. "
+       },
+       {
+        "type": "text",
+        "text": "Use metric."
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "Weather in "
+       },
+       {
+        "type": "text",
+        "text": "Lyon?"
+       }
+      ]
+     }
+    ]
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "system",
+      "content": [
+       {
+        "type": "text",
+        "text": "Be brief. "
+       },
+       {
+        "type": "text",
+        "text": "Use metric."
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "Weather in "
+       },
+       {
+        "type": "text",
+        "text": "Lyon?"
+       }
+      ]
+     }
+    ],
+    "tools": null,
+    "kwargs": {}
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜>Be brief. Use metric.<｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Weather in Lyon?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "assistant_last_prefill",
+   "body": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "Sure,"
+     }
+    ]
+   },
+   "hf": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": "Sure,"
+     }
+    ],
+    "tools": null,
+    "kwargs": {}
+   },
+   "expected": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the weather in Paris?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>Sure,<｜hy_end:6124c78e｜>"
+  }
+ ]
+}

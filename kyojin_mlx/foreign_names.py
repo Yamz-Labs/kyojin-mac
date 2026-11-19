@@ -54,6 +54,10 @@ class Arch:
     skip_nextn: bool = False              # blocks past the trunk exist in the file (llama.cpp loads them with TENSOR_SKIP) and the mlx-lm class has no use for them
     xform: str = ""                       # name of the converter's transform set (foreign_xform.py)
     config: str = "qwen3"                 # config builder (_CONFIG)
+    layer_prefix: str = "model.layers."   # HF prefix of a trunk block (a class whose sanitize wants `model.language_model.layers.`: GLM-5.3 in mlx-vlm)
+    concat: dict = field(default_factory=dict)    # HF suffix of a tensor the class holds fused -> HF suffixes of the file's parts, row-concatenated in this order (empty: none)
+    unserved: tuple = ()                  # GGUF names the file carries that no loader path serves yet: reading one raises (a tensor is never dropped silently)
+    mapped_rows: dict = field(default_factory=dict)   # GGUF name of a row-gathered table -> suffix of the model-class module that looks rows up in it (foreign_mapped_rows): served only with KYOJIN_MAPPED_ROW_TABLE=1 (else the name stays unserved)
 
 
 _SHEXP = {"ffn_gate_shexp": "mlp.shared_expert.gate_proj", "ffn_up_shexp": "mlp.shared_expert.up_proj", "ffn_down_shexp": "mlp.shared_expert.down_proj",
@@ -131,7 +135,7 @@ def gguf_name(name: str, arch: str, n_trunk: int | None = None) -> str | None:
             raise GF.GgufError(f"GGUF tensor {name!r}: block {i} is past the {n_trunk} trunk blocks and {arch} has no draft head mapping")
         if rest in A.mtp:
             return A.mtp[rest]
-    pre = f"mtp.layers.{i - n_trunk}." if head else f"model.layers.{i}."
+    pre = f"mtp.layers.{i - n_trunk}." if head else f"{A.layer_prefix}{i}."
     if rest in A.exact:
         return pre + A.exact[rest]
     kind, _, sfx = rest.rpartition(".")
@@ -140,11 +144,27 @@ def gguf_name(name: str, arch: str, n_trunk: int | None = None) -> str | None:
     return f"{pre}{A.blk[kind]}.{sfx}"
 
 
+def mapped_row_table() -> bool:
+    """Flag KYOJIN_MAPPED_ROW_TABLE (default 0, read at call): a table of Arch.mapped_rows is served from the mapped file by row id (foreign_mapped_rows)."""
+    return os.environ.get("KYOJIN_MAPPED_ROW_TABLE", "0") not in ("0", "")
+
+
+def mapped_tables(arch: str, names) -> list:
+    """The tensors of `names` that the row's Arch.mapped_rows serves from the mapped file: only with the flag on, else none (they stay in Arch.unserved)."""
+    A = _arch(arch)
+    return sorted(n for n in names if n in A.mapped_rows and n in A.unserved) if mapped_row_table() else []
+
+
+def is_lookup_table(hf: str) -> bool:
+    """A table indexed by token id, never a matrix product: the token embedding and gemma4's per-layer embedding (`embed_tokens_per_layer`, one row of n_layer x hidden_per_layer per token)."""
+    return hf.endswith("embed_tokens.weight") or hf.endswith("embed_tokens_per_layer.weight")
+
+
 def is_linear(hf: str, ndim: int, arch: str) -> bool:
     """A weight matrix the loader may hand to a quantised kernel (not a norm, a router, a convolution or the embedding table)."""
     A = _arch(arch)
     return (hf.endswith(".weight") and ndim >= 2 and not hf.endswith("norm.weight") and not hf.endswith("mlp.gate.weight") and not hf.endswith(A.dense)
-            and not hf.endswith("embed_tokens.weight"))
+            and not is_lookup_table(hf))
 
 
 def n_trunk_of(kv: dict, arch: str) -> int | None:
@@ -181,7 +201,12 @@ def _hint(arch: str) -> str:
 
 
 def _kv_getter(kv, arch):
-    return lambda k, d=None: kv.get(f"{arch}.{k}", d)
+    def get(k, d=None):
+        v = kv.get(f"{arch}.{k}", d)
+        if k in ("expert_count", "expert_used_count") and isinstance(v, (list, tuple)):
+            return GF.kv_count_uniform(v, f"{arch}.{k}")             # array-valued (per-layer) key: one value if uniform, a clear refusal if not
+        return v
+    return get
 
 
 def _cfg_qwen3(g: GF.GgufFile, arch: str) -> dict:
@@ -409,7 +434,7 @@ def gguf_config(g: GF.GgufFile) -> dict:
     if arch not in ARCHS:
         raise GF.GgufError(f"GGUF architecture {arch!r} is not mapped (mapped: {', '.join(ARCHS)}); put the model's config.json next to the file")
     A = ARCHS[arch]
-    return dict(model_type=A.model_type, architectures=list(A.architectures), **_CONFIG[A.config](g, arch))
+    return {"model_type": A.model_type, "architectures": list(A.architectures), **_CONFIG[A.config](g, arch)}     # a row's own model_type wins
 
 
 # ---------------------------------------------------------------------------------------------------------- a GGUF as a servable directory
@@ -571,13 +596,19 @@ def gguf_serve_dir(path: str, cache: str | None = None) -> str:
     try:
         g = GF.GgufFile(src)
         try:
+            arch = g.kv.get("general.architecture")
+            from . import foreign_archkit as _K, foreign_skeleton as _SK
+            skel = arch not in ARCHS and not _K.have(arch) and _SK.enabled() and _SK.has_rows(arch)    # no kit table, skeleton rows on (hy_v4_flash): config from the skeleton spec
+            if arch not in ARCHS and not skel:                                   # no hand-written row: generated llama.cpp tables (foreign_archkit_serve)
+                from .foreign_archkit_serve import register
+                register(src)
             if not os.path.isfile(os.path.join(d, "tokenizer.json")):
                 write_gguf_tokenizer(g.kv, tmp)
             if os.path.isfile(os.path.join(d, "config.json")):
                 shutil.copyfile(os.path.join(d, "config.json"), os.path.join(tmp, "config.json"))
             else:
                 with open(os.path.join(tmp, "config.json"), "w") as fh:
-                    json.dump(gguf_config(g), fh)
+                    json.dump(_SK.serve_config(g) if skel else gguf_config(g), fh)
         finally:
             g.close()
         for f in _SERVE_FILES[1:] + ("generation_config.json",):
@@ -594,3 +625,9 @@ def gguf_serve_dir(path: str, cache: str | None = None) -> str:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
     return out
+
+
+# Rows of the architectures whose rules live in their own module (rows only, no model code): GLM-5.3-Flash `glm5-next` (foreign_glm_gguf).
+from . import foreign_glm_gguf as _glm_rows  # noqa: E402,F401  (registers itself at its end)
+# Qwen3.8-Flash-Next `qwen4exp` (foreign_qwen4exp_gguf): rows live in their own module and register only while KYOJIN_KIT_UNPROVEN_ROWS is on.
+from . import foreign_qwen4exp_gguf as _q4_rows  # noqa: E402,F401  (registers itself at its end)

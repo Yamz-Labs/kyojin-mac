@@ -67,10 +67,29 @@ def render_resume(family, body: dict) -> Rendered:
     r = family.render(body)
     if prefix is None:
         return r
-    if not r.thinking_first or r.prompt.rstrip().endswith("</think>"):
+    if not r.thinking_first or r.prompt.rstrip().endswith(think_tags(family)[1]):
         raise ChatError("continue_final_message: this request does not end inside an open think block (thinking is off?)")
     r.prompt += prefix
     return r
+
+
+def think_tags(family) -> tuple:
+    """(open, close) think tags of a chat family: `think_tags` on the family (Hy4: <think:6124c78e>), else <think> / </think> (qwen, glm, ds41, generic)."""
+    return tuple(getattr(family, "think_tags", None) or ("<think>", "</think>"))
+
+
+def think_token_ids(tokenizer, family) -> tuple | None:
+    """(open id, close id) of the family's think tags when the tokenizer holds each as one token, else None (flag spec_typical_phase)."""
+    ids = []
+    for t in think_tags(family):
+        try:
+            i = tokenizer.convert_tokens_to_ids(t)
+        except Exception:                                                            # noqa: BLE001
+            return None
+        if not isinstance(i, int) or i < 0 or i == getattr(tokenizer, "unk_token_id", None):
+            return None
+        ids.append(i)
+    return tuple(ids)
 
 
 # ------------------------------------------------------------------------------------------------ templates (qwen, glm)
@@ -255,9 +274,14 @@ class Splitter:
     From <tool_call> to </tool_call> everything is held for parse_tool_calls(); text after the close is content again.
     Whitespace at the edges of a piece (the newlines around </think> and <tool_call>) is dropped."""
 
-    def __init__(self, reasoning_first: bool, think_open: bool = False):
+    def __init__(self, reasoning_first: bool, think_open: bool = False, think_tags: tuple = (THINK_OPEN, THINK_CLOSE), tool_tags: dict | None = None):
         self.think_open = think_open                       # the model itself opens the <think> block (SmolLM3 /think, Gemma 4 channel; no <think> in the generation prompt)
-        self.closers = [THINK_CLOSE]
+        self.opens = {think_tags[0]: think_tags[1]}        # think open tag -> its close tag (Hy4: the suffixed tags)
+        if tuple(think_tags) == (THINK_OPEN, THINK_CLOSE):
+            self.opens[CHANNEL_OPEN] = CHANNEL_CLOSE
+        self.tool_tags = dict(tool_tags or {TOOL_OPEN: TOOL_CLOSE})    # tool block open tag -> its close tag
+        self.tool_close = TOOL_CLOSE
+        self.closers = [think_tags[1]]
         self.mode = "reasoning" if reasoning_first else "content"
         self.buf = ""
         self.ws = ""
@@ -265,6 +289,8 @@ class Splitter:
         self.tool_text = ""
         self.tool_from = 0
         self.said = self.after_call = False
+        self.calls = True                                  # False: <tool_call> is plain text (tool_choice none)
+        self.calls_in_reasoning = True                     # False: a <tool_call> inside a think block is reasoning text (GLM)
 
     def _emit(self, seg: str, out: list) -> None:
         seg = self.ws + seg
@@ -288,27 +314,28 @@ class Splitter:
             if self.mode == "tool":
                 self.tool_text += self.buf
                 self.buf = ""
-                end = self.tool_text.find(TOOL_CLOSE, self.tool_from)
+                end = self.tool_text.find(self.tool_close, self.tool_from)
                 if end < 0:
                     return out
-                end += len(TOOL_CLOSE)
+                end += len(self.tool_close)
                 self.buf, self.tool_text = self.tool_text[end:], self.tool_text[:end]
                 self.mode, self.lead, self.after_call = "content", True, True
                 continue
             opens = self.think_open and self.mode == "content" and not self.said and not self.tool_text    # only as the very first thing the model says
-            tags = [TOOL_OPEN] + (self.closers if self.mode == "reasoning" else []) + ([THINK_OPEN, CHANNEL_OPEN] if opens else [])
-            hits = [(self.buf.find(t), t) for t in tags if t in self.buf and (t not in (THINK_OPEN, CHANNEL_OPEN) or not self.buf[:self.buf.find(t)].strip())]
+            tags = (list(self.tool_tags) if self.calls and (self.calls_in_reasoning or self.mode != "reasoning") else []) \
+                + (self.closers if self.mode == "reasoning" else []) + (list(self.opens) if opens else [])
+            hits = [(self.buf.find(t), t) for t in tags if t in self.buf and (t not in self.opens or not self.buf[:self.buf.find(t)].strip())]
             if hits:
                 pos, tag = min(hits)
                 self._emit(self.buf[:pos], out)
                 self.ws = ""
                 self.buf = self.buf[pos + len(tag):]
-                if tag == TOOL_OPEN:
-                    self.mode, self.tool_from = "tool", len(self.tool_text)
-                    self.tool_text += TOOL_OPEN
-                elif tag in (THINK_OPEN, CHANNEL_OPEN):
+                if tag in self.tool_tags:
+                    self.mode, self.tool_from, self.tool_close = "tool", len(self.tool_text), self.tool_tags[tag]
+                    self.tool_text += tag
+                elif tag in self.opens:
                     self.mode, self.lead, self.think_open = "reasoning", True, False
-                    self.closers = [CHANNEL_CLOSE if tag == CHANNEL_OPEN else THINK_CLOSE]
+                    self.closers = [self.opens[tag]]
                 else:
                     self.mode, self.lead = "content", True
                 continue
@@ -604,84 +631,104 @@ class HarmonyFamily(QwenFamily):
 
 
 # ------------------------------------------------------------------------------------------------ glm
-def glm_parse_completion(text: str) -> dict:
-    """Split GLM think blocks and tool calls into OpenAI fields (tools/glm/serve.py parse_completion)."""
-    calls: list = []
-    content_parts: list = []
-    reasoning_parts: list = []
-    cursor = 0
-    pattern = re.compile(re.escape(TOOL_OPEN) + r"(.*?)" + re.escape(TOOL_CLOSE), re.S)
-    for match in pattern.finditer(text):
-        visible = text[cursor:match.start()]
-        if "<think>" in visible:
-            before, after = visible.split("<think>", 1)
-            content_parts.append(before)
-            thinking, _, visible = after.partition("</think>")
-            reasoning_parts.append(thinking)
-        content_parts.append(visible)
-        body = match.group(1)
-        name_match = re.match(r"\s*([^\s<]+)", body)
+_GLM_NAME_RE = re.compile(r"\s*([^\s<]+)")
+GLM_TAG_SUFFIX = ""                                                  # GLM-5: <tool_call> <arg_key> <arg_value> as they are; Hy4: every tag carries HY4_SUFFIX
+_GLM_RES: dict = {}
+
+
+def _glm_res(suffix: str) -> tuple:
+    """(call block regex, key / value regex) of the GLM-shaped tool-call tags with `suffix` ("" = GLM-5, ":6124c78e" = Hy4)."""
+    hit = _GLM_RES.get(suffix)
+    if hit is None:
+        t = lambda name, close=False: re.escape(f"<{'/' if close else ''}{name}{suffix}>")     # noqa: E731
+        hit = _GLM_RES[suffix] = (re.compile(t("tool_call") + r"(.*?)" + t("tool_call", True), re.S),
+                                  re.compile(t("arg_key") + r"(.*?)" + t("arg_key", True) + r"\s*" + t("arg_value") + r"(.*?)" + t("arg_value", True), re.S))
+    return hit
+
+
+def glm_parse_tool_calls(tool_text: str, tools: list | None = None, suffix: str = GLM_TAG_SUFFIX) -> list:
+    """GLM tool calls (<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>, one block per call) to OpenAI tool_calls.
+    A value is typed by the parameter's schema when the request declares the tool (a string parameter keeps its text exactly, "3" stays "3");
+    otherwise it is JSON when it parses and text when not. A block whose close tag never came is not a call. `suffix`: the tag suffix (Hy4)."""
+    schemas = {}
+    for t in tools or []:
+        fn = t.get("function", t)
+        schemas[fn.get("name")] = (fn.get("parameters") or {}).get("properties") or {}
+    call_re, arg_re = _glm_res(suffix)
+    calls = []
+    for body in call_re.findall(tool_text):
+        name_match = _GLM_NAME_RE.match(body)
         if not name_match:
             continue
+        name = name_match.group(1)
+        props = schemas.get(name) or {}
         args: dict = {}
-        for part in re.finditer(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", body, re.S):
-            args[part.group(1).strip()] = _json_value(part.group(2).strip())
+        for k, v in arg_re.findall(body):
+            k = k.strip()
+            schema = props.get(k)
+            args[k] = _coerce(v, schema) if schema else _json_value(v.strip())
         calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
-                      "function": {"name": name_match.group(1), "arguments": json.dumps(args, ensure_ascii=False)}})
-        cursor = match.end()
-    tail = text[cursor:]
-    if "<think>" in tail:
-        before, after = tail.split("<think>", 1)
-        content_parts.append(before)
-        thinking, _, tail = after.partition("</think>")
-        reasoning_parts.append(thinking)
-    content_parts.append(tail)
-    message: dict = {"role": "assistant", "content": "".join(content_parts)}
-    reasoning = "".join(reasoning_parts)
+                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+    return calls
+
+
+def glm_parse_completion(text: str, tools: list | None = None, parser=None) -> dict:
+    """A whole GLM completion (the text after the generation prompt's open <think>, or with its own <think> ...) -> OpenAI message fields.
+    `parser`: another GLM-shaped stream parser (Hy4Parser), default GlmParser(False, True, tools)."""
+    p = parser if parser is not None else GlmParser(False, True, tools)
+    ev = p.feed(text) + p.finish()
+    message: dict = {"role": "assistant", "content": "".join(e[1] for e in ev if e[0] == "content")}
+    reasoning = "".join(e[1] for e in ev if e[0] == "reasoning")
     if reasoning:
         message["reasoning_content"] = reasoning
+    calls = [e for e in ev if e[0] == "tool_start"]
     if calls:
-        message["tool_calls"] = calls
+        args = {e[1]: e[2] for e in ev if e[0] == "tool_args"}
+        message["tool_calls"] = [{"id": e[2], "type": "function", "function": {"name": e[3], "arguments": args.get(e[1], "{}")}} for e in calls]
     return message
 
 
-class GlmParser:
-    """Reasoning and prose stream as they decode; everything from <tool_call> on is held and parsed once at the end
-    (the box GLM server does the same)."""
+class GlmParser(QwenParser):
+    """GLM-5 reply: reasoning up to </think> (reasoning_content), prose (content) and every <tool_call>...</tool_call> block, held and parsed once at
+    the end (one tool_calls entry per block, in order). `<tool_call>` inside a think block is reasoning text; with tool_choice "none" it is content.
+    Edge whitespace (around </think> and the calls) is dropped, as the Qwen parser does."""
 
-    def __init__(self, reasoning_first: bool, parse_tools: bool = True):
-        self.text = "<think>" if reasoning_first else ""
-        self.done = len(self.text)
-        self.mode = "reasoning" if reasoning_first else "content"
-        self.parse_tools = parse_tools
-        self.hold = max(len("</think>"), len(TOOL_OPEN)) - 1
-
-    def _flush(self, final: bool) -> list:
-        out: list = []
-        while self.mode != "tool":
-            tags = ["</think>"] if self.mode == "reasoning" else ["<think>", TOOL_OPEN]
-            hits = [(self.text.find(t, self.done), t) for t in tags if self.text.find(t, self.done) >= 0]
-            end = min(hits)[0] if hits else (len(self.text) if final else max(self.done, len(self.text) - self.hold))
-            piece = self.text[self.done:end]
-            if piece:
-                out.append(("reasoning" if self.mode == "reasoning" else "content", piece))
-            self.done = end
-            if not hits:
-                break
-            pos, tag = min(hits)
-            self.done = pos + len(tag)
-            self.mode = {"</think>": "content", "<think>": "reasoning", TOOL_OPEN: "tool"}[tag]
-        return out
-
-    def feed(self, text: str) -> list:
-        self.text += text
-        return self._flush(False)
+    def __init__(self, reasoning_first: bool, parse_tools: bool = True, tools: list | None = None):
+        super().__init__(reasoning_first, tools, parse_tools, think_open=True)      # think_open: a reply that opens its own <think> (thinking off) is split too
+        self.sp.calls, self.sp.calls_in_reasoning = parse_tools, False
 
     def finish(self) -> list:
-        out = self._flush(True)
+        ev = list(self.sp.finish())
         if self.parse_tools:
-            out += _complete_calls(0, glm_parse_completion(self.text).get("tool_calls", []))
-        return out
+            ev += _complete_calls(0, glm_parse_tool_calls(self.sp.tool_text, self.tools))
+        return ev
+
+
+def _glm_messages(messages):
+    """OpenAI messages -> what the GLM template reads: `reasoning` (the OpenRouter spelling) read as reasoning_content, tool-call arguments as objects."""
+    if not isinstance(messages, list):
+        return messages
+    out = []
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "assistant":
+            m = dict(m)
+            if not isinstance(m.get("reasoning_content"), str) and isinstance(m.get("reasoning"), str):
+                m["reasoning_content"] = m["reasoning"]
+            if m.get("tool_calls"):
+                calls = []
+                for c in m["tool_calls"]:
+                    fn = dict(c.get("function") or {})
+                    args = fn.get("arguments")
+                    if isinstance(args, str):
+                        args = _json_value(args) if args.strip() else {}
+                    if args is None:
+                        args = {}
+                    if not isinstance(args, dict):
+                        raise ChatError("tool_calls: function.arguments must be a JSON object")
+                    calls.append(dict(c, function=dict(fn, arguments=args)))
+                m["tool_calls"] = calls
+        out.append(m)
+    return out
 
 
 class GlmFamily:
@@ -689,9 +736,32 @@ class GlmFamily:
     DEFAULTS = {"reasoning_effort": "medium"}
 
     def __init__(self, tokenizer, model_dir: str, template: str | None = None, defaults: dict | None = None):
-        path = Path(model_dir) / "chat_template.jinja"
         self.template = template or (ASSETS / "glm53-template-medium.jinja").read_text()
         self.defaults = {**self.DEFAULTS, **(defaults or {})}
+
+    def _options(self, body: dict, ctk: dict) -> tuple[bool, Any]:
+        """(thinking, reasoning effort) of a request, read like the DS4.1 family reads Hermes: chat_template_kwargs, then body fields, then `reasoning`
+        ({"enabled", "effort"}), then the server default. `thinking` / `enable_thinking` are a bool or {"type": "enabled"|"disabled"};
+        reasoning_effort "none" turns thinking off. The GLM template knows low / high (anything else renders as max, medium is this server's own level)."""
+        try:
+            effort = ctk.get("reasoning_effort")
+            if effort is None:
+                effort = body.get("reasoning_effort")
+            r_switch, r_effort = ds41_chat._reasoning_object(body)
+            if effort is None:
+                effort = r_effort
+            thinking = ds41_chat._switch(ctk)
+            if thinking is None:
+                thinking = ds41_chat._switch(body)
+        except ds41_chat.ChatFormatError as e:
+            raise ChatError(str(e)) from None
+        if thinking is None:
+            thinking = r_switch
+        if thinking is None:
+            thinking = False if effort == "none" else bool(self.defaults.get("thinking", True))
+        if effort in (None, "none") or not isinstance(effort, str):
+            effort = self.defaults["reasoning_effort"]
+        return thinking, {"minimal": "low"}.get(effort, effort)
 
     def render(self, body: dict) -> Rendered:
         tools = body.get("tools")
@@ -702,18 +772,132 @@ class GlmFamily:
         if not isinstance(ctk, dict):
             raise ChatError("chat_template_kwargs must be an object")
         pick = lambda key, default=None: ctk[key] if ctk.get(key) is not None else body.get(key, default)   # noqa: E731
+        thinking, effort = self._options(body, ctk)
         kw = {"clear_thinking": pick("clear_thinking")}
-        effort = pick("reasoning_effort", self.defaults["reasoning_effort"])
         if effort is not None:
             kw["reasoning_effort"] = effort
         if pick("effort_guidance", os.environ.get("KYOJIN_EFFORT_GUIDANCE") == "1"):   # opt-in medium guidance text, off by default
             kw["effort_guidance"] = True
-        prompt = render_jinja(self.template, body.get("messages"), tools, **kw)
-        cuts = jinja_cut_texts(self.template, body.get("messages"), tools, prompt, **kw)
+        messages = _glm_messages(body.get("messages"))
+        prompt = render_jinja(self.template, messages, tools, **kw)
+        cuts = jinja_cut_texts(self.template, messages, tools, prompt, **kw)
+        if not thinking and prompt.endswith("<think>"):          # the template always opens a think block: close it empty (how it renders earlier turns)
+            prompt += "</think>"
         return Rendered(prompt, prompt.rstrip().endswith("<think>"), parse_tools, tools, cut_texts=cuts)
 
     def parser(self, r: Rendered):
-        return GlmParser(r.thinking_first, r.parse_tools)
+        return GlmParser(r.thinking_first, r.parse_tools, r.tools)
+
+
+# ------------------------------------------------------------------------------------------------ hy4 (Hy4-flash, GGUF hy_v4_flash)
+HY4_SUFFIX = ":6124c78e"                                             # every control tag of the Hy4 template carries it; each tag is one token
+HY4_THINK_OPEN, HY4_THINK_CLOSE = f"<think{HY4_SUFFIX}>", f"</think{HY4_SUFFIX}>"              # 120029 / 120030
+HY4_CALLS_OPEN, HY4_CALLS_CLOSE = f"<tool_calls{HY4_SUFFIX}>", f"</tool_calls{HY4_SUFFIX}>"    # 120035 / ..
+HY4_CALL_OPEN, HY4_CALL_CLOSE = f"<tool_call{HY4_SUFFIX}>", f"</tool_call{HY4_SUFFIX}>"        # 120033 / ..
+HY4_END = f"<｜hy_end{HY4_SUFFIX}｜>"                                 # 120025: end of every turn, the file's eos (llama.cpp special_eog_ids = {it})
+HY4_EFFORTS = ("no_think", "low", "high", "max")                     # what the template accepts (any other value raises in it)
+HY4_EFFORT_ALIASES = {"none": "no_think", "minimal": "low", "medium": "high", "xhigh": "max"}   # OpenAI / Hermes spellings -> the template's
+
+
+class Hy4Parser(GlmParser):
+    """Hy4-flash reply: GlmParser with the suffixed tags. Reasoning up to </think:6124c78e>, then content; the <tool_calls:6124c78e> ...
+    </tool_calls:6124c78e> block (or a bare <tool_call:6124c78e> block when the model leaves the wrapper out) is held and parsed once at the end,
+    one tool_calls entry per <tool_call:6124c78e> in it."""
+
+    def __init__(self, reasoning_first: bool, parse_tools: bool = True, tools: list | None = None):
+        QwenParser.__init__(self, reasoning_first, tools, parse_tools)
+        self.sp = Splitter(reasoning_first, think_open=True, think_tags=(HY4_THINK_OPEN, HY4_THINK_CLOSE),
+                           tool_tags={HY4_CALLS_OPEN: HY4_CALLS_CLOSE, HY4_CALL_OPEN: HY4_CALL_CLOSE})
+        self.sp.calls, self.sp.calls_in_reasoning = parse_tools, False
+
+    def finish(self) -> list:
+        ev = list(self.sp.finish())
+        if self.parse_tools:
+            ev += _complete_calls(0, glm_parse_tool_calls(self.sp.tool_text, self.tools, HY4_SUFFIX))
+        return ev
+
+
+def hy4_parse_completion(text: str, tools: list | None = None, reasoning_first: bool = True) -> dict:
+    """A whole Hy4 completion (by default the text after the generation prompt's open <think:6124c78e>) -> OpenAI message fields."""
+    return glm_parse_completion(text, tools, Hy4Parser(reasoning_first, True, tools))
+
+
+class Hy4Family:
+    """Hy4-flash: the GGUF's own tokenizer.chat_template (tokenizer_config.json of the serve directory), rendered as transformers does.
+    Reasoning: the template's `reasoning_effort` no_think / low / high / max (default: left to the template, which picks high); thinking off
+    (enable_thinking / thinking false, reasoning_effort none, reasoning.enabled false) = no_think. Tool calls are GLM-shaped with suffixed tags."""
+    name = "hy4"
+    think_tags = (HY4_THINK_OPEN, HY4_THINK_CLOSE)
+
+    def __init__(self, tokenizer, model_dir: str, template: str | None = None, defaults: dict | None = None):
+        cfg = Path(model_dir) / "tokenizer_config.json"
+        self.template = template or getattr(tokenizer, "chat_template", None) or (json.loads(cfg.read_text()).get("chat_template") if cfg.is_file() else None)
+        if not isinstance(self.template, str) or not self.template:
+            raise ChatError(f"no chat template in {model_dir}")
+        self.defaults = dict(defaults or {})
+        self.vision = None
+
+    def _effort(self, value: Any, where: str) -> str:
+        e = HY4_EFFORT_ALIASES.get(value, value) if isinstance(value, str) else value
+        if e not in HY4_EFFORTS:
+            raise ChatError(f"{where}: {value!r}, should be no_think / low / high / max")
+        return e
+
+    def options(self, body: dict) -> dict:
+        """The template kwargs of a request: chat_template_kwargs, then body fields, then `reasoning` ({"enabled", "effort"}), then the server
+        defaults. `preserved_thinking` (or its negation `clear_thinking`) passes through; the template defaults it to `tools` being declared."""
+        ctk = body.get("chat_template_kwargs") or {}
+        if not isinstance(ctk, dict):
+            raise ChatError("chat_template_kwargs must be an object")
+        try:
+            thinking = ds41_chat._switch(ctk)
+            if thinking is None:
+                thinking = ds41_chat._switch(body)
+        except ds41_chat.ChatFormatError as e:
+            raise ChatError(str(e)) from None
+        pick = lambda key: ctk[key] if ctk.get(key) is not None else body.get(key)     # noqa: E731
+        effort = pick("reasoning_effort")
+        r = body.get("reasoning")
+        if r is not None and not isinstance(r, dict):
+            raise ChatError("reasoning must be an object")
+        r = r or {}
+        if thinking is None and isinstance(r.get("enabled"), bool):
+            thinking = r["enabled"]
+        if effort is None and HY4_EFFORT_ALIASES.get(r.get("effort"), r.get("effort")) in HY4_EFFORTS:    # an unknown reasoning.effort is ignored, never a 400
+            effort = r["effort"]
+        if thinking is None:
+            thinking = ds41_chat._switch(self.defaults)
+        if effort is None:
+            effort = self.defaults.get("reasoning_effort")
+        kw: dict = {}
+        if effort is not None:
+            kw["reasoning_effort"] = self._effort(effort, "reasoning_effort")
+        if thinking is False:
+            kw["reasoning_effort"] = "no_think"
+        elif thinking is True and kw.get("reasoning_effort") == "no_think":     # thinking asked for explicitly: the template's default level
+            kw.pop("reasoning_effort")
+        keep = pick("preserved_thinking")
+        if keep is None and pick("clear_thinking") is not None:
+            keep = not pick("clear_thinking")
+        if keep is not None:
+            if not isinstance(keep, bool):
+                raise ChatError("preserved_thinking / clear_thinking must be boolean")
+            kw["preserved_thinking"] = keep
+        return kw
+
+    def render(self, body: dict) -> Rendered:
+        tools = body.get("tools")
+        parse_tools = body.get("tool_choice") != "none"
+        if not parse_tools:
+            tools = None
+        kw = self.options(body)
+        messages = _glm_messages(body.get("messages"))
+        prompt = render_jinja(self.template, messages, tools, **kw)
+        cuts = jinja_cut_texts(self.template, messages, tools, prompt, **kw)
+        return Rendered(prompt, prompt.endswith(HY4_THINK_OPEN), parse_tools, tools, {"reasoning_effort": kw.get("reasoning_effort", "high")}, cut_texts=cuts)
+
+    def parser(self, r: Rendered):
+        return Hy4Parser(r.thinking_first, r.parse_tools, r.tools)
 
 
 # ------------------------------------------------------------------------------------------------ ds41
@@ -826,7 +1010,8 @@ class GenericFamily(QwenFamily):
         return Rendered(prompt, False, False, tools, cut_texts=cuts)
 
 
-FAMILIES = {"qwen": QwenFamily, "glm": GlmFamily, "ds41": Ds41Family, "generic": GenericFamily, "jinja": JinjaFamily, "harmony": HarmonyFamily}
+FAMILIES = {"qwen": QwenFamily, "glm": GlmFamily, "ds41": Ds41Family, "generic": GenericFamily, "jinja": JinjaFamily, "harmony": HarmonyFamily, "hy4": Hy4Family}
+GGUF_ARCH_FAMILIES = {"hy_v4_flash": "hy4"}                          # a serve dir whose config.json names this gguf_architecture gets that family
 
 
 def family_of_gguf(model_type: str) -> str:

@@ -15,6 +15,8 @@ class's cost with the real overlap (a single-dispatch profile over-prices small 
     attn        attention core (kv write, compressor, indexer, attend) -> zeros, cache untouched    dsv4_core.core, fuse_attn.core
     idx         indexer only -> fixed first-k positions                                             dsv4_core.core (the idx_short form of the selection)
     ablit       decensor projection -> identity                                                     ablit.project
+    attn_proj attn_core attn_out mlp hc engram head   and attn / idx / norm / router / moe_routed / moe_shared on the generic decoder skeleton (Hy4, GLM, kit models):
+                structural stand-ins found by layer structure, see ablate_struct.py (installed from foreign_skeleton.Model.__call__)
 
 `mhc` and `norm` route the decode block through the stock chain (fuse_layer), because the fused stage paths (decstage, glue_fuse, suglue, the compiled
 regions) fold those ops into their own kernels and have no stand-in; ops folded inside other kernels (the kv_chain / qkv_stage norm, the router GEMV of the
@@ -28,7 +30,8 @@ from collections import Counter
 import mlx.core as mx
 
 ENV = "KYOJIN_ABLATE"
-CLASSES = ("moe_routed", "moe_shared", "router", "moe_glue", "mhc", "norm", "attn", "idx", "ablit")
+CLASSES = ("moe_routed", "moe_shared", "router", "moe_glue", "mhc", "norm", "attn", "idx", "ablit",
+           "attn_proj", "attn_core", "attn_out", "mlp", "hc", "engram", "head")      # the last seven: ablate_struct.py (generic decoder skeleton)
 _CHAINED = frozenset(("mhc", "norm"))                      # classes whose stand-ins live in the stock chain only: the fused block paths step aside
 HITS: Counter = Counter()                                  # stand-in executions per class (python side: counts graph builds, not launches)
 _const: dict = {}

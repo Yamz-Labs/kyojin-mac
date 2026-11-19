@@ -207,7 +207,11 @@ def _run_shape(shape, d, res, fail) -> Result:
     res.numbers.update(k)
     if not (k["disk_hit_at"] > 0 and k["disk_bitwise"]):
         fail(f"disk: {k}")
-    if shape.family == "ds":
+    if shape.family == "ds" and archs.arch_of(shape.config).ced is None:      # GLM-5.3: no encoder / decoder split described, CED is not a cell of this shape
+        res.numbers["ced_supported"] = False
+        if shape.ced:
+            fail("shape says ced=True but its architecture has no CedSpec")
+    elif shape.family == "ds":
         from . import ced as C
         why = C.explain(lm.config)
         res.numbers["ced_supported"] = why is None

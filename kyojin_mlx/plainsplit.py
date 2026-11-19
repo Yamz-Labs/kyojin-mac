@@ -61,7 +61,7 @@ ZERO = dict(beg=0.0, fin=0.0, busy=0.0, n=0, nd=0, gsum=0.0, gaps=0, idleh=0.0, 
 
 def on() -> bool:
     """Read per call (flag `plain_split`), like the other serve probes."""
-    return os.environ.get("KYOJIN_PLAIN_SPLIT", "0") not in ("0", "")
+    return os.environ.get("KYOJIN_PLAIN_SPLIT", "0") not in ("0", "") or os.environ.get("KYOJIN_DECODE_TRACE", "0") not in ("0", "")   # decode_trace (g13): the same probe on the d0 decode tick
 
 
 def _clk() -> float:
@@ -155,16 +155,19 @@ class Tick:
         self.plan = (self.t0 - _round[0]) * 1e3 if (_round[0] and _round[1] == self.seq) else -1.0
         self.marks = {"start": self.t0}
         self.ae = [0.0, 0.0, 0]                              # async_eval: wall, thread CPU, calls (inside the build)
+        self.ael = []                                        # hostgap: (start ms since the tick's start, wall ms) of every async_eval call
         self.tl = [0.0, 0.0, 0]                              # tolist: wall, thread CPU, calls (inside consume)
         self._saved = (mx.async_eval, mx.array.tolist)
         aev, tl = self._saved
-        ae, tlacc = self.ae, self.tl
+        ae, tlacc, ael, t0c = self.ae, self.tl, self.ael, self.t0
 
         def ae_(*a, **k):
             t, c = time.perf_counter(), time.thread_time()
+            ts_ = _clk()
             try:
                 return aev(*a, **k)
             finally:
+                ael.append((round((ts_ - t0c) * 1e3, 3), round((time.perf_counter() - t) * 1e3, 3)))
                 ae[0] += time.perf_counter() - t
                 ae[1] += time.thread_time() - c
                 ae[2] += 1
@@ -207,7 +210,7 @@ class Tick:
              "prev_busy": 0.0, "prev_n": 0, "prev_resid": 0.0, "overlap": 0.0,
              "cur_start": 0.0, "cur_end": 0.0, "cur_busy": 0.0, "cur_sum": 0.0,
              "cur_n": 0, "cur_nd": 0, "cur_gaps": 0, "cur_idleh": 0.0, "cur_idleq": 0.0,
-             "starve": 0.0, "busy_close": 0.0, "n_close": 0}
+             "starve": 0.0, "busy_close": 0.0, "n_close": 0, "ael": self.ael[:40]}
         ct = ctypes.c_double()
         if s1 > self.s0:
             C.cb_commit_time(self.s0, ct)

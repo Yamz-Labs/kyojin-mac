@@ -78,6 +78,21 @@ def report() -> dict:
     return dict(HITS)
 
 
+POOL_PARAMS = frozenset(("wkv", "wgate", "norm"))             # the only parameters the vectorized pooling reproduces (pool = softmax-weighted sum of wkv rows by wgate scores, then norm)
+POOL_ATTRS = ("wkv", "wgate", "norm", "head_dim", "layer_idx", "_grow_state")
+
+
+def pool_ok(mod) -> bool:
+    """Capability test of the hook (was: class name only). The pooling is written for a compressor that is exactly wkv / wgate / norm over non-overlapping groups with fp32
+    kv_state / score_state; a module that has any other parameter (a positional `ape` added to the scores, ...), an overlap / rotate switch, or lacks one of the parts
+    would be pooled with the wrong math, so it keeps its own __call__."""
+    if int(getattr(mod, "compress_ratio", 1)) <= 1 or not all(hasattr(mod, a) for a in POOL_ATTRS):
+        return False
+    if getattr(mod, "overlap", False) or getattr(mod, "rotate", False):
+        return False
+    return set(dict(mod.parameters()).keys()) <= POOL_PARAMS
+
+
 def install(model) -> int:
     """Use the vectorized pooling in every ratio > 1 compressor of `model` (patched mlx-vlm model or its language model). Idempotent. Returns how many
     compressors it armed."""
@@ -85,7 +100,7 @@ def install(model) -> int:
     lm = getattr(model, "language_model", model)
     n = 0
     for _, mod in lm.named_modules():
-        if type(mod).__name__ == "Compressor" and getattr(mod, "compress_ratio", 1) > 1 and not getattr(type(mod), FLAG, False):
+        if type(mod).__name__ == "Compressor" and getattr(mod, "compress_ratio", 1) > 1 and not getattr(type(mod), FLAG, False) and pool_ok(mod):
             _override(mod, "__call__", _pool_call)
             type(mod)._kyojin_pf_pool = True                  # on the per-instance subclass _override made: a second install skips it
             n += 1

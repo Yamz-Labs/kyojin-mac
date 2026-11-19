@@ -4,7 +4,7 @@
 Active params (2 x params x tokens = matmul FLOPs, attention FLOPs not counted) come from the GGUF metadata, or --params for a pack dir.
 Prints tok/s, TFLOPS and % of peak per length; texts of the last-row argmax are printed so arms compare."""
 from hashlib import md5
-import argparse, os, sys, time
+import argparse, os, re, sys, time
 import numpy as np, mlx.core as mx
 
 def peak():
@@ -22,10 +22,11 @@ def active_params(path):
     from kyojin_mlx.foreign_gguf import GgufFile, find_gguf
     g = GgufFile(find_gguf(path)); tot = 0.0
     ne = next((v for k, v in g.kv.items() if k.endswith(".expert_count")), 0); nu = next((v for k, v in g.kv.items() if k.endswith(".expert_used_count")), 0)
+    at = lambda v, n: (v[int(m.group(1))] if (m := re.match(r"blk\.(\d+)\.", n)) and int(m.group(1)) < len(v) else max(v or [0])) if isinstance(v, (list, tuple)) else v   # scalar or per-layer array
     for n, t in g.tensors.items():
         if "token_embd" in n or len(t.ne) < 2: continue
         e = float(np.prod(t.ne))
-        tot += e * nu / ne if len(t.ne) == 3 and "_exps" in n else e
+        tot += e * at(nu, n) / at(ne, n) if len(t.ne) == 3 and "_exps" in n else e
     return tot
 
 if __name__ == "__main__":

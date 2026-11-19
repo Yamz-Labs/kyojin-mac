@@ -153,12 +153,14 @@ class MoeGather:
 
     def __init__(self, gate: Stack, up: Stack, down: Stack, topk: int, limit: float = 10.0, wpre: bool = False, fq: bool = False,
                  tgk_gu: int | None = None, tgk_dn: int | None = None, alpha: float = 1.0, beta: float = 0.0,
-                 union: bool = False, pin_rows: int | None = None, grouped: bool | None = None, hotk: int | None = None):
+                 union: bool = False, pin_rows: int | None = None, grouped: bool | None = None, hotk: int | None = None, act: str = "swiglu"):
         """union: pairs routed to the same expert share one decode of its trellis (multi-user decode, rows >= 2); per-pair
         results are bit-identical to the plain gather path. Measured on the Air (N = 4): a win only when more than about half of the
         routed pairs are shared (x1.1 at 50 %, x1.7 at 100 %), 10-20 % slower with independent users, so it is opt-in. pin_rows: choose the k-split (tgk) as if the call had that many rows,
         so a row's result does not depend on how many users share the step (multi-user: pin_rows=1 equals the solo call)."""
         self.alpha, self.beta = float(alpha), float(beta)
+        assert act in S.ACT_KINDS, act
+        self.act = act                                                # activation kind of mid (metal_src.ACT_KINDS)
         self.union, self.pin_rows = union, pin_rows
         self.grouped = GROUPED if grouped is None else grouped
         self.hotk = HOTK if hotk is None else hotk                       # groups of >= hotk rows take the NAX GEMM (rounding-class), 0 = GEMV only (bitwise)
@@ -203,7 +205,7 @@ class MoeGather:
         """Kernel of one stage for this layer, built once: the python side of a decode step must not regenerate Metal source text."""
         k = self._kn.get((tag, key))
         if k is None:
-            k = self._kn[(tag, key)] = _kernel((tag, key, self.limit, self.wpre, self.fq, self.alpha, self.beta, self.cb), name=name, input_names=input_names,
+            k = self._kn[(tag, key)] = _kernel((tag, key, self.limit, self.wpre, self.fq, self.alpha, self.beta, self.act, self.cb), name=name, input_names=input_names,
                                                output_names=output_names, source=make_source)
         return k
 
@@ -382,9 +384,9 @@ class MoeGather:
 
     def mid_hot(self, part: mx.array, yn: mx.array, ids: mx.array, wts: mx.array, hrow: mx.array, hinfo: mx.array, rows: int):
         P = self._params(rows)
-        kern = _kernel(("midh", self.limit, self.wpre, self.fq, self.alpha, self.beta), name=f"kyojin_midh_{int(self.wpre)}{int(self.fq)}_{len(_kc)}",
+        kern = _kernel(("midh", self.limit, self.wpre, self.fq, self.alpha, self.beta, self.act), name=f"kyojin_midh_{int(self.wpre)}{int(self.fq)}_{len(_kc)}",
                        input_names=["part", "yn", "ids", "wts", "svh0", "svh1", "suhd", "hrow", "hinfo", "params"], output_names=["xh2", "A2"],
-                       source=S.mid_hot_source(self.limit, self.wpre, self.fq, self.alpha, self.beta))
+                       source=S.mid_hot_source(self.limit, self.wpre, self.fq, self.alpha, self.beta, self.act))
         grid, tg = S.had_grid(self.g.nout // 128, P["npairs"])
         return kern(inputs=[part, yn, ids, wts, self.g.svh, self.u.svh, self.d.suh, hrow, hinfo, P["mid"]], grid=grid, threadgroup=tg,
                     output_shapes=[(P["npairs"], self.g.nout)] * 2, output_dtypes=[mx.float32, mx.float16])
@@ -431,9 +433,9 @@ class MoeGather:
         P = self._params(rows)
         kern = self._kn.get(("mid", half))
         if kern is None:
-            kern = self._kn[("mid", half)] = _kernel(("mid", self.limit, self.wpre, self.fq, self.alpha, self.beta, half), name=f"kyojin_mid_{int(self.wpre)}{int(self.fq)}{'_hx' if half else ''}_{len(_kc)}",
+            kern = self._kn[("mid", half)] = _kernel(("mid", self.limit, self.wpre, self.fq, self.alpha, self.beta, half, self.act), name=f"kyojin_mid_{int(self.wpre)}{int(self.fq)}{'_hx' if half else ''}_{len(_kc)}",
                                                   input_names=["part", "ids", "wts", "svh0", "svh1", "suhd", "params"], output_names=["xh2"],
-                                                  source=lambda: (S.mid_half_source if half else S.mid_source)(self.limit, self.wpre, self.fq, self.alpha, self.beta))
+                                                  source=lambda: (S.mid_half_source if half else S.mid_source)(self.limit, self.wpre, self.fq, self.alpha, self.beta, self.act))
         gt = P.get("hg_mid")
         if gt is None:
             gt = P["hg_mid"] = S.had_grid(self.g.nout // 128, P["npairs"])
@@ -483,7 +485,7 @@ class MoeGather:
 
     # ---- moe_chain: mid in the tail of the gate/up GEMV, the combine in the tail of the down GEMV (bit-identical, 3 launches per layer)
     def chain_ok(self) -> bool:
-        return CHAIN and not self.union and not KSPLIT and self.topk <= 8 and self.cbg == self.cb      # verified codebooks only (not the affine fold mul1af)
+        return CHAIN and not self.union and not KSPLIT and self.topk <= S.CHAIN_TOPK_MAX and self.cbg == self.cb      # verified codebooks only (not the affine fold mul1af)
 
     def _chain_ctr(self, rows: int):
         P = self._params(rows)
@@ -503,7 +505,7 @@ class MoeGather:
         key = (tag, ks, cbf, pf, pf2) + key_extra
         kern = self._kn.get(("chain", key))
         if kern is None:
-            kern = self._kn[("chain", key)] = _kernel(("chain", key, self.limit, self.wpre, self.fq, self.alpha, self.beta, self.cb, self.topk), name=f"kyojin_ch{tag}_{cbf}_{'_'.join(map(str, ks))}_{abs(hash(key)) % 10**8}",
+            kern = self._kn[("chain", key)] = _kernel(("chain", key, self.limit, self.wpre, self.fq, self.alpha, self.beta, self.act, self.cb, self.topk), name=f"kyojin_ch{tag}_{cbf}_{'_'.join(map(str, ks))}_{abs(hash(key)) % 10**8}",
                                                       input_names=names, output_names=outs, source=lambda: make_source(pf, pf2, cbf))
         return kern
 
@@ -516,7 +518,7 @@ class MoeGather:
         if t128:
             FD.hit("gather_roof")
         kern = self._chain_kern("gu", (self.g, self.u), self.ks_gu, 2, ["part", "xh2"], ["wts", "svh0", "svh1", "suhd", "ctr"],
-                                lambda pf, pf2, cbf: S.chain_gu_source(self.ks_gu, cbf, pf, pf2, self.g.blocks, self.limit, self.wpre, self.fq, self.alpha, self.beta, shared_skip, t128),
+                                lambda pf, pf2, cbf: S.chain_gu_source(self.ks_gu, cbf, pf, pf2, self.g.blocks, self.limit, self.wpre, self.fq, self.alpha, self.beta, shared_skip, t128, self.act),
                                 (shared_skip,) + (("t128",) if t128 else ()))
         ins = [xh, ids, s0.bound, s1.bound, s0.offset, s1.offset, s0.k, s1.k, P["gemv_gu"], wts, self.g.svh, self.u.svh, self.d.suh, self._chain_ctr(rows)[0]]
         return kern(inputs=ins, grid=(s0.blocks * 256, P["tgu"], 2 * npairs), threadgroup=(128 if t128 else 256, 1, 1),
@@ -533,7 +535,7 @@ class MoeGather:
         tgu = P["tgu"]
         kern = self._chain_kern("guf", (self.g, self.u), self.ks_gu, 2, ["part", "xh2"], ["wts", "svh0", "svh1", "suhd", "ctr", "suh0", "suh1"],
                                 lambda pf, pf2, cbf: S.chain_gu_fx_source(self.ks_gu, cbf, pf, pf2, self.g.blocks, self.limit, self.wpre, self.fq, self.alpha, self.beta, None,
-                                                                          self.g.kt, tgu, self.topk, fq8), (fq8, self.g.kt, tgu, self.topk))
+                                                                          self.g.kt, tgu, self.topk, fq8, self.act), (fq8, self.g.kt, tgu, self.topk))
         npairs = P["npairs"]
         ins = [x, ids, s0.bound, s1.bound, s0.offset, s1.offset, s0.k, s1.k, P["gemv_gu"], wts, self.g.svh, self.u.svh, self.d.suh, self._chain_ctr(rows)[0], self.g.suh, self.u.suh]
         return kern(inputs=ins, grid=(s0.blocks * 256, tgu, 2 * npairs), threadgroup=(256, 1, 1),
@@ -596,15 +598,21 @@ def swiglu_ref(g: mx.array, u: mx.array, limit: float, alpha: float = 1.0, beta:
     return g * mx.sigmoid(g * alpha) * (u + beta)
 
 
+def situ_ref(g: mx.array, u: mx.array, beta: float, lin_beta: float) -> mx.array:
+    """fp32, op by op: SiTU-GLU = beta * tanh(g / beta) * sigmoid(g) * (lin_beta * tanh(u / lin_beta)); no clamp."""
+    return (beta * mx.tanh(g / beta) * mx.sigmoid(g)) * (lin_beta * mx.tanh(u / lin_beta))
+
+
 class MoeUnfused:
     """Reference / baseline: per routed expert and projection a `Mul1Gemv` (rot, GEMV, finalize; f32 out), swiglu with mlx ops,
     host read of the router ids. Same tgk as the fused path gives bit-identical partials."""
 
     def __init__(self, gate: Stack, up: Stack, down: Stack, topk: int, limit: float = 10.0, wpre: bool = False, fq: bool = False,
-                 tgk_gu: int | None = None, tgk_dn: int | None = None, alpha: float = 1.0, beta: float = 0.0):
+                 tgk_gu: int | None = None, tgk_dn: int | None = None, alpha: float = 1.0, beta: float = 0.0, act: str = "swiglu"):
         self.g, self.u, self.d, self.topk, self.limit, self.wpre, self.fq = gate, up, down, topk, float(limit), wpre, fq
         self.tgk_gu, self.tgk_dn = tgk_gu, tgk_dn
         self.alpha, self.beta = float(alpha), float(beta)
+        self.act = act
         self._lin: dict = {}
 
     def _gemv(self, st: Stack, name: str, e: int, tgk: int | None) -> KN.Mul1Gemv:
@@ -628,7 +636,7 @@ class MoeUnfused:
                 e = ids_h[r][j]
                 g = self._gemv(self.g, "g", e, tgu)(xr)
                 u = self._gemv(self.u, "u", e, tgu)(xr)
-                a = swiglu_ref(g, u, self.limit, self.alpha, self.beta)
+                a = situ_ref(g, u, self.alpha, self.beta) if self.act == "situ" else swiglu_ref(g, u, self.limit, self.alpha, self.beta)
                 w = wts[r, j]
                 if self.wpre:
                     a = a * w

@@ -1,0 +1,7153 @@
+{
+"label": "DeepSeek-V4.1-Flash-1017 UD-Q4_K_XL shards 1-9 (header range reads)",
+"tensors_per_shard": [
+0,
+20,
+20,
+20,
+20,
+20,
+20,
+1,
+922
+],
+"kv_keys": [
+"general.architecture",
+"general.type",
+"general.name",
+"general.version",
+"general.basename",
+"general.size_label",
+"general.license",
+"general.tags",
+"deepseek41.block_count",
+"deepseek41.context_length",
+"deepseek41.embedding_length",
+"deepseek41.attention.head_count",
+"deepseek41.attention.head_count_kv",
+"deepseek41.rope.scaling.type",
+"deepseek41.rope.scaling.factor",
+"deepseek41.rope.scaling.original_context_length",
+"deepseek41.rope.scaling.yarn_beta_fast",
+"deepseek41.rope.scaling.yarn_beta_slow",
+"deepseek41.rope.freq_base",
+"deepseek41.attention.layer_norm_rms_epsilon",
+"deepseek41.expert_count",
+"deepseek41.expert_used_count",
+"deepseek41.expert_gating_func",
+"deepseek41.attention.key_length",
+"deepseek41.attention.value_length",
+"general.file_type",
+"deepseek41.rope.dimension_count",
+"deepseek41.attention.q_lora_rank",
+"deepseek41.attention.sliding_window",
+"deepseek41.expert_feed_forward_length",
+"deepseek41.expert_shared_count",
+"deepseek41.expert_weights_scale",
+"deepseek41.expert_weights_norm",
+"deepseek41.swiglu_clamp_exp",
+"deepseek41.swiglu_clamp_shexp",
+"deepseek41.attention.indexer.head_count",
+"deepseek41.attention.indexer.key_length",
+"deepseek41.attention.indexer.top_k",
+"deepseek41.attention.output_group_count",
+"deepseek41.attention.output_lora_rank",
+"deepseek41.attention.compress_ratios",
+"deepseek41.attention.compress_rope_freq_base",
+"deepseek41.hyper_connection.count",
+"deepseek41.hyper_connection.sinkhorn_iterations",
+"deepseek41.hyper_connection.epsilon",
+"deepseek41.embedding_length_out",
+"deepseek41.attention.kv_source_layers",
+"deepseek41.attention.indexer.source_layers",
+"deepseek41.attention.indexer.candidate_source_layer",
+"deepseek41.attention.indexer.candidate_top_k_blocks",
+"deepseek41.attention.indexer.candidate_block_size",
+"deepseek41.ple.layers",
+"deepseek41.ple.ngram_size",
+"deepseek41.ple.heads_per_ngram",
+"deepseek41.embedding_length_per_layer_input",
+"deepseek41.ple.layer_multipliers",
+"deepseek41.ple.head_offsets",
+"deepseek41.ple.head_vocab_sizes",
+"deepseek41.hash_layer_count",
+"deepseek41.engram.vocab_size",
+"deepseek41.engram.pad_token_id",
+"deepseek41.engram.compressed_vocab_size",
+"deepseek41.engram.token_map",
+"deepseek41.dspark.block_size",
+"deepseek41.dspark.noise_token_id",
+"deepseek41.dspark.target_layers",
+"deepseek41.dspark.markov_rank",
+"deepseek41.dspark.expert_count",
+"deepseek41.dspark.expert_used_count",
+"general.quantization_version",
+"tokenizer.ggml.model",
+"tokenizer.ggml.pre",
+"tokenizer.ggml.tokens",
+"tokenizer.ggml.token_type",
+"tokenizer.ggml.merges",
+"tokenizer.ggml.bos_token_id",
+"tokenizer.ggml.eos_token_id",
+"tokenizer.ggml.padding_token_id",
+"tokenizer.ggml.add_bos_token",
+"tokenizer.ggml.add_eos_token",
+"general.quantized_by",
+"general.repo_url",
+"general.sampling.temp",
+"general.sampling.top_p",
+"general.base_model.count",
+"general.base_model.0.name",
+"general.base_model.0.organization",
+"general.base_model.0.repo_url",
+"split.no",
+"split.count",
+"split.tensors.count",
+"tokenizer.chat_template"
+],
+"kv": {
+"general.architecture": "deepseek41",
+"general.type": "model",
+"general.name": "DeepSeek-V4.1-Flash-1017",
+"general.version": "1017",
+"general.basename": "DeepSeek-V4.1-Flash",
+"general.size_label": "748B-A16B",
+"general.license": "mit",
+"deepseek41.block_count": 40,
+"deepseek41.context_length": 1048576,
+"deepseek41.embedding_length": 5120,
+"deepseek41.attention.head_count": 64,
+"deepseek41.attention.head_count_kv": 1,
+"deepseek41.rope.scaling.type": "yarn",
+"deepseek41.rope.scaling.factor": 16.0,
+"deepseek41.rope.scaling.original_context_length": 65536,
+"deepseek41.rope.scaling.yarn_beta_fast": 32.0,
+"deepseek41.rope.scaling.yarn_beta_slow": 1.0,
+"deepseek41.rope.freq_base": 10000.0,
+"deepseek41.attention.layer_norm_rms_epsilon": 9.999999682655225e-21,
+"deepseek41.expert_count": 384,
+"deepseek41.expert_used_count": 6,
+"deepseek41.expert_gating_func": 4,
+"deepseek41.attention.key_length": 512,
+"deepseek41.attention.value_length": 512,
+"general.file_type": 38,
+"deepseek41.rope.dimension_count": 64,
+"deepseek41.attention.q_lora_rank": 1280,
+"deepseek41.attention.sliding_window": 128,
+"deepseek41.expert_feed_forward_length": 2304,
+"deepseek41.expert_shared_count": 1,
+"deepseek41.expert_weights_scale": 1.5,
+"deepseek41.expert_weights_norm": true,
+"deepseek41.attention.indexer.head_count": 32,
+"deepseek41.attention.indexer.key_length": 128,
+"deepseek41.attention.indexer.top_k": 512,
+"deepseek41.attention.output_group_count": 8,
+"deepseek41.attention.output_lora_rank": 1024,
+"deepseek41.attention.compress_rope_freq_base": 160000.0,
+"deepseek41.hyper_connection.count": 4,
+"deepseek41.hyper_connection.sinkhorn_iterations": 20,
+"deepseek41.hyper_connection.epsilon": 9.999999974752427e-07,
+"deepseek41.embedding_length_out": 20480,
+"deepseek41.attention.indexer.candidate_source_layer": 20,
+"deepseek41.attention.indexer.candidate_top_k_blocks": 2048,
+"deepseek41.attention.indexer.candidate_block_size": 8,
+"deepseek41.ple.ngram_size": 4,
+"deepseek41.ple.heads_per_ngram": 8,
+"deepseek41.embedding_length_per_layer_input": 256,
+"deepseek41.hash_layer_count": 0,
+"deepseek41.engram.vocab_size": 16000000,
+"deepseek41.engram.pad_token_id": 2,
+"deepseek41.engram.compressed_vocab_size": 99092,
+"deepseek41.dspark.block_size": 5,
+"deepseek41.dspark.noise_token_id": 128799,
+"deepseek41.dspark.markov_rank": 256,
+"deepseek41.dspark.expert_count": 128,
+"deepseek41.dspark.expert_used_count": 3,
+"general.quantization_version": 2,
+"general.quantized_by": "Unsloth",
+"general.repo_url": "https://huggingface.co/unsloth",
+"general.sampling.temp": 1.0,
+"general.sampling.top_p": 1.0,
+"general.base_model.count": 1,
+"general.base_model.0.name": "DeepSeek V4.1 Flash 1017",
+"general.base_model.0.organization": "Deepseek Ai",
+"general.base_model.0.repo_url": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017",
+"split.no": 0,
+"split.count": 9,
+"split.tensors.count": 1043
+},
+"tensors": {
+"blk.0.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.0.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.0.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.1.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.1.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.1.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.2.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.2.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.2.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.3.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.3.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.3.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.4.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.4.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.4.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.5.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.5.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.5.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.6.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.6.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.6.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.7.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.7.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.7.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.8.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.8.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.8.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.9.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.9.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.9.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.10.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.10.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.10.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.11.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.11.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.11.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.12.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.12.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.12.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.13.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.13.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.13.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.14.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.14.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.14.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.15.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.15.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.15.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.16.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.16.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.16.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.17.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.17.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.17.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.18.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.18.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.18.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.19.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.19.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.19.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.20.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.20.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.20.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.21.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.21.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.21.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.22.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.22.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.22.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.23.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.23.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.23.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.24.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.24.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.24.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.25.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.25.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.25.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.26.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.26.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.26.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.27.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.27.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.27.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.28.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.28.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.28.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.29.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.29.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.29.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.30.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.30.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.30.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.31.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.31.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.31.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.32.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.32.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.32.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.33.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.33.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.33.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.34.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.34.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.34.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.35.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.35.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.35.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.36.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.36.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.36.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.37.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.37.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.37.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.38.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.38.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.38.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.39.ffn_gate_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"blk.39.ffn_down_exps.weight": [
+[
+2304,
+5120,
+384
+],
+39
+],
+"blk.39.ffn_up_exps.weight": [
+[
+5120,
+2304,
+384
+],
+39
+],
+"per_layer_token_embd.weight": [
+[
+256,
+768022850
+],
+43
+],
+"token_embd.weight": [
+[
+5120,
+129280
+],
+8
+],
+"blk.0.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.0.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.0.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.0.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.0.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.0.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.0.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.0.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.0.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.0.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.0.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.0.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.0.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.0.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.0.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.0.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.0.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.0.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.0.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.0.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.0.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.0.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.1.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.1.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.1.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.1.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.1.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.1.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.1.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.1.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.1.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.1.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.1.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.1.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.1.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.1.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.1.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.1.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.1.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.1.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.1.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.1.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.1.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.1.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.2.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.2.attn_compressor_norm.weight": [
+[
+512
+],
+0
+],
+"blk.2.attn_compressor_gate.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.2.attn_compressor_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.2.indexer.k_norm.weight": [
+[
+128
+],
+0
+],
+"blk.2.indexer.proj.weight": [
+[
+5120,
+32
+],
+8
+],
+"blk.2.indexer.attn_k.weight": [
+[
+512,
+128
+],
+8
+],
+"blk.2.indexer.attn_q_b.weight": [
+[
+1280,
+4096
+],
+8
+],
+"blk.2.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.2.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.2.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.2.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.2.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.2.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.2.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.2.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.2.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.2.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.2.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.2.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.2.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.2.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.2.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.2.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.2.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.2.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.2.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.2.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.2.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.3.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.3.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.3.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.3.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.3.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.3.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.3.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.3.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.3.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.3.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.3.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.3.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.3.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.3.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.3.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.3.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.3.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.3.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.3.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.3.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.3.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.3.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.4.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.4.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.4.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.4.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.4.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.4.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.4.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.4.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.4.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.4.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.4.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.4.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.4.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.4.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.4.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.4.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.4.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.4.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.4.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.4.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.4.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.4.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.5.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.5.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.5.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.5.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.5.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.5.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.5.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.5.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.5.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.5.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.5.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.5.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.5.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.5.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.5.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.5.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.5.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.5.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.5.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.5.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.5.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.5.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.6.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.6.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.6.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.6.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.6.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.6.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.6.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.6.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.6.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.6.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.6.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.6.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.6.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.6.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.6.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.6.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.6.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.6.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.6.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.6.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.6.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.6.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.7.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.7.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.7.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.7.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.7.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.7.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.7.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.7.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.7.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.7.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.7.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.7.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.7.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.7.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.7.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.7.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.7.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.7.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.7.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.7.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.7.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.7.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.8.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.8.attn_compressor_norm.weight": [
+[
+512
+],
+0
+],
+"blk.8.attn_compressor_gate.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.8.attn_compressor_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.8.indexer.k_norm.weight": [
+[
+128
+],
+0
+],
+"blk.8.indexer.proj.weight": [
+[
+5120,
+32
+],
+8
+],
+"blk.8.indexer.attn_k.weight": [
+[
+512,
+128
+],
+8
+],
+"blk.8.indexer.attn_q_b.weight": [
+[
+1280,
+4096
+],
+8
+],
+"blk.8.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.8.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.8.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.8.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.8.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.8.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.8.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.8.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.8.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.8.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.8.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.8.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.8.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.8.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.8.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.8.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.8.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.8.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.8.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.8.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.8.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.9.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.9.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.9.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.9.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.9.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.9.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.9.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.9.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.9.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.9.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.9.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.9.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.9.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.9.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.9.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.9.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.9.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.9.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.9.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.9.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.9.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.9.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.10.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.10.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.10.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.10.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.10.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.10.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.10.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.10.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.10.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.10.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.10.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.10.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.10.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.10.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.10.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.10.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.10.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.10.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.10.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.10.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.10.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.10.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.11.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.11.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.11.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.11.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.11.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.11.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.11.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.11.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.11.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.11.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.11.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.11.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.11.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.11.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.11.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.11.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.11.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.11.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.11.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.11.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.11.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.11.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.12.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.12.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.12.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.12.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.12.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.12.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.12.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.12.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.12.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.12.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.12.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.12.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.12.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.12.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.12.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.12.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.12.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.12.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.12.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.12.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.12.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.12.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.13.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.13.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.13.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.13.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.13.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.13.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.13.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.13.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.13.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.13.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.13.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.13.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.13.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.13.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.13.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.13.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.13.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.13.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.13.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.13.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.13.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.13.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.14.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.14.attn_compressor_norm.weight": [
+[
+512
+],
+0
+],
+"blk.14.attn_compressor_gate.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.14.attn_compressor_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.14.indexer.k_norm.weight": [
+[
+128
+],
+0
+],
+"blk.14.indexer.proj.weight": [
+[
+5120,
+32
+],
+8
+],
+"blk.14.indexer.attn_k.weight": [
+[
+512,
+128
+],
+8
+],
+"blk.14.indexer.attn_q_b.weight": [
+[
+1280,
+4096
+],
+8
+],
+"blk.14.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.14.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.14.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.14.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.14.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.14.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.14.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.14.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.14.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.14.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.14.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.14.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.14.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.14.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.14.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.14.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.14.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.14.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.14.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.14.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.14.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.15.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.15.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.15.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.15.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.15.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.15.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.15.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.15.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.15.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.15.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.15.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.15.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.15.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.15.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.15.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.15.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.15.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.15.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.15.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.15.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.15.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.15.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.16.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.16.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.16.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.16.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.16.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.16.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.16.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.16.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.16.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.16.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.16.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.16.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.16.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.16.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.16.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.16.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.16.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.16.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.16.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.16.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.16.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.16.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.17.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.17.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.17.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.17.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.17.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.17.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.17.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.17.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.17.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.17.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.17.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.17.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.17.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.17.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.17.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.17.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.17.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.17.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.17.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.17.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.17.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.17.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.18.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.18.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.18.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.18.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.18.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.18.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.18.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.18.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.18.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.18.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.18.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.18.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.18.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.18.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.18.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.18.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.18.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.18.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.18.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.18.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.18.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.18.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.19.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.19.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.19.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.19.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.19.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.19.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.19.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.19.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.19.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.19.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.19.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.19.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.19.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.19.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.19.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.19.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.19.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.19.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.19.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.19.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.19.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.19.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.20.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.20.attn_compressor_norm.weight": [
+[
+512
+],
+0
+],
+"blk.20.attn_compressor_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.20.indexer.k_norm.weight": [
+[
+128
+],
+0
+],
+"blk.20.indexer.proj.weight": [
+[
+5120,
+32
+],
+8
+],
+"blk.20.indexer.attn_k.weight": [
+[
+512,
+128
+],
+8
+],
+"blk.20.indexer.attn_q_b.weight": [
+[
+1280,
+4096
+],
+8
+],
+"blk.20.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.20.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.20.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.20.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.20.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.20.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.20.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.20.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.20.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.20.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.20.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.20.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.20.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.20.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.20.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.20.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.20.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.20.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.20.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.20.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.20.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.21.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.21.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.21.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.21.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.21.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.21.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.21.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.21.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.21.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.21.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.21.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.21.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.21.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.21.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.21.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.21.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.21.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.21.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.21.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.21.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.21.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.21.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.22.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.22.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.22.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.22.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.22.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.22.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.22.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.22.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.22.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.22.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.22.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.22.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.22.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.22.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.22.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.22.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.22.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.22.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.22.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.22.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.22.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.22.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.23.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.23.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.23.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.23.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.23.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.23.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.23.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.23.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.23.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.23.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.23.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.23.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.23.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.23.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.23.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.23.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.23.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.23.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.23.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.23.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.23.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.23.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.24.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.24.indexer.proj.weight": [
+[
+5120,
+32
+],
+8
+],
+"blk.24.indexer.attn_q_b.weight": [
+[
+1280,
+4096
+],
+8
+],
+"blk.24.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.24.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.24.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.24.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.24.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.24.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.24.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.24.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.24.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.24.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.24.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.24.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.24.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.24.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.24.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.24.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.24.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.24.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.24.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.24.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.24.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.25.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.25.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.25.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.25.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.25.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.25.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.25.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.25.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.25.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.25.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.25.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.25.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.25.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.25.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.25.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.25.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.25.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.25.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.25.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.25.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.25.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.25.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.26.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.26.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.26.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.26.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.26.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.26.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.26.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.26.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.26.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.26.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.26.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.26.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.26.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.26.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.26.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.26.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.26.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.26.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.26.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.26.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.26.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.26.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.27.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.27.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.27.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.27.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.27.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.27.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.27.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.27.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.27.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.27.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.27.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.27.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.27.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.27.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.27.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.27.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.27.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.27.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.27.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.27.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.27.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.27.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.28.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.28.indexer.proj.weight": [
+[
+5120,
+32
+],
+8
+],
+"blk.28.indexer.attn_q_b.weight": [
+[
+1280,
+4096
+],
+8
+],
+"blk.28.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.28.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.28.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.28.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.28.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.28.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.28.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.28.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.28.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.28.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.28.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.28.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.28.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.28.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.28.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.28.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.28.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.28.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.28.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.28.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.28.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.29.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.29.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.29.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.29.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.29.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.29.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.29.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.29.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.29.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.29.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.29.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.29.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.29.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.29.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.29.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.29.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.29.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.29.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.29.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.29.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.29.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.29.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.30.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.30.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.30.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.30.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.30.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.30.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.30.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.30.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.30.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.30.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.30.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.30.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.30.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.30.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.30.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.30.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.30.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.30.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.30.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.30.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.30.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.30.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.31.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.31.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.31.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.31.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.31.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.31.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.31.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.31.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.31.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.31.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.31.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.31.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.31.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.31.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.31.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.31.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.31.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.31.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.31.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.31.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.31.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.31.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.32.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.32.indexer.proj.weight": [
+[
+5120,
+32
+],
+8
+],
+"blk.32.indexer.attn_q_b.weight": [
+[
+1280,
+4096
+],
+8
+],
+"blk.32.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.32.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.32.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.32.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.32.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.32.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.32.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.32.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.32.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.32.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.32.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.32.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.32.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.32.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.32.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.32.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.32.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.32.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.32.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.32.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.32.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.33.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.33.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.33.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.33.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.33.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.33.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.33.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.33.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.33.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.33.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.33.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.33.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.33.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.33.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.33.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.33.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.33.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.33.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.33.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.33.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.33.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.33.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.34.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.34.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.34.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.34.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.34.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.34.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.34.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.34.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.34.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.34.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.34.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.34.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.34.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.34.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.34.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.34.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.34.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.34.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.34.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.34.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.34.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.34.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.35.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.35.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.35.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.35.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.35.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.35.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.35.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.35.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.35.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.35.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.35.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.35.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.35.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.35.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.35.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.35.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.35.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.35.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.35.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.35.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.35.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.35.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.36.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.36.indexer.proj.weight": [
+[
+5120,
+32
+],
+8
+],
+"blk.36.indexer.attn_q_b.weight": [
+[
+1280,
+4096
+],
+8
+],
+"blk.36.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.36.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.36.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.36.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.36.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.36.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.36.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.36.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.36.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.36.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.36.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.36.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.36.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.36.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.36.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.36.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.36.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.36.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.36.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.36.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.36.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.37.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.37.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.37.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.37.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.37.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.37.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.37.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.37.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.37.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.37.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.37.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.37.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.37.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.37.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.37.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.37.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.37.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.37.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.37.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.37.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.37.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.37.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.38.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.38.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.38.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.38.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.38.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.38.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.38.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.38.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.38.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.38.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.38.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.38.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.38.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.38.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.38.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.38.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.38.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.38.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.38.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.38.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.38.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.38.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.39.attn_sinks.weight": [
+[
+64
+],
+0
+],
+"blk.39.attn_kv_a_norm.weight": [
+[
+512
+],
+0
+],
+"blk.39.attn_q_a_norm.weight": [
+[
+1280
+],
+0
+],
+"blk.39.attn_kv.weight": [
+[
+5120,
+512
+],
+8
+],
+"blk.39.attn_output_a.weight": [
+[
+4096,
+8192
+],
+8
+],
+"blk.39.attn_output_b.weight": [
+[
+8192,
+5120
+],
+8
+],
+"blk.39.attn_q_a.weight": [
+[
+5120,
+1280
+],
+8
+],
+"blk.39.attn_q_b.weight": [
+[
+1280,
+32768
+],
+8
+],
+"blk.39.attn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.39.exp_probs_b.bias": [
+[
+384
+],
+0
+],
+"blk.39.exp_probs_b_vl.bias": [
+[
+384
+],
+0
+],
+"blk.39.ffn_gate_inp.weight": [
+[
+5120,
+384
+],
+0
+],
+"blk.39.ffn_gate_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.39.ffn_down_shexp.weight": [
+[
+2304,
+5120
+],
+8
+],
+"blk.39.ffn_up_shexp.weight": [
+[
+5120,
+2304
+],
+8
+],
+"blk.39.ffn_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.39.hc_attn_base.weight": [
+[
+24
+],
+0
+],
+"blk.39.hc_attn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.39.hc_attn_scale.weight": [
+[
+3
+],
+0
+],
+"blk.39.hc_ffn_base.weight": [
+[
+24
+],
+0
+],
+"blk.39.hc_ffn_fn.weight": [
+[
+20480,
+24
+],
+0
+],
+"blk.39.hc_ffn_scale.weight": [
+[
+3
+],
+0
+],
+"output.weight": [
+[
+5120,
+129280
+],
+8
+],
+"output_norm.weight": [
+[
+5120
+],
+0
+],
+"blk.1.engram_gate.weight": [
+[
+5120,
+4
+],
+0
+],
+"blk.1.engram_kv.weight": [
+[
+6144,
+25600
+],
+8
+],
+"blk.14.engram_gate.weight": [
+[
+5120,
+4
+],
+0
+],
+"blk.14.engram_kv.weight": [
+[
+6144,
+25600
+],
+8
+]
+}
+}

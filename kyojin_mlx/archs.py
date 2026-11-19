@@ -30,6 +30,7 @@ class MoeSpec:
     alpha: float = 1.0                            # act = min(g, L) * sigmoid(alpha * min(g, L)) * (clip(u, -L, L) + beta)
     beta: float = 0.0                             # silu: alpha 1, beta 0; swigluoai (MiniMax-M3): alpha 1.702, beta 1
     limit_path: str = "activation.limit"          # on the replaced switch module
+    act: str = "swiglu"                           # activation kind of the expert kernels (metal_src.ACT_KINDS): "swiglu" (alpha / beta / limit above) or "situ" (alpha = gate scale, beta = linear scale, no limit)
 
 
 @dataclass
@@ -82,7 +83,7 @@ class Vendor:
     A role left "" is not used by that architecture (a check on it is skipped, never guessed). `cls(role)` resolves a role once (the import is cached by
     Python); the hot paths call it at install time and keep the class."""
     module: str
-    block: str = ""                                   # one decoder layer (hyper-connection block); the ablit hook and the block fusions patch its __call__
+    block: str = ""                                   # one decoder layer (hyper-connection block); the block fusions patch its __call__
     attn: str = ""                                    # the attention module of a layer
     moe: str = ""                                     # the routed + shared MoE module of a layer
     cache: str = ""                                   # the per-model KV cache class (the kvdisk adapter, CED, the fp4 pool match it by name through the MRO)
@@ -139,6 +140,8 @@ class ArchSpec:
     vendor: Vendor | None = None                         # the model code (module + class roles); None = the architecture has no Kyojin class-level hook
     trunk: str = "language_model"                        # attribute of the loaded model that holds the decoder (`.layers`); the ablit hook arms its blocks
     index_patch: str = ""                                # "glm": KYOJIN_DSA_INDEX_GLM installs kyojin_mlx.glm_index (the pool selection of the GLM indexer)
+    defaults: dict = field(default_factory=dict)         # lever start values of this architecture: {op-named KYOJIN_* variable: "value"}. Applied by load_backend (opflags.apply_arch_defaults)
+                                                         # only for a lever whose variable (under any spelling) the environment does not set; the log line lists what was defaulted
 
 
 GLM5 = ArchSpec(
@@ -155,6 +158,16 @@ GLM5 = ArchSpec(
                   sites=(("HyperConnection", "_mix", "hc_branch_mix"), ("MoEGate", "__call__", "router_sigmoid_group"),
                          ("Glm5NextIndexer", "_project_keys", "index_gate_keys"),
                          ("Glm5NextAttention", "_attend", "mla_attend_rows"))),
+    # The served GLM-5.3 lane (what the lane's flags.env sets, every value measured and Opus-reviewed there), so an empty flags.env reproduces it. Op names where a lever has
+    # one (kyojin_mlx.opflags.OPS; the KYOJIN_GLM_* spelling stays an alias), the existing name otherwise (no rename sweep). NOT here on purpose:
+    # KYOJIN_GLM_DENSE_Q (keeps a second resident copy of the dense weights; env-only until the fix lands) and KYOJIN_GLM_MULTI_PLAIN (measured not OK).
+    defaults={
+        "KYOJIN_DENSE_GEMV_1B": "1", "KYOJIN_GLM_HC_FUSE": "1", "KYOJIN_GLM_MOE": "1", "KYOJIN_DSA_FAST": "1", "KYOJIN_KQ_GMM_STORED": "1",
+        "KYOJIN_GLM_DSA_PF": "1", "KYOJIN_GLM_PF_HC": "1", "KYOJIN_GLM_PF_IDX": "1", "KYOJIN_GLM_SPEC_ROWS": "4", "KYOJIN_MOE_EXPERT_E": "1",
+        "KYOJIN_KQ_GMM_SCHED": "omlx", "KYOJIN_GLM_CHAIN": "0", "KYOJIN_KDA_PF": "1", "KYOJIN_DSA_FUSE": "1", "KYOJIN_GLM_FUSE_SMALL": "1",
+        "KYOJIN_DSA_FUSE_EVAL": "1", "KYOJIN_GLM_PF_MOE": "1", "KYOJIN_PF_UNTILE": "1", "KYOJIN_HOST_EARLY_SUBMIT": "1", "KYOJIN_VERIFY_ROWS_GEMV": "1",
+        "KYOJIN_HOST_EARLY_SUBMIT_ROWS": "2", "KYOJIN_GLM_MTPFEED": "1", "KYOJIN_VERIFY_POOLSEL": "1", "KYOJIN_DRAFT_HEAD_F16": "1", "KYOJIN_GLM_LAG1": "1",
+    },
 )
 
 DS41 = ArchSpec(

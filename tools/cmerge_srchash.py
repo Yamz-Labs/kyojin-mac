@@ -53,7 +53,7 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             print(f"mod {mod} IMPORT {type(e).__name__}")
             continue
-        strs = sorted((k, v) for k, v in vars(m).items() if isinstance(v, str) and len(v) > 80)
+        strs = sorted((k, v) for k, v in vars(m).items() if isinstance(v, str) and len(v) > 80 and not k.startswith("__"))   # dunders (__file__) differ per tree
         print(f"mod {mod} {len(strs)} strings {h(repr(strs))} clamp65504={sum(v.count('65504') for _, v in strs)}")
     print(f"coop sources hashed: {n}")
     return 0

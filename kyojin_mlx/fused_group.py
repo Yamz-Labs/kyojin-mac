@@ -356,7 +356,9 @@ def share_window_math() -> bool:
         cls = _A.cls("attn")
     except ImportError:
         return False
-    orig = cls._window_part
+    orig = getattr(cls, "_window_part", None)
+    if orig is None:                                  # GLM-5.3 attention: no sliding window
+        return False
     if getattr(orig, "_s5_window", False):
         return True
     if hashlib.sha256(inspect.getsource(orig).encode()).hexdigest() != _WINDOW_PART_SHA:

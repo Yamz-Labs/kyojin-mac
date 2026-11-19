@@ -165,3 +165,26 @@ def test_batched_decode_equals_solo_bitwise():
         assert np.array_equal(lb[i].view(np.uint16), ls[i][0].view(np.uint16))
     got = MU.decode_batched(model, MU.batch_caches([MU.fork_cache(c) for c in cs]), first, 12)
     assert got == ref
+
+
+def test_fork_of_a_cache_class_without_from_state():
+    """A model's own cache class with no state / from_state (mlx-vlm MiniMaxM3KVCache: a KVCache plus index keys) forks attribute by attribute."""
+    class OwnCache:
+        def __init__(self):
+            self.kv_cache = MU.KVCache()
+            self.index_keys = None
+            self.index_offset = 0
+
+        def update_and_fetch(self, k, v):
+            return self.kv_cache.update_and_fetch(k, v)
+
+    c = OwnCache()
+    k = mx.ones((1, 2, 5, 4))
+    c.update_and_fetch(k, k)
+    c.index_keys, c.index_offset = mx.arange(10).reshape(1, 1, 10, 1), 5
+    (n,) = MU.fork_cache([c])
+    assert type(n) is OwnCache and n is not c and n.kv_cache is not c.kv_cache
+    assert n.kv_cache.offset == 5 and n.index_offset == 5
+    assert mx.array_equal(n.index_keys, c.index_keys) and mx.array_equal(n.kv_cache.keys[..., :5, :], k)
+    n.update_and_fetch(k[..., :1, :] * 2, k[..., :1, :] * 2)
+    assert n.kv_cache.offset == 6 and c.kv_cache.offset == 5

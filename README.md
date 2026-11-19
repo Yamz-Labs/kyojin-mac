@@ -36,6 +36,26 @@ or `tools/mac_serve.sh /path/to/model ...` (same options, keeps the Mac awake).
 Options derive from the pack. `--help` lists them all. Details: `docs/SERVER.md`.
 To add a model see `docs/ADD_A_MODEL.md` and `docs/NEW_MODEL.md`. To convert to EXL3 see `CONVERT.md`.
 
+## Hy4-flash (GGUF)
+
+Hy4-flash runs from the public Q3_K GGUF (2 files, 144 GiB) published by AngelSlim: [AngelSlim/Hy4-flash-GGUF](https://huggingface.co/AngelSlim/Hy4-flash-GGUF). The model keeps the publisher's licence.
+Tested on a Mac Studio with 256 GB of unified memory.
+
+    pip install -U "huggingface_hub[cli]"
+    hf download AngelSlim/Hy4-flash-GGUF --include "Hy4-flash-Q3_K-*.gguf" --local-dir ./hy4-flash
+    set -a; . tools/hy4_mac.env; set +a
+    python -m kyojin_mlx.serve.server --model ./hy4-flash --port 8080 --model-id Hy4-flash \
+        --sessions 1 --ctx 262144 --kv-mode fp16 --no-kv-disk --prefill-chunk 2048 --mtp-depth 5
+
+`tools/hy4_mac.env` holds the kernel flags of the measured line. Speculative decoding uses the model's own multi-token-prediction head (`--mtp-depth 5`).
+Speed numbers: see the benchmark table.
+
+- Context: 256K tokens (`--ctx 262144`). 1M tokens is not part of this release.
+- One request decodes at a time; other requests queue. Batched multi-user decode of Hy4 is not in this release.
+- The Engram tables (59 GiB) stay on disk and are read by row: the first request after a start is slower while rows are read.
+- One model and one quantization (Q3_K). The model row is marked unproven in the loader, which is why `tools/hy4_mac.env` sets `KYOJIN_SKELETON=1` and `KYOJIN_KIT_UNPROVEN_ROWS=1`.
+- Tests: `tests/test_hy4_*.py`, `tests/test_skeleton_hy4_*.py` and `tests/test_engram_hy4.py` (run one file at a time).
+
 ## Speed
 
 Kyojin 1.8.9 on a Mac Studio M5 Ultra, 256 GB. Served through the real server, real text, tokens per second.
@@ -59,6 +79,20 @@ One warm-up discarded, then one measured run.
 
 Memory: one resident copy of the weights. The 35B GGUF is a 20.8 GiB file and uses 21.6-22.0 GB in MLX.
 DeepSeek V4.1 uses 176-178 GB at 8K context and 187 GB at 983K.
+
+## New in 1.10.0
+
+Hy4-flash (GGUF Q3_K) on a Mac Studio, up to 256K tokens of context. Numbers: see the benchmark table. Guide: the Hy4-flash section above.
+
+| change | effect | off |
+|---|---|---|
+| Hy4-flash serve backend on the generic decoder skeleton: prefill, decode, Engram rows read from the GGUF by row | serves the public Q3_K GGUF | - |
+| multi-token-prediction speculation with the model's own head, depth 5 | `--mtp-depth 5` | `--mtp-depth 0` |
+| fixed-state gather attention over the kept keys, pooled keys carried in the cache state | long context | `KYOJIN_HY4_FIXED_GATHER=0` |
+| fused attention, hyper-connection and expert kernels for the skeleton (`tools/hy4_mac.env`) | decode and prefill speed | unset the flag |
+| optional hierarchical candidate-restricted indexer for prompt chunks | `KYOJIN_HY4_HISA` (default off) | - |
+
+- Hy4 runs one session at a time; extra requests queue.
 
 ## New in 1.9.8
 

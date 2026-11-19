@@ -1677,10 +1677,10 @@ def rot_hot_source(in_half: bool) -> str:
 
 
 @functools.lru_cache(maxsize=None)
-def mid_hot_source(limit: float, wpre: bool, fq: bool, alpha: float = 1.0, beta: float = 0.0) -> str:
+def mid_hot_source(limit: float, wpre: bool, fq: bool, alpha: float = 1.0, beta: float = 0.0, act: str = "swiglu") -> str:
     """mid for the grouped path with hot groups. Inputs: part (GEMV partials), yn f32 [2 * hot_rows, N] (NAX gate + up), ids, wts, svh0, svh1, suhd,
     hrow, hinfo, params [TGK, N]. Outputs: xh2 f32 [NP, N] (pairs outside hot groups), A2 half [NP, N] (hot pairs at row hrow, k permuted)."""
-    s = mid_source(limit, wpre, fq, alpha, beta)
+    s = mid_source(limit, wpre, fq, alpha, beta, act)
     old_e = "const uint e = uint(ids[p]);"
     assert s.count(old_e) == 1
     s = s.replace(old_e, old_e + "\n    const uint hr = hrow[p];")
@@ -1757,9 +1757,29 @@ BUTTERFLY
 """
 
 
+ACT_KINDS = ("swiglu", "situ")                                      # activation kinds of the expert kernels; "swiglu" is the clamped silu-gated form of _MID
+_MID_ACT_SWIGLU = (_MID[_MID.index("    float4 g4 = min(gu[0]"):_MID.index("    float4 a4 = (g4 * sg) * UBETA;\n") + len("    float4 a4 = (g4 * sg) * UBETA;\n")])
+_MID_ACT_SITU = r"""    float4 g4 = gu[0], u4 = gu[1];                                   // SiTU: no clamp (the tanh bounds both), a = SITU_B tanh(g / SITU_B) sigmoid(g) * SITU_LB tanh(u / SITU_LB)
+    float4 a4;
+    for (int i = 0; i < 4; ++i) {                                    // mlx sigmoid: y = 1 / (1 + exp(|x|)); x < 0 ? y : 1 - y
+        const float y = 1.0f / (1.0f + metal::precise::exp(abs(g4[i])));
+        const float sg = (g4[i] < 0.0f) ? y : 1.0f - y;
+        a4[i] = ((SITU_B * metal::precise::tanh(g4[i] / SITU_B)) * sg) * (SITU_LB * metal::precise::tanh(u4[i] / SITU_LB));
+    }
+"""
+assert _MID.count(_MID_ACT_SWIGLU) == 1
+_MID_SITU = _MID.replace(_MID_ACT_SWIGLU, _MID_ACT_SITU)
+
+
 @functools.lru_cache(maxsize=None)
-def mid_source(limit: float, wpre: bool, fq: bool, alpha: float = 1.0, beta: float = 0.0) -> str:
-    """act = min(g, L) * sigmoid(alpha * min(g, L)) * (clip(u, -L, L) + beta): silu-gated (alpha 1, beta 0) or swigluoai."""
+def mid_source(limit: float, wpre: bool, fq: bool, alpha: float = 1.0, beta: float = 0.0, act: str = "swiglu") -> str:
+    """act "swiglu": min(g, L) * sigmoid(alpha * min(g, L)) * (clip(u, -L, L) + beta): silu-gated (alpha 1, beta 0) or swigluoai.
+    act "situ": (alpha * tanh(g / alpha) * sigmoid(g)) * (beta * tanh(u / beta)); alpha is the gate scale, beta the linear scale, limit is not used."""
+    assert act in ACT_KINDS, act
+    if act == "situ":
+        assert alpha > 0.0 and beta > 0.0
+        return (_MID_SITU.replace("SITU_LB", repr(float(beta)) + "f").replace("SITU_B", repr(float(alpha)) + "f").replace("BUTTERFLY", _BUTTERFLY).replace("RSQRT", RSQRT_HAD)
+                .replace("WPRE", "a4 = a4 * wts[p];" if wpre else "").replace("FQ", FQ_FP8 if fq else ""))
     return (_MID.replace("BUTTERFLY", _BUTTERFLY).replace("RSQRT", RSQRT_HAD).replace("LIMIT", repr(float(limit)) + "f")
             .replace("ALPHAMUL", f"* {float(alpha)!r}f" if alpha != 1.0 else "")
             .replace("UBETA", f"(u4 + {float(beta)!r}f)" if beta != 0.0 else "u4")
@@ -1767,9 +1787,9 @@ def mid_source(limit: float, wpre: bool, fq: bool, alpha: float = 1.0, beta: flo
 
 
 @functools.lru_cache(maxsize=None)
-def mid_half_source(limit: float, wpre: bool, fq: bool, alpha: float = 1.0, beta: float = 0.0) -> str:
+def mid_half_source(limit: float, wpre: bool, fq: bool, alpha: float = 1.0, beta: float = 0.0, act: str = "swiglu") -> str:
     """mid with xh2 stored as half in the run's k order (see rot_gather_half_source)."""
-    s = mid_source(limit, wpre, fq, alpha, beta)
+    s = mid_source(limit, wpre, fq, alpha, beta, act)
     old = "*((device float4*)(xh2 + ulong(p) * N + col)) = float4(v0, v1, v2, v3) * " + RSQRT_HAD + ";"
     assert s.count(old) == 1
     return s.replace(old, perm_store("xh2 + ulong(p) * N + blk * 128", "float4(v0, v1, v2, v3) * " + RSQRT_HAD, True))
@@ -1873,9 +1893,9 @@ def rot_gather_sh_source(nproj: int, in_half: bool, fq8: bool = False) -> str:
 
 
 @functools.lru_cache(maxsize=None)
-def mid_sh_source(limit: float, wpre: bool, fq: bool, alpha: float = 1.0, beta: float = 0.0) -> str:
+def mid_sh_source(limit: float, wpre: bool, fq: bool, alpha: float = 1.0, beta: float = 0.0, act: str = "swiglu") -> str:
     """mid with the fp8 fake quant skipped for the shared expert (e == params[2])."""
-    s = mid_source(limit, wpre, fq, alpha, beta)
+    s = mid_source(limit, wpre, fq, alpha, beta, act)
     if not fq:
         return s
     assert s.count(FQ_FP8) == 1, "mid template changed"
@@ -1943,11 +1963,11 @@ def _chain_check(gemv: str, src: str) -> None:
 
 
 def chain_gu_source(Ks: tuple[int, ...], cb: str, pf: bool, pf2: bool, blocks: int, limit: float, wpre: bool, fq: bool, alpha: float, beta: float,
-                    shared_skip: int | None = None, t128: bool = False) -> str:
+                    shared_skip: int | None = None, t128: bool = False, act: str = "swiglu") -> str:
     """gather_gemv_source (gate + up) with mid in its tail. Extra inputs after the GEMV's: wts, svh0, svh1, suhd, ctr. Outputs part, xh2 [npairs, N].
     shared_skip: expert id whose down input skips the fp8 fake quant (moe_sumoe's shared slot; 0xFFFFFFFF = none) or None for the plain mid."""
     gemv = gather_gemv_source(Ks, 2, cb, pf, False, pf2, t128)
-    mid = mid_source(limit, wpre, fq, alpha, beta) if shared_skip is None else mid_sh_source(limit, wpre, fq, alpha, beta)
+    mid = mid_source(limit, wpre, fq, alpha, beta, act) if shared_skip is None else mid_sh_source(limit, wpre, fq, alpha, beta, act)
     assert mid.count(_CH_MID_HEAD) == 1 and mid.count(_CH_PART_LD) == 1, "mid template changed"
     mid = mid.replace(_CH_MID_HEAD, "").replace(_CH_PART_LD, "acc += LDF4(part + (ulong(p * 2 + pj) * TGK + kb) * N + col);")
     if shared_skip is not None:
@@ -1961,10 +1981,14 @@ def chain_gu_source(Ks: tuple[int, ...], cb: str, pf: bool, pf2: bool, blocks: i
     return out
 
 
+CHAIN_SG = 8                                                        # simdgroups of the chain launches (threadgroup (256, 1, 1)); the combine tail keeps one slot per simdgroup up to this many
+CHAIN_TOPK_MAX = 16                                                 # slots per row of the combine tail: ys[TOPK][32] float4 = 512 B per slot of threadgroup memory (8 KB at 16)
+
+
 def chain_dn_source(Ks: tuple[int, ...], cb: str, pf: bool, pf2: bool, blocks: int, topk: int, wpost: bool, bf16_last: bool = False) -> str:
     """gather_gemv_source (down) with the combine (final_par's arithmetic) in its tail. Extra inputs after the GEMV's: ids is the GEMV's, then wts, svh, ctr.
     Outputs part, y [rows, N]. One simdgroup per pair of the row computes its term, simdgroup 0 adds them in order j."""
-    assert topk <= 8
+    assert topk <= CHAIN_TOPK_MAX, f"chain combine tail holds {CHAIN_TOPK_MAX} slots per row at most"
     gemv = gather_gemv_source(Ks, 1, cb, pf, False, pf2)
     arrive = _CH_ARRIVE.replace("CTRI", f"((zz / {topk}u) * chain_blocks + blk)").replace("ARRIVE", f"({topk}u * chain_tgk)")
     tail = r"""
@@ -1993,6 +2017,10 @@ BUTTERFLY
         *((device float4*)(y + ulong(r) * N + blk * 128 + lane * 4)) = out;
     }
 """
+    if topk > CHAIN_SG:                                             # more slots than simdgroups: each simdgroup strides over the slots (the in-order sum below is unchanged)
+        old_t = "    if (warp < TOPK) {\n        const uint j = warp;\n"
+        assert tail.count(old_t) == 1
+        tail = tail.replace(old_t, "    for (uint j = warp; j < TOPK; j += CHAIN_SGu) {\n").replace("CHAIN_SGu", f"{CHAIN_SG}u")
     tail = (tail.replace("BUTTERFLY", _BUTTERFLY).replace("RSQRT", RSQRT_HAD)
             .replace("WPOST", "y4 = y4 * wts[pp];" if wpost else "").replace("BF16LAST", _BF16_ROUND if bf16_last else "").replace("TOPK", str(topk)))
     out = _CH_LDF4 + gemv + arrive + tail
@@ -2028,12 +2056,12 @@ def fx_ok(kt: int, tgk: int, ws: int = 4, cap: int = 24) -> bool:
     return chunk % 2 == 0 and (ws * chunk * 16 + 127) // 128 <= cap
 
 
-def chain_gu_fx_source(Ks, cb, pf, pf2, blocks, limit, wpre, fq, alpha, beta, shared_skip, kt: int, tgk: int, topk: int, fq8: bool) -> str:
+def chain_gu_fx_source(Ks, cb, pf, pf2, blocks, limit, wpre, fq, alpha, beta, shared_skip, kt: int, tgk: int, topk: int, fq8: bool, act: str = "swiglu") -> str:
     """chain_gu_source with the rot in the GEMV prologue. Inputs: xh is the fp16 activation [rows, KD] (not rotated), extras after the chain's: suh0, suh1."""
     assert shared_skip is None and fx_ok(kt, tgk)
     chunk = (kt + tgk * 4 - 1) // (tgk * 4)
     nb = min((4 * chunk * 16 + 127) // 128, kt * 16 // 128)
-    src = chain_gu_source(Ks, cb, pf, pf2, blocks, limit, wpre, fq, alpha, beta, shared_skip)
+    src = chain_gu_source(Ks, cb, pf, pf2, blocks, limit, wpre, fq, alpha, beta, shared_skip, act=act)
     xl = _XV_LOAD.replace("XV4", "half4")
     xl = with_fq8(xl) if fq8 else xl
     assert xl.count("x + o") >= 1

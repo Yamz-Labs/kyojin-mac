@@ -130,7 +130,7 @@ def index_cos_sin(length: int, rope_dim: int, theta: float, yarn: tuple):
 
 
 def install_rope(L) -> int:
-    if not ROPE or getattr(L, "_kyojin_longctx_rope", False):
+    if not ROPE or getattr(L, "_kyojin_longctx_rope", False) or not hasattr(L, "_cached_index_cos_sin"):       # GLM-5.3's module has no DS4.1 rope-table helpers
         return 0
     _orig["cached"] = L._cached_index_cos_sin
     _orig["index"] = L._index_cos_sin

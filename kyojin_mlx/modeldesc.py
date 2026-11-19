@@ -16,6 +16,7 @@ for a config, which of those paths apply and which fall back, so the speed a new
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import dataclass, field
 
@@ -76,21 +77,54 @@ DESCS = (
         chat_prefixes=("ernie",), backend_prefixes=("ernie",)),
 )
 
+# Rows with no Metal identity proof yet (proven=False): they exist only while KYOJIN_KIT_UNPROVEN_ROWS is on (foreign_unproven), read per call; off = the table above, unchanged.
+UNPROVEN_DESCS = (
+    ModelDesc(                                      # Qwen3.8-Flash-Next (GGUF `qwen4exp` and the FP4-Local safetensors pack): hybrid linear attention + MoE on the mlx-vlm qwen4_exp class,
+        name="qwen4_exp", model_types=("qwen4_exp",),   # read as stored by foreign_linear.load_foreign, served on GenericBackend (the language model defines the caches)
+        architectures={"Qwen4ExpForConditionalGeneration": True, "Qwen4ExpForCausalLM": False},
+        block="hybrid_gdn", attn="gdn+gqa", kv="fp16", moe="yes", hc="no", backend="generic_foreign", server="qwen", family="qwen4_exp",
+        thinking_key="enable_thinking", stop_tokens=("<|im_end|>", "<|endoftext|>")),
+    ModelDesc(                                      # Hy4-flash (GGUF `hy_v4_flash`): MLA + kpool index + Engram + latent MoE + hyper-connections on the skeleton Model
+        name="hy_v4_flash", model_types=("hy_v4_flash",),   # (foreign_skeleton, also behind KYOJIN_SKELETON); keyed by the serve config's gguf_architecture (model_key):
+        architectures={},                                   # its model_type is the skeleton's own "kyojin_skeleton". Hy4Backend: one session, plain decode (delivery A)
+        block="mla_kpool_moe_hc", attn="mla+kpool", kv="fp16", moe="yes", hc="yes", backend="hy4", server="hy4", family="hy4",
+        stop_tokens=("<｜hy_end:6124c78e｜>",)),
+)
+SKELETON_TYPE = "kyojin_skeleton"                   # foreign_skeleton.ModelArgs.model_type: one model_type for every skeleton architecture
 _BY_TYPE = {t: d for d in DESCS for t in d.model_types}
 _BY_ARCH = {a: d for d in DESCS for a in d.architectures}
 
 
+def _unproven_on() -> bool:
+    return os.environ.get("KYOJIN_KIT_UNPROVEN_ROWS", "0") not in ("0", "")
+
+
+def model_key(cfg: dict) -> str:
+    """The key a config is looked up by: its model_type, except a skeleton serve config (foreign_skeleton.serve_config), whose model_type is the same
+    for every architecture: there the GGUF architecture (`gguf_architecture`, e.g. "hy_v4_flash") names the row."""
+    mt = cfg.get("model_type", "") or ""
+    if mt == SKELETON_TYPE and cfg.get("gguf_architecture"):
+        return str(cfg["gguf_architecture"])
+    return mt
+
+
 def by_model_type(model_type: str) -> ModelDesc | None:
     """Exact match only (what `archs.arch_of` always did)."""
-    return _BY_TYPE.get(model_type)
+    d = _BY_TYPE.get(model_type)
+    if d is None and _unproven_on():
+        d = next((u for u in UNPROVEN_DESCS if model_type in u.model_types), None)
+    return d
 
 
 def by_architecture(architecture: str) -> ModelDesc | None:
-    return _BY_ARCH.get(architecture)
+    d = _BY_ARCH.get(architecture)
+    if d is None and _unproven_on():
+        d = next((u for u in UNPROVEN_DESCS if architecture in u.architectures), None)
+    return d
 
 
 def _prefix(model_type: str, field_name: str) -> ModelDesc | None:
-    d = _BY_TYPE.get(model_type)
+    d = by_model_type(model_type)
     if d is not None:
         return d
     for d in DESCS:
@@ -117,8 +151,8 @@ def stop_tokens_of(server: str) -> tuple:
     """Stop-token strings of the chat family `server` ("qwen" / "glm" / "ds41"): the row that selects that family."""
     if server in ("generic", "jinja"):         # a pack with no row (Jinja fallback family), or a bare GGUF of a mapped architecture: the ids of the file's own metadata (generation_config.json) plus the end-of-turn tokens llama.cpp treats as
         return GENERIC_STOPS                   # end of generation by their text (llama-vocab.cpp special_eog_ids, lines 3266-3296), which the metadata does not always carry (gemma, GLM)
-    for d in DESCS:
-        if d.server == server:
+    for d in DESCS + UNPROVEN_DESCS:           # the unproven rows too, flag on or off: a stop string is data (hy4: <｜hy_end:6124c78e｜>, the file's eos, llama.cpp's only eog id)
+        if d.server == server:                 # DESCS first: a proven family keeps its own row's stops
             return d.stop_tokens
     raise KeyError(server)
 

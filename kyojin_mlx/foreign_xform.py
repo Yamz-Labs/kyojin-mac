@@ -14,6 +14,8 @@ The row permutations are applied to the stored blocks (rows are independent in e
 Nothing is re-quantised and no weight is converted."""
 from __future__ import annotations
 
+import re
+
 import numpy as np
 
 from . import foreign_gguf as GF
@@ -122,7 +124,31 @@ def _qwen35moe(name: str, kv: dict) -> Xf | None:
     return x
 
 
-_SETS = {"qwen35": _qwen35, "qwen35moe": _qwen35moe, "llama": _llama, "mistral3": lambda name, kv: _llama(name, kv, "mistral3"), "gemma3": _gemma3, "qwen2moe": _qwen2moe}
+POST["unsq1"] = lambda w: w.reshape(w.shape[0], 1, w.shape[1])       # [C, K] -> [C, 1, K]: undoes the converter's `.squeeze(1)` of a depthwise conv weight (the class's sanitize moves it to its own layout)
+
+
+def _lfm2moe(name: str, kv: dict) -> Xf | None:
+    """conversion/lfm2.py LFM2MoeModel.modify_tensors: `conv.conv` weights are squeezed ([C, 1, K] -> [C, K]); the expert stacking and the other renames need no value change."""
+    return Xf(post="unsq1") if name.endswith(".shortconv.conv.weight") else None
+
+
+POST["flat"] = lambda w: w.reshape(-1)
+POST["a_log_flat"] = lambda w: _a_log(w).reshape(-1)
+
+
+def _nemotron_h_moe(name: str, kv: dict) -> Xf | None:
+    """conversion/nemotron.py NemotronHModel.modify_tensors (MoE branch): A_log -> -exp(A_log) reshaped [heads, 1] (`ssm_a`), D reshaped [heads, 1] (`ssm_d`), the mamba conv weight
+    squeezed to [C, K] (the class's sanitize moves the [C, 1, K] form to its own layout), the gated norm weight reshaped [n_group, -1]; dt_bias only renamed, experts stacked."""
+    if re.fullmatch(r"blk\.\d+\.ssm_a", name):
+        return Xf(post="a_log_flat")
+    if re.fullmatch(r"blk\.\d+\.ssm_d|blk\.\d+\.ssm_norm\.weight", name):
+        return Xf(post="flat")
+    if re.fullmatch(r"blk\.\d+\.ssm_conv1d\.weight", name):
+        return Xf(post="unsq1")
+    return None
+
+
+_SETS = {"nemotron_h_moe": _nemotron_h_moe, "lfm2moe": _lfm2moe, "qwen35": _qwen35, "qwen35moe": _qwen35moe, "llama": _llama, "mistral3": lambda name, kv: _llama(name, kv, "mistral3"), "gemma3": _gemma3, "gemma2": _gemma3, "granitemoe": lambda name, kv: _llama(name, kv, "granitemoe"), "qwen2moe": _qwen2moe}
 
 
 def plan(name: str, xform: str, kv: dict, rows: int | None = None) -> Xf | None:

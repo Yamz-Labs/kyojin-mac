@@ -299,7 +299,17 @@ def _fork_any(c):
         return type(c)(*_fork_any_list(c.caches))
     if hasattr(type(c), "from_state"):
         return type(c).from_state(_dup(c.state), c.meta_state)
+    if hasattr(c, "__dict__") and hasattr(c, "update_and_fetch"):  # a model's own cache class without state / from_state (mlx-vlm MiniMaxM3KVCache:
+        n = object.__new__(type(c))                                  # a KVCache plus index keys): attribute by attribute, nested caches forked, arrays shared
+        n.__dict__.update({k: _fork_attr(v) for k, v in c.__dict__.items() if k != "mu_tag"})
+        return n
     raise TypeError(f"fork_cache: unsupported cache {type(c).__name__} (no from_state)")
+
+
+def _fork_attr(v):
+    if hasattr(v, "update_and_fetch") or isinstance(v, (KVCache, ArraysCache)):
+        return fork_cache([v])[0]
+    return _dup(v)
 
 
 def _fork_any_list(cs) -> list:

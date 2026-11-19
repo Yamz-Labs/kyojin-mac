@@ -1,83 +1,88 @@
-"""Union MoE decode (pairs of different users routed to the same expert share one trellis decode): per-pair results must be
-bit-identical to the plain gather path, and with a pinned k-split a user's row must not depend on the other users in the step.
-Synthetic ragged stacks (tests/test_moe.py helpers), mixed K, both codebooks. Needs a Mac (Metal)."""
+# SPDX-License-Identifier: Apache-2.0
+"""moe_union: the union expert kernels (each distinct expert read once for all the rows that chose it) equal the per-slot gather path, bit for bit, for K-family
+and legacy-family stored experts, T = 2..8 rows with overlapping routing; the device-side tables match a host reference."""
 import numpy as np
 import pytest
 
 mx = pytest.importorskip("mlx.core")
-if not mx.metal.is_available():
-    pytest.skip("Metal not available", allow_module_level=True)
+pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="needs Metal")
+from kyojin_mlx import foreign_gguf as GF, foreign_linear as FL, moe_union as MU  # noqa: E402
 
-from kyojin_mlx import moe as M
-from test_moe import E, KS, TOPK, make_stack, _x
-
-
-@pytest.fixture(scope="module", params=["mul1", "mcg"])
-def layer(request):
-    cb = request.param
-    kin, ninter = 256, 384
-    g, _ = make_stack(kin, ninter, KS, cb, 1)
-    u, _ = make_stack(kin, ninter, KS, cb, 2)
-    d, _ = make_stack(ninter, kin, KS, cb, 3)
-    return g, u, d
+BS = {"Q3_K": (110, 108), "Q4_K": (144, 0), "Q6_K": (210, 208)}
+H = F = 512
+E = 24
+K = 6
 
 
-def route(rows, mode, seed):
-    rng = np.random.default_rng(seed)
-    base = rng.choice(E, TOPK, replace=False)
-    ids = []
-    for r in range(rows):
-        if mode == "identical":
-            ids.append(base.copy())
-        elif mode == "permuted":
-            ids.append(rng.permutation(base))
-        elif mode == "partial":                                      # half of the base experts + fresh ones
-            keep = rng.permutation(base)[:TOPK // 2]
-            rest = [e for e in rng.permutation(E) if e not in keep][:TOPK - len(keep)]
-            ids.append(rng.permutation(np.concatenate([keep, rest])))
-        else:
-            ids.append(rng.choice(E, TOPK, replace=False))
-    w = rng.uniform(0.1, 1.0, (rows, TOPK)).astype(np.float32)
-    return mx.array(np.stack(ids).astype(np.int32)), mx.array((w / w.sum(-1, keepdims=True) * 1.5).astype(np.float32))
+def stack(tname, n, k, rng):
+    bs, nb = BS[tname]
+    row = k // 256 * bs
+    packs = []
+    for _ in range(E):
+        raw = rng.integers(0, 256, (n, row), dtype=np.uint8)
+        for b in range(k // 256):
+            o = b * bs + nb
+            if tname == "Q3_K":
+                raw[:, o:o + 2] = np.array([0x00, 0x1c], np.uint8)
+            elif tname == "Q4_K":
+                raw[:, o:o + 2] = np.array([0x00, 0x1c], np.uint8)
+                raw[:, o + 2:o + 4] = np.array([0x00, 0x18], np.uint8)
+            else:
+                raw[:, o:o + 2] = np.array([0x00, 0x1c], np.uint8)
+        packs.append(GF.to_pack(tname, raw, k))
+    return FL.DevPack(packs)
 
 
-def bits(a):
-    return np.array(a).view(np.uint32)
+def host_tables(inds, R):
+    T, Kk = inds.shape
+    S = T * Kk
+    order = []
+    for e in inds.reshape(-1):
+        if int(e) not in order:
+            order.append(int(e))
+    groups = []
+    for e in order:
+        rows = [r * Kk + k for r in range(T) for k in range(Kk) if inds[r, k] == e]
+        for c in range(0, len(rows), R):
+            groups.append((e, rows[c:c + R]))
+    eids = np.zeros(S, np.uint32)
+    osl = np.full((S, R), 0xFFFFFFFF, np.uint32)
+    for g, (e, rows) in enumerate(groups):
+        eids[g] = e
+        osl[g, :len(rows)] = rows
+    return eids, osl.reshape(-1), len(groups)
 
 
-@pytest.mark.parametrize("rows", [2, 3, 4, 5, 8, 9])      # 5-8: eight-member variant, 9: falls back to the plain path
-@pytest.mark.parametrize("mode", ["identical", "permuted", "partial", "random"])
-@pytest.mark.parametrize("wpre", [False, True])
-def test_union_equals_gather(layer, rows, mode, wpre):
-    g, u, d = layer
-    plain = M.MoeGather(g, u, d, TOPK, wpre=wpre, tgk_gu=2, tgk_dn=2)
-    uni = M.MoeGather(g, u, d, TOPK, wpre=wpre, tgk_gu=2, tgk_dn=2, union=True)
-    ids, w = route(rows, mode, 10 * rows + len(mode))
-    x = _x(rows, g.kin, 7)
-    assert np.array_equal(bits(plain(x, ids, w)), bits(uni(x, ids, w)))
-    # stage level: the partials of every (pair, projection)
-    fl = ids.reshape(-1).astype(mx.int32)
-    xh = plain.rot_gu(x, fl)
-    assert np.array_equal(bits(plain.gemv_gu(xh, fl, rows)), bits(uni.gemv_gu(xh, fl, rows)))
+@pytest.mark.parametrize("R", [1, 2, 3, 8])
+@pytest.mark.parametrize("T", [2, 5, 6, 8])
+def test_tables(T, R):
+    rng = np.random.default_rng(T)
+    inds = np.stack([rng.choice(E, K, replace=False) for _ in range(T)]).astype(np.uint32)
+    eu, osl = MU.tables(mx.array(inds), T, K, R)
+    he, ho, n = host_tables(inds, R)
+    assert np.array_equal(np.array(eu)[:n], he[:n]) and np.array_equal(np.array(osl), ho)
 
 
-@pytest.mark.parametrize("mode", ["identical", "partial", "random"])
-def test_pinned_rows_do_not_depend_on_the_batch(layer, mode):
-    g, u, d = layer
-    uni = M.MoeGather(g, u, d, TOPK, union=True, pin_rows=1)
-    ids, w = route(4, mode, 99)
-    x = _x(4, g.kin, 3)
-    y = bits(uni(x, ids, w))
-    for r in range(4):
-        assert np.array_equal(y[r], bits(uni(x[r:r + 1], ids[r:r + 1], w[r:r + 1]))[0]), r
-    y2 = bits(uni(x[:2], ids[:2], w[:2]))
-    assert np.array_equal(y2, y[:2])
-
-
-def test_union_kernel_is_the_one_running(layer):
-    g, u, d = layer
-    uni = M.MoeGather(g, u, d, TOPK, union=True, pin_rows=1)
-    ids, w = route(3, "identical", 5)
-    uni(_x(3, g.kin, 1), ids, w)
-    assert any(k[0] == "ug" and k[-1] == 4 for k in M._kc), list(M._kc)
-    uni(_x(1, g.kin, 1), ids[:1], w[:1])                      # one row: plain gather kernel, nothing to share
+@pytest.mark.parametrize("types", [("Q3_K", "Q3_K", "Q4_K"), ("Q3_K", "Q3_K", "Q6_K"), ("Q4_K", "Q4_K", "Q4_K")])
+@pytest.mark.parametrize("R", [1, 2, 3, 8])
+@pytest.mark.parametrize("T", [2, 6, 8])
+def test_union_equals_gather(types, T, R, monkeypatch):
+    monkeypatch.setenv("KYOJIN_MOE_UNION_R", str(R))
+    rng = np.random.default_rng(7)
+    sw = FL.ForeignSwitchGLU(stack(types[0], F, H, rng), stack(types[1], F, H, rng), stack(types[2], H, F, rng))
+    x = mx.array((rng.standard_normal((T, 1, H)) * 0.5).astype(np.float32)).astype(mx.float16)
+    inds = np.stack([rng.choice(E, K, replace=False) for _ in range(T)])[:, None, :].astype(np.uint32)
+    old = (FL.GATEUP_PAIR, MU.UNION)
+    try:
+        FL.GATEUP_PAIR = True
+        MU.UNION = False
+        ref = sw(x, mx.array(inds))
+        MU.UNION = True
+        n0 = MU.PATHS["union"]
+        got = sw(x, mx.array(inds))
+        mx.eval(ref, got)
+        assert MU.PATHS["union"] == n0 + 1, "the union path did not run"
+    finally:
+        FL.GATEUP_PAIR, MU.UNION = old
+    a, b = np.array(ref).astype(np.float32), np.array(got).astype(np.float32)
+    assert np.array_equal(a, b), f"max |diff| {np.abs(a - b).max()}"

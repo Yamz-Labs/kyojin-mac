@@ -207,6 +207,19 @@ def test_lru_cap_evicts_leaves_first_and_keeps_chains_loadable(tmp_path):
     assert kv.bytes() <= kv.cap
 
 
+def test_cap_lowered_since_last_run_applies_at_startup(tmp_path):
+    lm, cfg = M.make(sliding_window=16)
+    kv = mk(tmp_path, lm, 32)                             # no cap: 6 files stay
+    prefill_save(lm, kv, M.tokens(100, seed=1), 32, 96)
+    prefill_save(lm, kv, M.tokens(100, seed=2), 32, 96)
+    one, n = kv.bytes() // len(kv.index), len(kv.index)
+    kv2 = mk(tmp_path, lm, 32, cap=int(one * 2.5))       # same namespace, lower cap: evicted in __init__, before any save
+    assert kv2.bytes() <= kv2.cap and kv2.stats["evicted"] == n - len(kv2.index) > 0
+    for k, e in kv2.index.items():
+        assert e["parent"] is None or e["parent"] in kv2.index
+    assert len(os.listdir(kv2.dir)) - 1 == len(kv2.index)   # the files are gone too (+ namespace.json)
+
+
 def flat(c):
     from mlx.utils import tree_flatten
     if type(c).__name__ == "KVCache":

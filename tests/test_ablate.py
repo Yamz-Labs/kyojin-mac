@@ -70,7 +70,7 @@ def test_flag_is_off_by_default_and_validated():
         AZ.parse("norm,nope")
     with pytest.raises(ValueError):
         FL.set("ablate", "nope")                                                      # refused before anything is applied
-    assert set(AZ.CLASSES) == {"moe_routed", "moe_shared", "router", "moe_glue", "mhc", "norm", "attn", "idx", "ablit"}
+    assert set(AZ.CLASSES) >= {"moe_routed", "moe_shared", "router", "moe_glue", "mhc", "norm", "attn", "idx", "ablit"}
 
 
 def test_flag_set_writes_env_active_and_bumps_gen():

@@ -156,12 +156,17 @@ class LatentTQCache(KVCache):
     def prefix_cache_merge(self, rows, prefix_lens):
         return None
 
-    def to_dense(self, dtype=mx.bfloat16):
-        c = KVCache()
+    def to_dense(self, dtype=None):
+        """The exact dense latent (sink / window rows as written, pool rows dequantized) as a `LatentDense` row; dtype defaults to the dtype the rows were written in
+        (fp16 / bf16 inputs are never narrowed to bf16: that would round every sink / window row)."""
+        c = LatentDense()
         if self.words is not None:
-            c.keys = mx.contiguous(self._dense(dtype))
-            c.values = mx.zeros((*c.keys.shape[:3], 0), dtype=dtype)
+            dt = dtype or (self.rk.dtype if self.rk is not None else mx.bfloat16)
+            c.keys = mx.contiguous(self._dense(dt))
+            c.values = mx.zeros((*c.keys.shape[:3], 0), dtype=dt)
             c.offset = self.offset
+            c.tq_cfg = (self.qbits, self.sink_n, self.window)
+            c.rolled = self.offset - (0 if self.rk is None else self.rk.shape[2])     # rows below this are already the dequantized pool rows
         return c
 
     def extract(self, idx):
@@ -172,7 +177,141 @@ class LatentTQCache(KVCache):
 
     @classmethod
     def merge(cls, caches):
-        return BatchKVCache.merge([c.to_dense() for c in caches])
+        return _merge_rows(caches)
+
+
+def _dense_rows(caches):
+    """Rows of a mixed membership as plain dense caches: a LatentTQCache (a session fresh from prefill) is dequantized, a dense row (one that was
+    batched, then extracted) is kept as is."""
+    return [c.to_dense() if isinstance(c, LatentTQCache) else c for c in caches]
+
+
+def _merge_rows(caches):
+    """One batch cache from rows that are LatentTQCache and / or dense (`LatentDense`, a stock KVCache). BatchKVCache.merge reads `.keys`, which a
+    LatentTQCache does not hold (None -> an all-zero row): every row goes through `to_dense` first, whatever type the first row has."""
+    return LatentBatch.merge(_dense_rows(caches))
+
+
+def _roundtrip(x, bits):
+    """Rows `x` [B, H, n, D] as the pool would serve them (rotate + Lloyd-Max write, then dequant): what a window row becomes when it leaves the ring."""
+    B, H, n, D = x.shape
+    w, s = tq.tq_write(tq.rotate(x.reshape(-1, HALF), HALF), bits)
+    y = tq.unrotate(tq.tq_dequant(w, s, bits, HALF, mx.float32), HALF)
+    return y.reshape(B, H, n, D).astype(x.dtype)
+
+
+def _roll(keys, cfg, lo, hi, rolled, pad):
+    """Dense rows `keys` [B, H, L, D] of a batch: the columns [lo, hi) left the exact window this step, so each row of the batch that has not rolled them yet
+    (`rolled` = per-row first column still exact, `pad` = per-row left padding: an array or a host list) gets the quantized value its solo `LatentTQCache` serves
+    for that position (sink rows and padding stay as they are). Without this a merged row keeps rows exact that its solo run has already rounded, and every decode step
+    widens the gap (each row of the window that rolls out is one more difference in the attention of a context shorter than index_topk, where the
+    indexer keeps every row).
+    Which (row, column) pairs roll is known on the host (rolled / pad are host values), so the common case where every pair rolls writes the rounded columns straight
+    into the buffer: no mask arithmetic, no select (G3d: those were 8 of the 14 launches of the step's roll)."""
+    bits, sink, _ = cfg
+    cols = keys[:, :, lo:hi]
+    q = _roundtrip(cols, bits)
+    ph = pad.tolist() if hasattr(pad, "tolist") else list(pad)
+    todo = [[c >= rolled[b] and c - ph[b] >= sink for c in range(lo, hi)] for b in range(len(ph))]
+    if all(all(r) for r in todo):
+        keys[:, :, lo:hi] = q
+        return
+    if not any(any(r) for r in todo):
+        return
+    keys[:, :, lo:hi] = mx.where(mx.array(todo)[:, None, :, None], q, cols)
+
+
+class LatentDense(KVCache):
+    """A latent row that left a batch (or was densified for one): a KVCache whose `merge` accepts LatentTQCache rows next to dense ones. The engine merges with
+    `type(first row).merge`, so a batch that has an extracted row first and a fresh LatentTQCache later must not fall to `KVCache.merge`.
+    It keeps the TurboQuant overlay of the row it came from (`tq_cfg` = bits, sink, window; `rolled` = rows below it are already quantized) and rounds the
+    rows that leave the window as they would have in `LatentTQCache`, so a row decoded dense is the row decoded solo."""
+    tq_cfg = None
+    rolled = 0
+
+    @classmethod
+    def merge(cls, caches):
+        return _merge_rows(caches)
+
+    def update_and_fetch(self, keys, values):
+        out = super().update_and_fetch(keys, values)
+        if self.tq_cfg is None:
+            return out
+        hi = self.offset - self.tq_cfg[2]
+        if hi > self.rolled:
+            _roll(self.keys, self.tq_cfg, self.rolled, hi, [self.rolled], [0])
+            self.rolled = hi
+            return self.keys[..., :self.offset, :], self.values[..., :self.offset, :]
+        return out
+
+    def trim(self, n):
+        n = super().trim(n)
+        self.rolled = min(self.rolled, self.offset)
+        return n
+
+
+class LatentBatch(BatchKVCache):
+    """The merged latent cache: stock BatchKVCache whose rows extract back to `LatentDense`. Like `LatentDense` it rounds, per row, the rows that leave the
+    TurboQuant window (`_rolled[i]` = first physical column of row i still exact), so row i decodes as it does solo."""
+    tq_cfg = None
+
+    @classmethod
+    def merge(cls, caches):
+        batch = super().merge(caches)
+        cfgs = [c.tq_cfg for c in caches if getattr(c, "tq_cfg", None) is not None]
+        if cfgs and batch.keys is not None:
+            batch.tq_cfg = cfgs[0]
+            top = batch.keys.shape[2]
+            pads = batch.left_padding.tolist()
+            batch._rolled = [p + (c.rolled if getattr(c, "tq_cfg", None) is not None else c.offset) for p, c in zip(pads, caches)]   # a row without overlay never rolls
+            batch._rolled = [min(r, top) for r in batch._rolled]
+        return batch
+
+    def update_and_fetch(self, keys, values):
+        out = super().update_and_fetch(keys, values)
+        if self.tq_cfg is None:
+            return out
+        hi = self._idx - self.tq_cfg[2]
+        lo = min(self._rolled)
+        if hi > lo:
+            _roll(self.keys, self.tq_cfg, lo, hi, self._rolled, self.left_padding)
+            self._rolled = [max(r, hi) for r in self._rolled]
+            return self.keys[..., :self._idx, :], self.values[..., :self._idx, :]
+        return out
+
+    def trim(self, n):
+        n = super().trim(n)
+        if self.tq_cfg is not None:
+            self._rolled = [min(r, self._idx) for r in self._rolled]
+        return n
+
+    def filter(self, batch_indices):
+        idx = batch_indices.tolist() if hasattr(batch_indices, "tolist") else list(batch_indices)
+        idx = [idx] if isinstance(idx, int) else idx
+        idx0 = self._idx
+        super().filter(batch_indices)
+        if self.tq_cfg is not None:
+            shift = idx0 - self._idx
+            self._rolled = [max(0, self._rolled[i] - shift) for i in idx]
+
+    def extend(self, other):
+        lefts = (max(self._idx, other._idx) - self._idx, max(self._idx, other._idx) - other._idx)
+        mine = [r + lefts[0] for r in (self._rolled if self.tq_cfg is not None else [self._idx] * self.offset.size)]            # no overlay: never rolls
+        theirs = [r + lefts[1] for r in (other._rolled if other.tq_cfg is not None else [other._idx] * other.offset.size)]
+        cfg = self.tq_cfg or other.tq_cfg
+        super().extend(other)
+        self.tq_cfg = cfg
+        if cfg is not None:
+            self._rolled = mine + theirs
+
+    def extract(self, idx):
+        c = super().extract(idx)
+        d = LatentDense()
+        d.keys, d.values, d.offset = c.keys, c.values, c.offset
+        if self.tq_cfg is not None and c.keys is not None:
+            d.tq_cfg = self.tq_cfg
+            d.rolled = max(0, min(self._rolled[idx] - self.left_padding[idx].item(), d.offset))
+        return d
 
 
 def wrap_latent_layers(cache, cfg: dict):
@@ -207,16 +346,31 @@ def install_attend() -> bool:
     stock = cls._attend
 
     def _attend(self, q, latent, new_latent, topk, kv_cache, projected_cache, last_only=False):
+        from . import glm_dsa as _H
         if q.shape[2] != 1 or self.training or not isinstance(kv_cache, LatentTQCache) or kv_cache.words is None or topk is None:
+            k = "attend:stock:" + type(kv_cache).__name__ + (":L>1" if q.shape[2] != 1 else "")
+            _H.HITS[k] = _H.HITS.get(k, 0) + 1
             return stock(self, q, latent, new_latent, topk, kv_cache, projected_cache, last_only)
+        _H.HITS["attend:tq"] = _H.HITS.get("attend:tq", 0) + 1
         batch = q.shape[0]
         n = kv_cache.offset
-        sel = topk[:, 0:1]
-        valid = (sel >= 0) & (sel < n)
-        safe = mx.clip(sel, 0, max(n - 1, 0))
-        selected = kv_cache.gather(safe[:, None, 0, :, None], new_latent.dtype)
-        query = self.embed_q(q)
-        out = L.scaled_dot_product_attention(query, selected, selected, cache=kv_cache, scale=self.scale, mask=valid[:, None])
+        from . import glm_dsa as _G
+        out = None
+        if _G.gather_usable(kv_cache, q, topk, new_latent):
+            if _G.attend_usable(self, q):
+                rows, vm = _G.gather_rows(kv_cache, topk[0, 0], new_latent.dtype, pad=32)       # rows + validity, then the attention over them (see glm_dsa)
+                out = _G.attend(self.embed_q(q), rows, vm, self.scale)
+            else:
+                rows, vm = _G.gather_rows(kv_cache, topk[0, 0], new_latent.dtype)
+                selected, valid = rows[None, None], vm[None, None]
+        else:
+            sel = topk[:, 0:1]
+            valid = (sel >= 0) & (sel < n)
+            safe = mx.clip(sel, 0, max(n - 1, 0))
+            selected = kv_cache.gather(safe[:, None, 0, :, None], new_latent.dtype)
+        if out is None:
+            query = self.embed_q(q)
+            out = L.scaled_dot_product_attention(query, selected, selected, cache=kv_cache, scale=self.scale, mask=valid[:, None])
         out = self.unembed_out(out)
         if last_only:
             topk = topk[:, -1:]
