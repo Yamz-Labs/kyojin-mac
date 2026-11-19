@@ -45,9 +45,9 @@ Tested on a Mac Studio with 256 GB of unified memory.
     hf download AngelSlim/Hy4-flash-GGUF --include "Hy4-flash-Q3_K-*.gguf" --local-dir ./hy4-flash
     set -a; . tools/hy4_mac.env; set +a
     python -m kyojin_mlx.serve.server --model ./hy4-flash --port 8080 --model-id Hy4-flash \
-        --sessions 1 --ctx 262144 --kv-mode fp16 --no-kv-disk --prefill-chunk 2048 --mtp-depth 5
+        --sessions 1 --ctx 262144 --kv-mode fp16 --no-kv-disk --prefill-chunk 2048 --mtp-depth 5 --cache-limit-mb 16384
 
-`tools/hy4_mac.env` holds the kernel flags of the measured line. Speculative decoding uses the model's own multi-token-prediction head (`--mtp-depth 5`).
+`tools/hy4_mac.env` holds the kernel flags of the measured line. The prefill speed depends on the MLX buffer cache limit: `--cache-limit-mb 16384` is the value of the measured line (without the flag the limit is derived from the weights and the free memory). Speculative decoding uses the model's own multi-token-prediction head (`--mtp-depth 5`).
 Speed numbers: see the benchmark table.
 
 - Context: 256K tokens (`--ctx 262144`). 1M tokens is not part of this release.
