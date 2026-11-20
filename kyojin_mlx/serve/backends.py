@@ -400,7 +400,7 @@ class VlmBackend(Backend):
             ns["tq"] = tq.config()                          # (absent when off: the namespace of existing checkpoints is unchanged)
         from .. import ablit
         if (sig := ablit.signature()) is not None:
-            ns["ablit"] = sig                               # decensor hook: other layer outputs (absent when off: namespace unchanged)
+            ns["ablit"] = sig                               # refusal-direction hook: other layer outputs (absent when off: namespace unchanged)
         if self.drafter is not None:                # the drafter ring is part of the checkpoint
             ns["draft"] = [list(self.drafter.tap_ids), int(self.drafter.window)]
         return ns

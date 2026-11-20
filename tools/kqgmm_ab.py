@@ -28,7 +28,7 @@ def _sampler():                                              # footprint trace: 
             print(f"[fp] {last:.1f} -> {f:.1f} GiB at " + " < ".join(f"{x.name}:{x.lineno}" for x in traceback.extract_stack(fr)[-4:][::-1]), flush=True)
         last = f; time.sleep(0.25)
 threading.Thread(target=_sampler, daemon=True).start()
-if os.environ.get('SG_CACHE_MB'): mx.set_cache_limit(int(os.environ['SG_CACHE_MB']) << 20)                                   # load: freed host buffers go back to the OS (the box leakguard sums all footprints)
+if os.environ.get('SG_CACHE_MB'): mx.set_cache_limit(int(os.environ['SG_CACHE_MB']) << 20)                                   # load: freed host buffers go back to the OS (the box memory guard sums all footprints)
 be, _ = load_backend(a.pack, log=lambda *x: None)
 mx.clear_cache()
 m = be.model; lm = m.language_model if "language_model" in m else m; trunk = MU._trunk(lm)

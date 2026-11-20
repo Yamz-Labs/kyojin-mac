@@ -1,6 +1,6 @@
 """GPU lock on the Mac: ONE heavy job at a time (25/10 kernel panic: two 29 GiB jobs on 16 GB). flock on the same file as `lockf -k ~/kyojin-mlx/.gpu.lock`
 (flock(2) on macOS, the same lock the day-1 runner and the gates take). A job takes it for its whole run and releases it between jobs, so another
-agent's job is never blocked longer than one qualify job. Before each job: free memory and the tail of the macguard log."""
+agent's job is never blocked longer than one qualify job. Before each job: free memory and the tail of the memory guard log."""
 from __future__ import annotations
 
 import contextlib

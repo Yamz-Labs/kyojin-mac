@@ -3,7 +3,7 @@
 Pins (1) the flag parses / validates / round-trips through flags.set and is off by default, (2) with the flag off the batched step and the verify rows are bit
 identical to the base (before any use and after a set / reset), (3) each class runs end to end on a tiny DS4.1 model (batched core, `rows.enable`: plain step and verify
 rows) and its stand-in site is reached (HITS) where the mini model carries that site, (4) the sites the mini model does not carry (MoeGather stages, the sumoe
-routed call, the shared-expert impl, the fused mHC functions, the decensor projection, the fused-attention solo core) return the shapes / dtypes their consumers read."""
+routed call, the shared-expert impl, the fused mHC functions, the refusal-direction projection, the fused-attention solo core) return the shapes / dtypes their consumers read."""
 import os
 import sys
 from types import SimpleNamespace

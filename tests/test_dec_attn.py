@@ -208,7 +208,7 @@ def test_verify_logits_bit_equal(model, n, monkeypatch):
 
 
 def test_core_still_writes_through_the_ablit_writer(model, monkeypatch):
-    """The decensor hook projects after wo_b: the indexer levers must not bypass that writer."""
+    """The refusal-direction hook projects after wo_b: the indexer levers must not bypass that writer."""
     from kyojin_mlx import rows as RW
     attn = model.language_model.layers[1].attn
     calls = []
@@ -221,4 +221,4 @@ def test_core_still_writes_through_the_ablit_writer(model, monkeypatch):
     x = mx.array(np.zeros((2, 1, 512), np.float16))
     o = C.core(attn, x, s)
     mx.eval(o)
-    assert calls, "wo_b (the abliteration writer) was skipped"
+    assert calls, "wo_b (the direction-projection writer) was skipped"

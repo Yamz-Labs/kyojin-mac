@@ -1,4 +1,4 @@
-"""Runtime decensor hook (kyojin_mlx.ablit) on a tiny random DS4.1 stack (stock mlx-vlm modules, fp32): the hook equals the weight edit
+"""Runtime refusal-direction hook (kyojin_mlx.ablit) on a tiny random DS4.1 stack (stock mlx-vlm modules, fp32): the hook equals the weight edit
 W_out <- (I - w r r^T) W_out of the writers (wo_b, shared down_proj, every routed down_proj) on the eager decode path, the prompt path and the CED prefill;
 the spec switch off is bit-identical to no hook; blocks that are not armed (draft head, layers >= n_layers, weight 0) are never touched."""
 import json

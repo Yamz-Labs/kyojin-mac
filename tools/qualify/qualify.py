@@ -59,7 +59,7 @@ def parse(argv=None) -> dict:
     ap.add_argument("--doc-tokens", type=int, help="tokens per parity doc (air 512, ultra 2048)")
     ap.add_argument("--kv-n", type=int, help="context of the KV stage's long doc (air 2048, ultra 32768)")
     ap.add_argument("--kv-eval", type=int, help="scored positions at the end of the long doc (air 128, ultra 512)")
-    ap.add_argument("--mem-cap-gib", type=float, help="footprint cap of one job (default 13 GiB = the macguard rule on the Air; set it for the Ultra)")
+    ap.add_argument("--mem-cap-gib", type=float, help="footprint cap of one job (default 13 GiB = the memory guard rule on the Air; set it for the Ultra)")
     ap.add_argument("--autotune-rounds", type=int, default=5, help="interleaved timing rounds per candidate of the autotune stage")
     ap.add_argument("--kv-kl-max", type=float, default=0.02)
     ap.add_argument("--ctx-cap", type=int, help="cap of the max-ctx search (default: the model's max_position_embeddings)")
