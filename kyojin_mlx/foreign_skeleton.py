@@ -906,6 +906,8 @@ class Model(nn.Module):
         for il, (layer, c) in enumerate(zip(m.layers, cache)):
             sw = layer.self_attn.swa
             if sp.hc_count:
+                if getattr(eng, "pending", None) is not None and eng.pending(il):    # prompt chunk, this layer's table rows still being read: the layers built so far run on the GPU meanwhile
+                    mx.async_eval(h)
                 eg = eng.get(il)
                 if eg is not None and "engram" in layer:            # the Engram write is host numpy (table rows): it runs here, eagerly, so the layer itself is a pure array program (step_compile)
                     h, eg = layer.engram(h, *eg, sp.engram_eps), False
@@ -1023,6 +1025,7 @@ def engram_source_of(g):
     from . import engram_gguf as EG
     spec = EG.EngramGgufSpec.from_gguf(g)
     rm = EG.GgufRowMap(spec)
+    rd = EG.RowReader(g, spec)
 
     def src(ids, offset):
         if offset == 0:
@@ -1030,12 +1033,28 @@ def engram_source_of(g):
         if len(rm.history) != offset:
             raise SkeletonError(f"Engram history holds {len(rm.history)} positions, the cache {offset}")
         rows, valid = rm.rows_valid(ids)
-        return {lid: (EG.read_rows(g, spec, rows[:, i]), valid) for i, lid in enumerate(spec.layer_ids)}
+        if not EG.PREAD:                                           # KYOJIN_HY4_ENGRAM_PREAD=0: the memory-map gather (serial page-ins on a cold row)
+            return {lid: (EG.read_rows(g, spec, rows[:, i]), valid) for i, lid in enumerate(spec.layer_ids)}
+        return rd.layers(rows, valid, offset)
 
     def truncate(n):
         """Speculative rollback: the history keeps its first n positions (the rows of rejected drafts leave it)."""
         rm.history = rm.history[:n]
+
+    def hint(ids, a, b):
+        """The prompt positions [a, b) are the next prefill chunk: their rows are read in the background (content-addressed pieces: a wrong hint only misses)."""
+        if not (EG.PREAD and EG.AHEAD):
+            return False
+        a, b = int(a), min(int(b), int(a) + EG.AHEAD_MAX, len(ids))
+        if b - a < EG.LAZY_MIN:
+            return False
+        lo = max(0, a - (spec.ngram_size - 1))
+        prev, _ = EG.compressed_ids(spec, ids[lo:a])
+        cids, _ = EG.compressed_ids(spec, ids[a:b])
+        rd.hint(EG.hash_rows(spec, prev, cids, start=a), a)
+        return True
     src.truncate, src.history_len = truncate, lambda: len(rm.history)
+    src.hint, src.reader = hint, rd
     src.get_history = lambda: rm.history                         # per-session history: the serve backend parks / restores it when the live session changes (arrays are replaced, never edited in place)
     src.set_history = lambda h: setattr(rm, "history", h)
     return src

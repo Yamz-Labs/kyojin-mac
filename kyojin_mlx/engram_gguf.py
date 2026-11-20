@@ -24,6 +24,7 @@ Forward (`engram_forward`, the served DS4.1 Engram: mlx_vlm deepseek_v41 Engram 
 eps is the caller's: DS4.1 safetensors takes rms_norm_eps; Hy4's llama.cpp patch takes FLT_EPSILON (HY4_BUILD.md), not read from a key."""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -132,21 +133,38 @@ class GgufRowMap:
         """-> (rows [L, nl, n_cols] int64, valid [L] bool). A token id outside token_map (or negative) is DEAD, as llama.cpp engram_hash
         (hy-v4-flash.cpp:353-374): its own window slot takes the pad's compressed id and the position is invalid (no Engram delta); as an earlier
         token of a later window it is the pad too (history keeps the pad's id)."""
-        s = self.spec
-        ids = np.asarray(token_ids, np.int64).reshape(-1)
-        dead = (ids < 0) | (ids >= len(s.token_map))
-        cids = np.where(dead, s.pad_id, s.token_map[np.where(dead, 0, ids)])
-        start = len(self.history)
+        cids, dead = compressed_ids(self.spec, token_ids)
+        rows = hash_rows(self.spec, self.history, cids)
         self.history = np.concatenate([self.history, cids])
-        pos = np.arange(start, len(self.history))
-        toks = np.stack([np.where(pos - j < 0, s.pad_id, self.history[np.maximum(pos - j, 0)]) for j in range(s.ngram_size)], -1)   # [L, ng]
-        # uint64 as llama.cpp engram_hash (M:5211-5216): equal to int64 while the products fit int64 (DS4.1), right past it (Hy4-flash)
-        prod = toks.astype(np.uint64)[:, None, :] * s.multipliers.astype(np.uint64)[None]                                        # [L, nl, ng]
-        rolling, out = prod[..., 0], []
-        for n in range(1, s.ngram_size):
-            rolling = np.bitwise_xor(rolling, prod[..., n])
-            out.append((rolling[..., None] % s.primes[:, n - 1].astype(np.uint64)[None]).astype(np.int64))
-        return np.concatenate(out, -1) + s.offsets[None], ~dead
+        return rows, ~dead
+
+
+def compressed_ids(spec: EngramGgufSpec, token_ids):
+    """token ids -> (compressed ids [L] int64, dead [L] bool); a dead id (outside token_map, or negative) takes the pad's compressed id."""
+    ids = np.asarray(token_ids, np.int64).reshape(-1)
+    dead = (ids < 0) | (ids >= len(spec.token_map))
+    return np.where(dead, spec.pad_id, spec.token_map[np.where(dead, 0, ids)]), dead
+
+
+def hash_rows(spec: EngramGgufSpec, history, cids, start: int | None = None) -> np.ndarray:
+    """Table rows [L, nl, n_cols] int64 of the positions that follow `history` (compressed ids of the earlier positions; only the last ngram_size - 1 count)
+    and carry `cids`. `start`: the first position when `history` is only the tail of what came before (default: len(history)). Pure: no state is touched
+    (the row map and the prefetch hint both call it)."""
+    s = spec
+    h0 = np.asarray(history, np.int64)
+    start = len(h0) if start is None else int(start)
+    tail = h0[-(s.ngram_size - 1):]
+    base = start - len(tail)                                             # absolute position of arr[0]
+    arr = np.concatenate([tail, cids])
+    pos = np.arange(start, start + len(cids))
+    toks = np.stack([np.where(pos - j < 0, s.pad_id, arr[np.maximum(pos - j - base, 0)]) for j in range(s.ngram_size)], -1)   # [L, ng]
+    # uint64 as llama.cpp engram_hash (M:5211-5216): equal to int64 while the products fit int64 (DS4.1), right past it (Hy4-flash)
+    prod = toks.astype(np.uint64)[:, None, :] * s.multipliers.astype(np.uint64)[None]                                        # [L, nl, ng]
+    rolling, out = prod[..., 0], []
+    for n in range(1, s.ngram_size):
+        rolling = np.bitwise_xor(rolling, prod[..., n])
+        out.append((rolling[..., None] % s.primes[:, n - 1].astype(np.uint64)[None]).astype(np.int64))
+    return np.concatenate(out, -1) + s.offsets[None]
 
 
 def table_loc(g: "GF.GgufFile", spec: EngramGgufSpec) -> list:
@@ -165,6 +183,198 @@ def read_rows(g: "GF.GgufFile", spec: EngramGgufSpec, rows) -> np.ndarray:
     r = np.asarray(rows, np.int64)
     raw = g.raw(TABLE)
     return GF.dequant(spec.table_type, raw[r.reshape(-1)], spec.head_dim).reshape(r.shape + (spec.head_dim,))
+
+
+# ----------------------------------------------------------------------------------------------------------------- rows from the file: parallel preads
+# The Hy4-flash table is 63 GB (660M rows x 96 B, 4 Engram layers x 16 columns). Rows hash to uniformly random places, so `raw[rows]` on the memory map pays one serial 16 KB page-in per
+# cold row (a 4096-token chunk reads ~260k rows: cold prefill 126-435 tok/s against ~2000 warm, flat-diag / coldbase 19/11). The table stays on disk (owner 19/11: no warm-up, no pinning):
+# the rows of a request are DEDUPED, read by parallel native preads (engram_rows rowread, GIL released) and decoded by row. Prompt chunks read layer by layer in the background (the
+# forward waits for a layer's rows at that layer, so the GPU runs the layers before it), and a hint of the NEXT chunk (Hy4Backend.warm_prompt) reads its rows during this one.
+# Prefetched rows are content-addressed (row id -> bytes): a stale hint can only miss, never change an output. A row's bytes decode alone, so every path gives the same floats as `read_rows`.
+PREAD = os.environ.get("KYOJIN_HY4_ENGRAM_PREAD", "0") not in ("0", "")      # flags.py hy4_engram_pread: 0 = the memory-map gather (read_rows)
+LAZY = os.environ.get("KYOJIN_HY4_ENGRAM_LAZY", "0") not in ("0", "")        # flags.py hy4_engram_lazy: prompt chunks read layer by layer in the background
+AHEAD = os.environ.get("KYOJIN_HY4_ENGRAM_AHEAD", "0") not in ("0", "")      # flags.py hy4_engram_ahead: the next chunk's rows are read while this one runs
+LOG = os.environ.get("KYOJIN_HY4_ENGRAM_LOG", "0") not in ("0", "")          # one serve-log line per prompt chunk
+LAZY_MIN = 256                                                              # rows (positions) from which a request is a prompt chunk
+AHEAD_MAX = int(os.environ.get("KYOJIN_HY4_ENGRAM_AHEAD_MAX", "8192"))       # positions of one hint that are read ahead
+READ_THREADS = int(os.environ.get("KYOJIN_HY4_ENGRAM_THREADS", "64"))
+HOT_SAMPLE = 256
+STATS = {"calls": 0, "chunks": 0, "rows": 0, "unique": 0, "ahead_hit": 0, "read_rows": 0, "map_rows": 0, "read_s": 0.0, "wait_s": 0.0, "hints": 0, "hint_rows": 0, "hint_s": 0.0}
+
+
+class RowReader:
+    """Rows of the ONE table by parallel pread, deduped; `ahead` pieces (hinted next-chunk rows) answer a request first."""
+
+    def __init__(self, g: "GF.GgufFile", spec: EngramGgufSpec):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        self.spec = spec
+        self.raw = g.raw(TABLE)                                          # the memory map: only the hot-row path and the no-pread fallback gather from it
+        ti = g.tensors[TABLE]
+        src = g._owner.get(TABLE, g)
+        self.path, self.base, self.rb = src.path, src.data_start + ti.offset, int(self.raw.shape[1])
+        self.n_rows = int(self.raw.shape[0])
+        self._fd = None
+        self._lock = threading.Lock()
+        self._pieces: list = []                                          # [gen, layer_pos, Future -> (rows sorted unique, bytes), used, first position, end position]
+        self._gen = 0
+        self._lay = ThreadPoolExecutor(1, thread_name_prefix="hy4eng-lay")   # one prompt chunk's layers, in order
+        self._ahd = ThreadPoolExecutor(1, thread_name_prefix="hy4eng-ahead")
+
+    def fd(self) -> int:
+        if self._fd is None:
+            self._fd = os.open(self.path, os.O_RDONLY)
+        return self._fd
+
+    def close(self) -> None:
+        for ex in (self._lay, self._ahd):
+            ex.shutdown(wait=True)
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+
+    # ---- the bytes of sorted unique rows
+    def read_unique(self, u: np.ndarray) -> np.ndarray:
+        """uint8 [n, rb] of the sorted unique table rows `u`: the map when most of them are in the page cache (hot reads cost ~1 us there, preads of cached pages serialize),
+        else native preads from READ_THREADS threads."""
+        from .engram_rows import _rowread
+        n = u.size
+        if n == 0:
+            return np.empty((0, self.rb), np.uint8)
+        assert 0 <= u[0] and u[-1] < self.n_rows, "Engram row out of range"
+        rr = _rowread()
+        if rr is None:
+            STATS["map_rows"] += n
+            return self.raw[u]
+        uc = np.ascontiguousarray(u, np.int64)
+        k = min(n, HOT_SAMPLE)
+        if rr.hot(self.raw.ctypes.data, uc.ctypes.data, n, self.rb, k) * 2 >= k:
+            STATS["map_rows"] += n
+            return self.raw[u]
+        dst = np.empty((n, self.rb), np.uint8)
+        if rr.read(self.fd(), self.base, uc.ctypes.data, n, self.rb, dst.ctypes.data, max(1, min(READ_THREADS, n // 4))) != 0:
+            raise IOError(f"short read in {self.path}")
+        STATS["read_rows"] += n
+        return dst
+
+    # ---- rows of a request -> floats
+    def fetch(self, rows, layer_pos: int | None = None, offset: int = -1) -> np.ndarray:
+        """float32 [.., head_dim] of table rows (any shape of ids), the same values as `read_rows`. `layer_pos`: every row lies in that Engram layer's range; `offset`: the first position
+        of the request (both only choose which hinted pieces are worth waiting for: a piece answers by row id, so a wrong guess is a miss, never a wrong row)."""
+        import time
+        t0 = time.perf_counter()
+        r = np.asarray(rows, np.int64)
+        u, inv = np.unique(r.reshape(-1), return_inverse=True)
+        buf = np.empty((u.size, self.rb), np.uint8)
+        miss = np.ones(u.size, bool)
+        for pc in self._live(layer_pos, offset):
+            if not miss.any():
+                break
+            tw = time.perf_counter()
+            pu, pb = pc[2].result()
+            STATS["wait_s"] += time.perf_counter() - tw
+            if pu.size == 0:
+                continue
+            ix = np.minimum(np.searchsorted(pu, u), pu.size - 1)
+            hit = (pu[ix] == u) & miss
+            if hit.any():
+                buf[hit] = pb[ix[hit]]
+                miss &= ~hit
+                pc[3] = True
+        n_hit = int(u.size - miss.sum())
+        if miss.any():
+            buf[miss] = self.read_unique(u[miss])
+        STATS["calls"] += 1
+        STATS["rows"] += r.size
+        STATS["unique"] += u.size
+        STATS["ahead_hit"] += n_hit
+        STATS["read_s"] += time.perf_counter() - t0
+        return GF.dequant(self.spec.table_type, buf[inv.reshape(-1)], self.spec.head_dim).reshape(r.shape + (self.spec.head_dim,))
+
+    def _live(self, layer_pos, offset):
+        with self._lock:
+            return [pc for pc in self._pieces if not pc[3] and (layer_pos is None or pc[1] == layer_pos) and pc[4] <= offset < pc[5]]
+
+    # ---- hint: the next chunk's rows
+    def hint(self, rows: np.ndarray, first: int) -> None:
+        """rows [L, nl, n_cols] of the positions first.. of an upcoming chunk (hash_rows of its ids): read every layer's unique rows in the background. Up to AHEAD_MAX positions."""
+        import time
+        rows = np.asarray(rows, np.int64)[:AHEAD_MAX]
+        if rows.shape[0] < LAZY_MIN:
+            return
+        with self._lock:
+            self._gen += 1
+            gen = self._gen
+            self._pieces = [pc for pc in self._pieces if not pc[3] and pc[0] >= gen - 2]       # consumed pieces and old hints leave
+        for i in range(rows.shape[1]):
+            def job(i=i):
+                t0 = time.perf_counter()
+                u = np.unique(rows[:, i].reshape(-1))
+                out = (u, self.read_unique(u))
+                STATS["hint_s"] += time.perf_counter() - t0
+                return out
+            with self._lock:
+                self._pieces.append([gen, i, self._ahd.submit(job), False, first, first + rows.shape[0]])
+        STATS["hints"] += 1
+        STATS["hint_rows"] += int(rows.size)
+
+    # ---- rows of a chunk by layer
+    def layers(self, rows: np.ndarray, valid, offset: int = -1) -> "Mapping":
+        """rows [L, nl, n_cols] -> {layer_id: (float32 [L, n_cols, head_dim], valid)}: a prompt chunk is read per layer in the background (the result of a layer blocks when asked),
+        a small request (decode / verify rows) is read at once on the calling thread."""
+        ids = self.spec.layer_ids
+        if rows.shape[0] < LAZY_MIN or not LAZY:
+            if rows.shape[0] >= LAZY_MIN or not self._live(None, offset):
+                rd = self.fetch(rows, None, offset)                                  # one request over every layer (their row ranges are disjoint: one dedupe)
+                return {lid: (np.ascontiguousarray(rd[:, i]), valid) for i, lid in enumerate(ids)}
+            return {lid: (self.fetch(rows[:, i], i, offset), valid) for i, lid in enumerate(ids)}
+        STATS["chunks"] += 1
+        futs = {lid: self._lay.submit(self.fetch, np.ascontiguousarray(rows[:, i]), i, offset) for i, lid in enumerate(ids)}
+        return LazyRows(futs, valid)
+
+
+class LazyRows:
+    """Mapping layer id -> (rows, valid), each layer's rows a Future: `get` / `[]` wait for that layer. `pending(lid)`: its rows are not read yet."""
+
+    def __init__(self, futs: dict, valid):
+        self._f, self._v = futs, valid
+
+    def pending(self, lid) -> bool:
+        f = self._f.get(lid)
+        return f is not None and not f.done()
+
+    def get(self, lid, default=None):
+        f = self._f.get(lid)
+        if f is None:
+            return default
+        import time
+        t0 = time.perf_counter()
+        r = f.result()
+        STATS["wait_s"] += time.perf_counter() - t0
+        return (r, self._v)
+
+    def __getitem__(self, lid):
+        if lid not in self._f:
+            raise KeyError(lid)
+        return self.get(lid)
+
+    def __contains__(self, lid):
+        return lid in self._f
+
+    def __iter__(self):
+        return iter(self._f)
+
+    def __len__(self):
+        return len(self._f)
+
+    def keys(self):
+        return self._f.keys()
+
+    def items(self):
+        return [(k, self.get(k)) for k in self._f]
+
+    def values(self):
+        return [self.get(k) for k in self._f]
 
 
 def layer_weights(g: "GF.GgufFile", layer_id: int) -> tuple[np.ndarray, np.ndarray]:

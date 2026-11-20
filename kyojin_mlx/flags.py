@@ -557,6 +557,13 @@ FLAGS: dict[str, Flag] = {
                              "reads and its warm job on one worker (rounds of 2.9 to 4.2 s against 0.1 s, slicetrace 01/11), and its passes wipe the chunk's job table, so the chunk "
                              "reads the later layers again. Same rows, same bytes; only the order of the host reads changes; read per pass",
                              attrs=(("engram_rows", "DEC_QUEUE", _on),)),
+    "hy4_engram_pread": Flag("KYOJIN_HY4_ENGRAM_PREAD", "0", "Hy4-flash Engram rows (63 GB GGUF table, 4 layers x 16 columns): read by DEDUPED parallel preads (native rowread) instead of the memory-map gather `raw[rows]` "
+                             "(one serial 16 KB page-in per cold row: cold prefill 126-435 tok/s against ~2000 warm, coldbase 19/11). The table stays on disk (no warm-up, no pinning). Same rows, same "
+                             "bytes, same floats: exact; 0 = the map; read per load", attrs=(("engram_gguf", "PREAD", _on),)),
+    "hy4_engram_lazy": Flag("KYOJIN_HY4_ENGRAM_LAZY", "0", "Hy4-flash Engram, prompt chunks (>= 256 positions): the layers' rows are read one layer after the other in the background and the forward waits for a "
+                            "layer's rows at that layer (the layers before it run on the GPU: mx.async_eval). Same rows: exact", attrs=(("engram_gguf", "LAZY", _on),)),
+    "hy4_engram_ahead": Flag("KYOJIN_HY4_ENGRAM_AHEAD", "0", "Hy4-flash Engram: the engine's next-chunk hint (Hy4Backend.warm_prompt) reads the NEXT prompt chunk's rows in the background while this one "
+                             "runs (content-addressed pieces: a stale hint only misses). Same rows: exact", attrs=(("engram_gguf", "AHEAD", _on),)),
     "engram_one_batch": Flag("KYOJIN_ENGRAM_ONE_BATCH", "1", "Engram rows of a decode / verify pass (under 2048 rows): the value rows and the scale rows of a layer in ONE parallel batch of preads "
                              "(interleaved over a 32-thread pool, hot rows read on the calling thread) instead of two batches one after the other. The cold NVMe read of a layer "
                              "was 1.3-3.5 ms on the critical path of the verify pass (GPU idle at the Engram layers, decgap 04/11); now 0.2-0.4 ms. Same rows, same bytes; read per call",

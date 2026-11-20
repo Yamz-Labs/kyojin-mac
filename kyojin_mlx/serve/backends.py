@@ -1504,6 +1504,13 @@ class Hy4Backend(Backend):
         log("[kyojin] hy4: no load warm-up (the first request pays the first reads)")
         return 0.0
 
+    def warm_prompt(self, ids, a: int, b: int) -> None:
+        """Engine hint (before a prefill chunk): prompt positions [a, b) are the NEXT chunk. Its Engram rows are read from the file in the background while this chunk runs
+        (engram_gguf.RowReader.hint; no page-cache warm-up of the table, no residency). KYOJIN_HY4_ENGRAM_AHEAD=0 / _PREAD=0: nothing."""
+        h = getattr(getattr(self.model, "engram_source", None), "hint", None)
+        if h is not None:
+            h(ids, a, b)
+
     def warm_main(self, log=print, n: int = 40, steps: int = 6) -> float:
         """One short session (prefill + plain steps) on the loading thread, before the engine thread starts: the compiled decode programs (KYOJIN_STEP_COMPILE) and the
         lazily built constants exist before the engine thread first uses them (c124: an engine thread that ran first died with "no Stream(gpu, 0) in current thread").
@@ -1538,9 +1545,21 @@ class Hy4Backend(Backend):
         if prof:
             t1 = time.perf_counter()
         mx.eval(lg, *self.state(cache))
+        if toks.shape[-1] >= 256 and os.environ.get("KYOJIN_HY4_ENGRAM_LOG", "0") != "0":
+            self._engram_log(toks.shape[-1])
         if prof:
             self._prof_note(t1 - t0, time.perf_counter() - t1)
         return lg
+
+    def _engram_log(self, n: int) -> None:
+        """KYOJIN_HY4_ENGRAM_LOG=1: one serve-log line per prompt chunk, the Engram row counters since the previous one (engram_gguf.STATS)."""
+        from .. import engram_gguf as EG
+        prev = self.__dict__.get("_eng_prev", {})
+        cur = dict(EG.STATS)
+        d = {k: cur[k] - prev.get(k, 0) for k in cur}
+        self._eng_prev = cur
+        print(f"[kyojin] hy4 engram chunk n={n}: rows {d['rows']} unique {d['unique']} ahead_hit {d['ahead_hit']} pread {d['read_rows']} map {d['map_rows']} hints {d['hints']} "
+              f"read {d['read_s']:.2f}s wait {d['wait_s']:.2f}s hint {d['hint_s']:.2f}s", flush=True)
 
     def _prof_note(self, build: float, ev: float) -> None:
         """KYOJIN_HY4_STEP_PROF=1: per 64 plain one-row steps, ms of the graph build (model call) and of the eval (GPU wait), with the path counters once."""
