@@ -23,6 +23,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from . import headq as HQ
 from .foreign_skeleton_rows import ROWS
 from . import ablate as _ABL
 
@@ -927,7 +928,9 @@ class Model(nn.Module):
         from . import headlast
         if headlast.active() and h.shape[1] > headlast.LAST_ROW_MIN:       # a caller that reads the last row only (serve prefill): [B, 1, vocab], not [B, rows, vocab]
             h = h[:, -1:]
-        out = m.embed_tokens.as_linear(h) if sp.tie_word_embeddings else self.lm_head(h)
+        out = m.embed_tokens.as_linear(h) if sp.tie_word_embeddings else (HQ.project(self.lm_head, h) if HQ.BITS else None)
+        if out is None:
+            out = self.lm_head(h)
         out = out * sp.logit_scale if sp.logit_scale != 1.0 else out
         if sp.logit_softcap:
             c = sp.logit_softcap

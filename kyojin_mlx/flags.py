@@ -1169,6 +1169,10 @@ FLAGS: dict[str, Flag] = {
     "split_eval": Flag("KYOJIN_SPLIT", "0", "Plain and verify passes (1 .. 8 rows): mx.async_eval(h) after layers 1 and 8, so the GPU runs the first layers while the host builds the rest of the graph. n10 Mac Studio, Hy4: with one eval at the end the GPU idled for the whole host build (2.6 ms at 1 row, 7.2 ms at 6 rows); plain p4 40.4 -> 43.9 tok/s (ids equal), verify T=6 50.3 -> 44.2 ms. "
                        "Explicit KYOJIN_SPLIT_EVAL / _ROWS / _ROWS_MIN env wins. Read per call",
                        attrs=(("foreign_skeleton", "SPLIT_ON", _on),)),
+    "head_q": Flag("KYOJIN_HEAD_Q", "0", "Output head of a 1 .. 16 row pass (plain decode, verify rows; prompt chunks keep the dense head) through an 8- (or 4-) bit affine group-64 copy of the dense head matrix "
+                   "(mx.quantized_matmul) instead of the dense float32 matmul (Hy4: 1.6 GB, 1.3 ms of a 22.9 ms step at the bandwidth roof; Q8 reads a quarter). The packed copy is built once and "
+                   "shared with the MTP draft's output projection (one low-bit copy; the dense head stays resident for the prompt chunks). Logits differ at the 8-bit rounding: gate with the model's "
+                   "noise band. Read per call", kind="int", attrs=(("headq", "BITS", int),)),
     "moe_route_rs": Flag("KYOJIN_MOE_ROUTE_RS", "0", "Decode / verify (1 .. 8 rows) router of a generic MoE block with sigmoid gating (GenericMoE.route): the gate GEMV, sigmoid, selection bias, top-k, weight normalisation and scale "
                          "as ONE launch (glm_moe_rs.rowsel: rowdot + the last-arriving threadgroup selects) instead of the stock matmul + bias + sigmoid + argsort + take + sum + divide (~6 launches). "
                          "Logits = rowdot (row-invariant, so a plain step and a verify row agree); one group, no logit bias; others take the stock path. Metal only. Read per call",

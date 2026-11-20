@@ -27,6 +27,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from . import foreign_gguf as GF
+from . import headq as HQ
 from . import foreign_moe_generic as G
 from . import foreign_skeleton as SK
 from . import foreign_skeleton_moe as SM
@@ -101,7 +102,9 @@ class MtpHead(nn.Module):
 def head_logits(model, y):
     """The trunk's own output head on the head's state (Model.__call__ tail)."""
     sp = model.args
-    out = model.model.embed_tokens.as_linear(y) if sp.tie_word_embeddings else model.lm_head(y)
+    out = model.model.embed_tokens.as_linear(y) if sp.tie_word_embeddings else (HQ.project(model.lm_head, y) if HQ.BITS else None)       # flag head_q: the packed head
+    if out is None:
+        out = model.lm_head(y)
     out = out * sp.logit_scale if sp.logit_scale != 1.0 else out
     if sp.logit_softcap:
         out = mx.tanh(out / sp.logit_softcap) * sp.logit_softcap
@@ -257,10 +260,7 @@ class Mtp:
         lm = getattr(self.model, "lm_head", None)
         w = getattr(lm, "weight", None)
         if bits and w is not None and isinstance(w, mx.array) and w.ndim == 2 and w.dtype in (mx.float32, mx.bfloat16, mx.float16) and w.shape[-1] % 64 == 0:
-            ck = ("lm", bits)
-            if ck not in self._lin:
-                wq, sc, bi = mx.quantize(w, group_size=64, bits=bits); mx.eval(wq, sc, bi); self._lin[ck] = (wq, sc, bi, bits)
-            self._dq = self._lin[ck]
+            self._dq = HQ.packed(w, bits)                              # one low-bit copy of the head matrix, shared with the trunk's head_q
         print(f"[hy4-mtp] head bits {bits}; draft-only output projection: {'yes' if self._dq else 'no'}", flush=True)
 
     def head_logits(self, y):
