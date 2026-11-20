@@ -311,7 +311,7 @@ class MlaAttention(nn.Module):
                 MlaAttention.PATHS["attn_flash_swa"] += 1
                 return self._finish(o.transpose(0, 2, 1, 3), x, B, L, a16)
         from . import mla_decode_vec as MV
-        vec = MV.MODE and L <= MV.MAX_ROWS and not ring and not pf16
+        vec = MV.MODE and MV.MIN_ROWS <= L <= MV.MAX_ROWS and not ring and not pf16
         if vec and win and not self.kp:                                                 # flag mla_decode_vec: the windowed layer's attention core in one launch over the window read from the buffer
             o = self._attend_vec(q_nope, q_pe, buf, off, 0, None, win, ab16)
             if o is not None:

@@ -100,6 +100,7 @@ Hy4-flash (GGUF Q3_K) on a Mac Studio, up to 256K tokens of context. Numbers: se
 | output head of 1 to 16 row passes through one shared packed 8-bit copy | Hy4-flash speculative decode, TBD-FROM-CELL | `KYOJIN_HEAD_Q=0` |
 | one output row per simdgroup on small 8-bit GEMVs (twice the threadgroups) | Hy4-flash decode, TBD-FROM-CELL | `KYOJIN_FOREIGN_NBR_SMALL=0` |
 | one-launch flash-attention core for the MLA decode attention (windowed layers and pooled-key layers, 1 to 8 rows; replaces about 20 small launches per layer) | Hy4-flash decode at long context, TBD-FROM-CELL | `KYOJIN_HY4_ATTN_VEC=0` |
+| plain decode (one row) keeps the stock attention core; speculative verify rows (2 to 8) use the one-launch core | Hy4-flash speculative decode, TBD-FROM-CELL | `KYOJIN_HY4_ATTN_VEC_MIN_ROWS=1` |
 | Engram rows read by deduplicated parallel preads instead of one page-in per row from the memory map (the table stays on disk: no warm-up, no pinning) | Hy4-flash first request and prompt chunks, TBD-FROM-CELL | `KYOJIN_HY4_ENGRAM_PREAD=0` |
 | Engram rows of a speculative round read in the background while the draft head runs (rows stay on disk, only the cold rows are read) | Hy4-flash speculative decode, TBD-FROM-CELL | `KYOJIN_HY4_ENGRAM_DECPF=0` |
 

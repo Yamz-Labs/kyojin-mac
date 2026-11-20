@@ -22,6 +22,7 @@ import mlx.core as mx
 
 MODE = 0                                          # bound by flags.set (attrs): 0 off, 1 windowed (SWA) layers, 2 + kpool layers (keep mask and gather ids)
 MAX_ROWS = 8
+MIN_ROWS = 2                                      # bound by flags.set (attrs): flag mla_decode_vec_min_rows, fewer rows than this (plain decode, one row) run the stock core
 NSG = 4                                           # simdgroups per threadgroup
 KV, RD = 512, 64
 _k: dict = {}

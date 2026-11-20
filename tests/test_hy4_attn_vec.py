@@ -136,6 +136,7 @@ def test_wiring_reaches_kernel(kind, monkeypatch):
         return mx.zeros(qa.shape, dtype=qa.dtype)
     monkeypatch.setattr(MV, "eligible", lambda *a, **k: True)
     monkeypatch.setattr(MV, "attend", spy)
+    monkeypatch.setattr(MV, "MIN_ROWS", 1)                                  # every row count: the gate has its own test below
     xs = _xs(rng, 70, [1, 1, 4])
     for mode, expect in ((0, 0), (1, 3 if kind == 0 else 0), (2, 3)):
         monkeypatch.setattr(MV, "MODE", mode)
@@ -146,12 +147,44 @@ def test_wiring_reaches_kernel(kind, monkeypatch):
             assert all(c[0] == (0 if kind == 0 else 1) and c[1] == (40 if kind == 0 else 0) for c in calls)
     monkeypatch.undo()
     monkeypatch.setattr(MV, "MODE", 2)
+    monkeypatch.setattr(MV, "MIN_ROWS", 1)
     why0 = MLA.MlaAttention.PATHS.get("attn_vec_no_device", 0)
     a = _run_(m, xs, mx.float32, False)
     monkeypatch.setattr(MV, "MODE", 0)
     b = _run_(m, xs, mx.float32, False)
     assert MLA.MlaAttention.PATHS["attn_vec_no_device"] > why0
     assert all(float(mx.max(mx.abs(x - y)).item()) == 0.0 for x, y in zip(a, b))
+
+
+def test_min_rows_flag_declared():
+    from kyojin_mlx import flags as FL
+    f = FL.FLAGS["mla_decode_vec_min_rows"]
+    assert f.env == "KYOJIN_HY4_ATTN_VEC_MIN_ROWS" and f.default == "2" and f.attrs[0][:2] == ("mla_decode_vec", "MIN_ROWS")
+    assert MV.MIN_ROWS == 2
+
+
+@pytest.mark.parametrize("kind", [0, 1])
+@pytest.mark.parametrize("min_rows,rows,expect", [
+    (2, [1, 1, 1], []),                          # default: plain decode (one row) stays on the stock core
+    (2, [1, 2, 3, 4, 8], [2, 3, 4, 8]),          # spec verify rounds (T >= 2) keep the one-launch core
+    (3, [1, 2, 3, 4], [3, 4]),                   # a higher threshold moves the cut
+    (1, [1, 2, 4], [1, 2, 4]),                   # 1 = every row count
+])
+def test_min_rows_gate(kind, min_rows, rows, expect, monkeypatch):
+    mx.set_default_device(mx.cpu)
+    rng = np.random.default_rng(5)
+    m = _model(rng, kind)
+    calls = []
+
+    def spy(qa, q_pe, buf, off, kd, extra, sinks, scale, window):
+        calls.append(qa.shape[2])
+        return mx.zeros(qa.shape, dtype=qa.dtype)
+    monkeypatch.setattr(MV, "eligible", lambda *a, **k: True)
+    monkeypatch.setattr(MV, "attend", spy)
+    monkeypatch.setattr(MV, "MODE", 2)
+    monkeypatch.setattr(MV, "MIN_ROWS", min_rows)
+    _run_(m, _xs(rng, 70, rows), mx.float32, False)
+    assert calls == expect
 
 
 # ----------------------------------------------------------------------------------------------- Metal (chain cell stage 0)
