@@ -20,7 +20,7 @@ def test_budget_default_is_88_percent_of_ram():
 
 
 def test_slope_env():
-    assert M.slope_bytes_per_token({}) == pytest.approx(0.36 * G / 1000)
+    assert M.slope_bytes_per_token({}) == pytest.approx(0.12 * G / 1000)
     assert M.slope_bytes_per_token({"KYOJIN_MEM_GIB_PER_1K": "0.5"}) == pytest.approx(0.5 * G / 1000)
 
 
