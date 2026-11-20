@@ -68,6 +68,7 @@ from . import ticktrace as TT
 import numpy as np
 
 from .sampling import Sampling, sample_rows
+from .memguard import MemoryBudgetExceeded
 from . import hostloop as HL
 from . import loopguard as LG
 from . import pysample as PS
@@ -296,6 +297,7 @@ class Session:
     cap_n: int = 0                  # rounds at the depth cap in the window (a probe opens a fresh one)
     rate_gap: int = 0               # rounds at D = 0 between two cap probes (0 = probe_every; doubles while a probe confirms plain)
     rounds: int = 0
+    mem_abort: bool = False         # the memory guard stopped this session (it ends with reason "memory")
     t_submit: float = field(default_factory=time.perf_counter)
     t_tok: float = 0.0              # when the last token of this reply was accepted
     park_now: bool = False          # flag kv_admit: leave the batch at the next round (the memory budget is over and nothing else can be dropped)
@@ -1067,8 +1069,8 @@ class Engine:
                  prefix_bytes: int = 1 << 30, decode_per_chunk: int = 1, lookahead: bool = True, log=None,
                  mtp_depth: int = 0, kv_budget: int | None = None, replay_chunk: int = 16, rq_floor: int | None = None,
                  row_cost: float = 0.4, draft_cost: float = 0.15, probe_every: int = 16, cap_probe: int = 8, kv_refresh: int = 16,
-                 depth_override: int | None = None, disk=None, spec_costs: dict | None = None):
-        """mtp_depth: most drafts per session and round (0 = no speculative decode; needs backend.supports_spec). kv_budget: bytes (None = no
+                 depth_override: int | None = None, disk=None, spec_costs: dict | None = None, mem_guard=None):
+        """mem_guard: a serve.memguard.MemGuard (hard memory budget: admission, in-flight checks); None = off. mtp_depth: most drafts per session and round (0 = no speculative decode; needs backend.supports_spec). kv_budget: bytes (None = no
         limit, see the module doc). replay_chunk: tokens replayed per tick when a dropped cache is rebuilt. rq_floor: smallest reply share before
         a session yields its slot (default RQ_MIN_TOKENS). row_cost / draft_cost: cost of one more verify row / of a draft call in solo steps
         (the depth policy); probe_every: rounds at D = 0 between two probes with D = 1; cap_probe: rounds below the cap between two rounds at
@@ -1096,6 +1098,8 @@ class Engine:
         self.depth_override = depth_override
         self.spec_costs = {int(c): list(v) for c, v in spec_costs.items() if v} if spec_costs else None
         self.bpt = 0.0                              # bytes of cache per token (measured), to size a session before it is admitted
+        self.memguard = mem_guard
+        self._mem_ticks = 0
         self.backend, self.sessions, self.ctx = backend, sessions, ctx
         if chunk > MAX_PREFILL_CHUNK:
             raise ValueError(f"prefill chunk {chunk} > {MAX_PREFILL_CHUNK}: 16384-row chunks panicked the Ultra (29/10 00:26)")
@@ -1128,6 +1132,8 @@ class Engine:
         self.plain_ahead = lookahead                                  # plain rounds of the speculative path launch the next step before reading the one in flight
         if kv_budget is not None:
             prefix_bytes = min(prefix_bytes, kv_budget // 4)                 # snapshots are part of the budget; they never take more than a quarter
+        if mem_guard is not None:                                            # the memory budget bounds the snapshots too: a quarter of what the weights leave under it
+            prefix_bytes = min(prefix_bytes, max(0, (mem_guard.budget - mem_guard.base()) // 4))
         self.log = log or (lambda *a: None)
         self.prefix = PrefixCache(backend, block, prefix_bytes, disk=disk, log=self.log)
         self._lk_kept = collections.deque(maxlen=LK_KEEP)
@@ -1207,6 +1213,12 @@ class Engine:
             raise ValueError("empty prompt")
         if len(ids) >= self.ctx:
             raise ValueError(f"context length exceeded: prompt is {len(ids)} tokens, the server context is {self.ctx}")
+        if self.memguard is not None:                                # hard memory budget: a prompt that cannot fit is refused (HTTP 413) before it takes the live slot
+            try:
+                self.memguard.admit(len(ids))
+            except MemoryBudgetExceeded:
+                self.stats["mem_refused"] += 1
+                raise
         room = self.ctx - len(ids) - 1
         limit = room if max_new is None else min(max_new, room)
         sampling = sampling or Sampling()
@@ -1252,6 +1264,7 @@ class Engine:
         return {"sessions": self.sessions, "waiting": len(self.waiting) + len(self._inbox), "prefilling": len(self.prefilling),
                 "decoding": len(self.members) + len(self.ready), "prefix_entries": len(p.entries), "prefix_bytes": p.bytes,
                 "prefix_hits": p.hits, "prefix_misses": p.misses, "prefix_reasons": dict(p.reasons), "peak_gb": round(mx.get_peak_memory() / 2 ** 30, 3),
+                "mem_budget_gb": None if self.memguard is None else round(self.memguard.budget / 2 ** 30, 1),
                 "active_gb": round(mx.get_active_memory() / 2 ** 30, 3), "cache_gb": round(mx.get_cache_memory() / 2 ** 30, 3), "mtp_depth": self.mtp_depth,
                 "kv_budget_gb": None if self.kv_budget is None else round(self.kv_budget / 2 ** 30, 3),
                 "kv_gb": round(self.kv_bytes() / 2 ** 30, 4), "kv_peak_gb": round(self.kv_peak / 2 ** 30, 4),
@@ -1330,6 +1343,10 @@ class Engine:
         if self.members or self.ready:
             self._decode_phase()
         HL.mark("tick_body")
+        if self.memguard is not None and not self.prefilling:
+            self._mem_ticks += 1
+            if self._mem_ticks % self.memguard.check_ticks == 0:
+                self._mem_relieve()
         self._enforce_kv()
         self._note_kv()
         HL.mark("tick_post")
@@ -1494,6 +1511,34 @@ class Engine:
                 self.stats["kv_over_budget"] += 1
                 return
 
+    def _mem_relieve(self, extra: float = 0, victim: Session | None = None) -> bool:
+        """Hard memory guard (serve.memguard). Over the budget (MLX active + buffer cache or the process footprint, plus `extra` bytes about to be
+        allocated): free the MLX buffer cache, then drop prefix snapshots (LRU, by halves), then stop one request (`victim`, else the live session holding the
+        most KV) with reason "memory". The server stays up. True when a request was stopped."""
+        g = self.memguard
+        if not g.over(extra):
+            return False
+        g.clear_cache()
+        self.stats["mem_clear"] += 1
+        while g.over(extra) and self.prefix.entries:
+            self.prefix.shrink(self.prefix.bytes // 2 if self.prefix.bytes > 1 else -1)
+            self.stats["mem_prefix_shrink"] += 1
+            g.clear_cache()                                             # freed snapshots sit in the MLX cache until it is cleared
+        if not g.over(extra):
+            self.log(f"memory guard: back under the {g.budget / GIB:.0f} GiB budget (cache cleared, prefix snapshots now {self.prefix.bytes / GIB:.2f} GiB)")
+            return False
+        live = [x for x in (*self.prefilling, *self.ready, *self.members) if not x.mem_abort]
+        if victim is None or victim.mem_abort:
+            victim = max(live, key=lambda x: (x.kv_bytes, x.n_prompt + x.n_gen), default=None)
+        if victim is None:
+            return False
+        victim.mem_abort = True
+        victim.handle.cancel()                                          # ends through the cancel path of its stage: _finish(reason "memory"), cache and draft released
+        self.stats["mem_aborts"] += 1
+        self.log(f"memory guard: {g.used() / GIB:.0f} GiB used (+{extra / GIB:.1f} GiB next) over the {g.budget / GIB:.0f} GiB budget after cache clear and "
+                 f"prefix drop: request {victim.sid} ({victim.n_prompt} prompt tokens) stopped")
+        return True
+
     def _need_bytes(self, s: Session) -> float:
         """Flag kv_admit: the cache s may grow to before it yields its slot or ends: bytes per token (measured) x (prompt + reply tokens it may produce in one stretch)."""
         reply = s.max_new if s.yield_after is None else min(s.max_new, s.yield_after)
@@ -1576,11 +1621,13 @@ class Engine:
                 self._finish(s, "cancelled")
 
     def _finish(self, s: Session, reason: str) -> None:
+        if s.mem_abort and reason == "cancelled":
+            reason = "memory"
         ad = getattr(self.backend, "adopt_drop", None)
         if ad is not None and s.sid is not None:
             ad(s.sid)                                                # flag engram_adopt: a session that never reached its first chunk frees its row jobs
         s.t_done = time.perf_counter()
-        s.cache = s.draft = None
+        s.cache = s.draft = s.share_seed = None                      # no restore copy or shared seed outlives its request (the handle keeps the session object)
         t_first = s.t_first or s.t_done
         stats = {"prompt_tokens": s.n_prompt, "completion_tokens": s.n_gen + s.rw_tok, "cached_tokens": s.cached,
                  "queue_s": (s.t_start or s.t_done) - s.t_submit, "ttft_s": t_first - s.t_submit, "total_s": s.t_done - s.t_submit}
@@ -2115,6 +2162,8 @@ class Engine:
             self._replay_step(s)
             return
         end = self._chunk_end(s, s.pos, L)
+        if self.memguard is not None and self._mem_relieve((end - s.pos) * self.memguard.slope, s):
+            return                                                  # the memory guard stopped this request before its next chunk
         merge = end < L and self._cut_merge(s, end, L)
         cut_pos = end
         if merge:

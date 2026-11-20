@@ -24,6 +24,7 @@ from pathlib import Path
 
 from .chat import ChatError, FAMILIES, GGUF_ARCH_FAMILIES, family_of, render_resume, think_tags, think_token_ids, token_cuts
 from .engine import SessionRefused
+from .memguard import MemGuard, MemoryBudgetExceeded, PromptTooLong
 from .sampling import Sampling
 from .tokinc import IncTok
 from . import autoconfig
@@ -286,6 +287,10 @@ def make_handler(app: App):
                     self._error(404, f"no such endpoint: {path}")
             except SessionRefused as exc:                          # a one-session backend (Hy4 delivery A) with its session live
                 self._error(503, str(exc))
+            except PromptTooLong as exc:                           # memory budget: the prompt cannot fit, the server stays up
+                self._error(413, str(exc))
+            except MemoryBudgetExceeded as exc:                    # stopped in flight by the memory guard (before the reply started)
+                self._error(503, str(exc))
             except (ChatError, ValueError) as exc:
                 self._error(400, str(exc))
             except (BrokenPipeError, ConnectionResetError):
@@ -493,9 +498,13 @@ def make_handler(app: App):
                 n_carry = len(lg.gen) + len(close)
                 # A prompt with images keeps its virtual ids and its image spans (they sit before the reply, so they still hold); the real ids
                 # of the reply are the sampled ids themselves.
-                handle = app.engine.submit(ids + lg.gen + close, max_new=None if limit is None else limit - n_carry, sampling=sampling,
-                                           stop_ids=() if body.get("ignore_eos") is True else app.stop_ids, cuts=cuts, stages=stages,
-                                           vl=spans, real_ids=None if real_ids is None else real_ids + lg.gen + close)
+                try:
+                    handle = app.engine.submit(ids + lg.gen + close, max_new=None if limit is None else limit - n_carry, sampling=sampling,
+                                               stop_ids=() if body.get("ignore_eos") is True else app.stop_ids, cuts=cuts, stages=stages,
+                                               vl=spans, real_ids=None if real_ids is None else real_ids + lg.gen + close)
+                except PromptTooLong as exc:                     # the stream is open: end the reply here, the budget refuses the longer prompt
+                    app.log(f"{rid[-6:]} loop guard resume refused: {exc}")
+                    return False
                 return True
             try:
                 if stream:
@@ -558,6 +567,13 @@ def make_handler(app: App):
             except Exception:
                 handle.cancel()
                 raise
+            if reason == "memory":
+                msg_mem = "request stopped: the server hit its memory budget (KYOJIN_MEM_BUDGET_GIB); shorten the prompt or retry"
+                if stream:
+                    self._sse({"error": {"message": msg_mem, "type": "server_error"}})
+                    self._sse("[DONE]")
+                    return
+                raise MemoryBudgetExceeded(msg_mem)
             if reason in ("error", "shutdown"):
                 if stream:
                     self._sse({"error": {"message": "engine error", "type": "server_error"}})
@@ -801,10 +817,12 @@ def build_app(args, log=print):
     if args.sessions > backend.max_rows:                             # a backend that decodes fewer rows at once (Hy4: 1): the extra requests queue for the slot
         log(f"{backend.kind}: --sessions {args.sessions} -> {backend.max_rows} (rows decoded at once); further requests queue")
         args.sessions = backend.max_rows
+    mem_guard = MemGuard.from_env()                                  # KYOJIN_MEM_BUDGET_GIB (default 0.88 x RAM; 0 = off)
+    log("memory guard: " + ("off" if mem_guard is None else f"budget {mem_guard.budget / GIB:.0f} GiB, {mem_guard.slope * 1000 / GIB:.2f} GiB per 1K prompt tokens"))
     engine = Engine(backend, sessions=args.sessions, ctx=args.ctx, chunk=args.prefill_chunk, block=args.prefix_block,
                     prefix_bytes=int(args.prefix_cache_mb * 2 ** 20), decode_per_chunk=args.decode_per_chunk, log=log,
                     mtp_depth=args.mtp_depth, kv_budget=kv_budget, row_cost=args.row_cost, draft_cost=args.draft_cost, disk=disk,
-                    spec_costs=spec_costs, depth_override=int(os.environ["KYOJIN_MTP_FIXED"]) if os.environ.get("KYOJIN_MTP_FIXED") else getattr(backend, "default_fixed_depth", None))
+                    spec_costs=spec_costs, mem_guard=mem_guard, depth_override=int(os.environ["KYOJIN_MTP_FIXED"]) if os.environ.get("KYOJIN_MTP_FIXED") else getattr(backend, "default_fixed_depth", None))
     model_id = args.model_id or Path(args.model.rstrip("/")).name
     stops = stop_token_ids(args.model, cfg, tok, fam_name) | set(getattr(backend, "stop_ids", ()))     # Hy4: the GGUF eos (120025)
     bos = cfg.get("bos_token_id", cfg.get("text_config", {}).get("bos_token_id"))
