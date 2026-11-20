@@ -111,7 +111,7 @@ DeepSeek V4.1 uses 176-178 GB at 8K context and 187 GB at 983K.
 
 ### Hy4-flash Q3_K (GGUF) against llama.cpp
 
-Decode speed in tokens per second, Mac Studio M5 Ultra 256 GB, same Q3_K GGUF, same fixed text, speculative decode with the model's own head on both sides (ours: `--mtp-depth 3`; llama.cpp: `draft-mtp`). Served through the real server, real text, median of repeated runs. "to follow" marks a cell whose paired release run is not in yet; the lead adds it.
+Decode speed in tokens per second, Mac Studio M5 Ultra 256 GB, same Q3_K GGUF, same fixed text, speculative decode with the model's own head on both sides (ours: `--mtp-depth 3`; llama.cpp: `draft-mtp`). Served through the real server, real text, median of repeated runs. The 1.10.0 figures in this table (4K 64.2, 16K 56.9, and the rest) were measured on an earlier prompt set and are not directly comparable with the 1.10.3 numbers in "New in 1.10.3".
 
 | context | ours, speculative (depth 3) | ours, plain | llama.cpp, speculative | llama.cpp, plain |
 |---|---|---|---|---|
@@ -119,24 +119,37 @@ Decode speed in tokens per second, Mac Studio M5 Ultra 256 GB, same Q3_K GGUF, s
 | 16K | 56.88 | 42.42 | 57.17 | 48.85 |
 | 24K | 55.58 | 41.14 | 52.78 | 48.92 |
 | 32K | 46.08 | not measured | 50.4 | 48.7 |
-| 64K | measured numbers to follow | measured numbers to follow | 52.69 | 48.72 |
+| 64K | see "New in 1.10.3" | not measured | 52.69 | 48.72 |
 | 128K | measured numbers to follow | measured numbers to follow | measured numbers to follow | measured numbers to follow |
 
 Where llama.cpp leads:
 
-- Speculative decode: ours is ahead at 4K (+26 %) and 24K (+5 %), level at 16K (57.17 against 56.88, llama.cpp is 0.5 % ahead), and behind at 32K (46.08 against 50.4). At 64K llama.cpp holds 52.69; our paired run is to follow.
+- Speculative decode: ours is ahead at 4K (+26 %) and 24K (+5 %), level at 16K (57.17 against 56.88, llama.cpp is 0.5 % ahead), and behind at 32K (46.08 against 50.4). At 64K llama.cpp holds 52.69 (1.10.0 prompt set); our 1.10.3 figure at 64K is in "New in 1.10.3".
 - Plain decode (no draft): llama.cpp is faster at every context we measured (4K: 48.66 against 44.38; 16K: 48.85 against 42.42; 24K: 48.92 against 41.14). Our advantage comes from speculation, not from the plain step.
-- Long context (1.10.x, Mac Studio M5 Ultra, 256 GB): 64K and 128K prompts are served. A 141K-token prompt was served at 128K context with passkey retrieval 3 of 3 (decode 31 tok/s on the leak-free lane stack). A 176K-token prompt was served with passkey 3 of 3 (decode 37 tok/s). The peak footprint in these runs was 143 GiB (`phys_footprint`). These are single served checks on one text, not the paired table run: the paired 64K and 128K cells are marked "measured numbers to follow".
+- Long context (1.10.x, Mac Studio M5 Ultra, 256 GB): 64K and 128K prompts are served. A 141K-token prompt was served at 128K context with passkey retrieval 3 of 3 (decode 31 tok/s on the leak-free lane stack). A 176K-token prompt was served with passkey 3 of 3 (decode 37 tok/s). The peak footprint in these runs was 143 GiB (`phys_footprint`). These are single served checks on one text, not the paired table run. The 128K cells of the table are still to follow.
 - The speculative cells use the shipped serve line. Passkey retrieval passed 3 of 3 at 4K, 16K and 24K in both modes. The peak footprint is 150-151 GiB for a 144 GiB file (one resident copy of the weights).
 
 ## New in 1.10.3
 
-Long-context and decode levers for Hy4-flash on the Mac, all in `tools/hy4_mac.env`. Measured numbers to follow.
+Long-context and decode levers for Hy4-flash on the Mac, all in `tools/hy4_mac.env`.
+
+Speculative decode (`--mtp-depth 3`), Mac Studio, same prompts at each length, served through the real server. Tokens per second, median of 2 to 3 runs. Passkey retrieval 3 of 3 at every point. Fresh clone, README command.
+
+| context | 1.10.2 | 1.10.3 | change |
+|---|---|---|---|
+| 4K | 55.4 | 61.3 | +10.6 % |
+| 16K | 53.3 | 64.1 | +20.3 % |
+| 32K | 41.6 | 62.5 | +50.1 % |
+| 64K | 32.2 | 62.9 | +95.1 % |
+
+Peak footprint: 127.4 GiB (1.10.2), 127.5 GiB (1.10.3).
+
+- About 43 tok/s at a 141K-token prompt on the development lane with the draft-head KV cache (`KYOJIN_HY4_MTP_HEAD_KV=1`). The same prompt ran at 31 tok/s before that change.
 
 - Q3_K expert decode (`KYOJIN_QDEC_FAST=1`): one fused decode and dot per 32-weight unit, without decoding the weights to floats first. The products match the old text up to float rounding. `KYOJIN_QDEC_FAST=0` restores the decode-to-float text.
 - Absorb GEMV (`KYOJIN_ABSORB_GEMV=1`): the two MLA absorb products read one fp16 copy of `k_b` / `v_b` (the copy that the fp16 attention already makes, so there is one resident fp16 copy) in one launch per product. `KYOJIN_ABSORB_GEMV=0` runs the stock fp32 matmul.
 - Long-context gather (`KYOJIN_HY4_FIXED_GATHER=16384`, `KYOJIN_HY4_FIXED_GATHER_DEC=8192`, `KYOJIN_HY4_FIXED_PKCACHE=1`): from that many key slots on, attention reads only the keys the indexer kept, and the pooled keys live in the cache state. Set each to `0` to opt out.
-- MTP draft head KV (`KYOJIN_HY4_MTP_HEAD_KV=1`): the draft head keeps its KV in the same fixed-state layout as the trunk's layers, so its attention reads only the kept keys at long context instead of every key on each draft step. Measured numbers to follow. `KYOJIN_HY4_MTP_HEAD_KV=0` restores the plain head KV.
+- MTP draft head KV (`KYOJIN_HY4_MTP_HEAD_KV=1`): the draft head keeps its KV in the same fixed-state layout as the trunk's layers, so its attention reads only the kept keys at long context instead of every key on each draft step. Measured together with the other levers in the table above. `KYOJIN_HY4_MTP_HEAD_KV=0` restores the plain head KV.
 - The one-launch decode attention core keeps its row gate (`KYOJIN_HY4_ATTN_VEC_MIN_ROWS`, default 2): plain decode keeps the stock core, speculative verify rounds use the kernel.
 - Fires log: the served log line `[flags 60s]` (one per minute of activity, plus one right after the first request settles) now ends with the lever totals, `| totals qdec_fast=N absorb_gemv=N fixed_gather=N mtp_head_fixed_kv=N mtp_head_gather=N` (the last two count the draft head's calls on a fixed-state KV and the ones that took the kept-key gather; both stay 0 unless `KYOJIN_HY4_MTP_HEAD_KV=1`, and the head's gather calls also count in `fixed_gather`), and counts the kept-key gather per call (`hy4_gather fires/stock calls`, with the reasons `off`, `below_min`, `fp16_copy`) and the pooled-key cache (`hy4_pkcache`). A lever that is on but shows 0 did not run. `KYOJIN_HY4_FIRES_LOG=0` drops the totals; `KYOJIN_FLAG_AUDIT=0` drops the whole line.
 - Code defaults are unchanged: every lever above is off unless the env file (or your own environment) turns it on.
