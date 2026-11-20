@@ -23,6 +23,7 @@ import mlx.nn as nn
 
 from . import absorb_gemv as AG
 from . import attn_fp16 as AF
+from . import fired as FD
 from . import fixed_kv as FK
 from . import mla_flash_pf as MF
 from . import foreign_skeleton_kpool as KP
@@ -94,6 +95,11 @@ class KpoolProj(nn.Module):
         iq = ln(self.q_b_proj, qr).reshape(B, L, self.H, self.dx).transpose(0, 2, 1, 3)
         w = ln(self.weights_proj, x) * (self.dx * self.H) ** -0.5
         return iq, w
+
+
+def gather_skip(gmin: int, Sw: int, a16: bool) -> str:
+    """Why the kept-key gather branch (`gmin and Sw >= gmin and not a16`) was not taken: 'off' (flag 0), 'below_min' (fewer key slots than the minimum), 'fp16_copy' (the fp16 attention path, a16, owns the call)."""
+    return "off" if not gmin else "below_min" if Sw < gmin else "fp16_copy"
 
 
 class MlaAttention(nn.Module):
@@ -332,6 +338,10 @@ class MlaAttention(nn.Module):
             iq, w = self.kpool.query(x, qr, a16)
             from . import kpool_fuse as KF
             gmin = int(os.environ.get("KYOJIN_HY4_FIXED_GATHER_DEC" if L <= 16 else "KYOJIN_HY4_FIXED_GATHER", "0") or 0)
+            if pkc is not None:                                                         # fires log: the pooled keys came from the cache (flag KYOJIN_HY4_FIXED_PKCACHE) or were rebuilt
+                FD.fire("hy4_pkcache")
+            else:
+                FD.fb("hy4_pkcache", "no_cache")
             if pf16 and MF.on() and not win:                                            # KYOJIN_HY4_ATTN_FLASH=1: the fused flash kernel over the kept key list (fp16 prompt path only)
                 v_, g_ = kv[:, 0, :, a:a + dx], kv[:, 0, :, a + dx:a + 2 * dx]
                 pools = sel.pools_fixed_top(iq, w, v_, g_, off, pk=pkc) if gmin and Sw >= gmin else sel.pools_fixed(iq, w, v_, g_, off, pk=pkc)       # radix top-k from KYOJIN_HY4_FIXED_GATHER slots on
@@ -347,12 +357,14 @@ class MlaAttention(nn.Module):
                 s = sel.pools_fixed_top(iq, w, kv[:, 0, :, a:a + dx], kv[:, 0, :, a + dx:a + 2 * dx], off, pk=pkc)
                 slots, ok = KP.gather_slots(s, sort=not (L <= 16 and os.environ.get("KYOJIN_HY4_GATHER_NOSORT", "0") == "1"))
                 MlaAttention.PATHS["fixed_gather"] = MlaAttention.PATHS.get("fixed_gather", 0) + 1
+                FD.fire("hy4_gather")
                 if vec and MV.MODE >= 2:                                                # flag mla_decode_vec 2: the key ids of the gather path straight into the one-launch core
                     o = self._attend_vec(q_nope, q_pe, buf, off, 2, mx.where(ok, slots, -1).astype(mx.int32), 0, ab16)
                     if o is not None:
                         return self._finish(o.transpose(0, 2, 1, 3), x, B, L, a16)
                 o = self.attend_gather(q_nope, q_pe, lat, k_pe, slots, ok).transpose(0, 2, 1, 3)
                 return self._finish(o, x, B, L, a16)
+            FD.fb("hy4_gather", gather_skip(gmin, Sw, a16))                             # fires log: why the kept-key gather did not run on this call
             if KF.use(L, Sw):                                                           # flag kpool_fuse: selection + mask in one launch (left-aligned slots); stock selection past KYOJIN_KPOOL_FUSE_MAXS slots
                 keep = sel.keep_fused_fixed(iq, w, kv[:, 0, :, a:a + dx], kv[:, 0, :, a + dx:a + 2 * dx], off, pk=pkc)
                 MlaAttention.PATHS["kpool_fuse_fixed"] += 1
