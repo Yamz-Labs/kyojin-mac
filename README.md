@@ -67,13 +67,11 @@ The directory holds `edit_spec.json` (hidden size 3072, 42 layers, per-layer wei
 - The hook edits the attention output (after its post norm) and the MLP / MoE output (after its post norm) of the trunk layers whose weight is not 0. The speculative draft head is never edited.
 - Blocks with an armed hook run the unfused sub-layer path, so decode is slower than the unarmed line. The compiled decode step and the fused hyper-connection kernels are not armed.
 
-<!-- bundled-spec (uncomment once the spec has passed its gates and its files are added under specs/hy4/):
-A tested spec ships with the repository in `specs/hy4/`. Use it with:
+A spec ships with the repository in `specs/hy4/` (off by default). To arm it, one line before the serve command:
 
     export KYOJIN_ABLIT_SPEC=specs/hy4
 
-The sha256 of both files is listed in `specs/hy4/SHA256SUMS`.
--->
+The sha256 of both files is listed in `specs/hy4/SHA256SUMS`. Measured cost of the armed hook on the Mac Studio (4K context, speculative decode, depth 3): about 20 to 30 % lower decode speed than the line in the table above, because armed blocks run the unfused path (see the second note above). Reasoning answers also get much longer on the refusal-style test prompts (in our check 4 of 17 answers reached the 4096-token limit and 3 came back empty). Treat the armed hook as experimental: it is not part of the measured table, and a faster fused version is in progress.
 
 ## Speed
 
