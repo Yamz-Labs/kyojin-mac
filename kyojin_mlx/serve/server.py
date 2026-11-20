@@ -512,9 +512,15 @@ def make_handler(app: App):
                     state["started"] = True
                     if chat:
                         self._sse(chunk({"role": "assistant", "content": ""}))
+                watch = None if stream else HL.ClientWatch(self.connection)   # a non-stream reply writes nothing until the end: look at the socket instead
                 while True:
+                    if watch is not None and watch.gone():       # the client left (during the queue wait, the prefill or the decode): stop generating
+                        app.log(f"{rid[-6:]} client left: request cancelled")
+                        handle.cancel()
+                        self.close_connection = True
+                        return
                     try:
-                        ev = handle.events.get(timeout=10.0)
+                        ev = handle.events.get(timeout=10.0 if stream else HL.DISCONNECT_PERIOD_S)
                     except queue.Empty:                          # a long prefill or a wait for a slot: tell a stream client we are alive
                         if stream:                               # (and find out if it left)
                             self.wfile.write(b": waiting\n\n")
