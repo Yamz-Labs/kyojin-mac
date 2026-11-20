@@ -36,7 +36,9 @@ def test_totals_read_loaded_modules_only(monkeypatch):
     monkeypatch.setitem(MLA.MlaAttention.PATHS, "fixed_gather", 5)
     monkeypatch.setitem(MLA.MlaAttention.PATHS, "mtp_head_fixed_kv", 2)
     monkeypatch.setitem(MLA.MlaAttention.PATHS, "mtp_head_gather", 1)
-    assert FD.totals() == {"qdec_fast": 7, "absorb_gemv": 3, "fixed_gather": 5, "mtp_head_fixed_kv": 2, "mtp_head_gather": 1}
+    monkeypatch.setitem(MLA.MlaAttention.PATHS, "fixed_kv_headroom", 9)
+    monkeypatch.setitem(MLA.MlaAttention.PATHS, "fixed_kv_grow_decode", 0)
+    assert FD.totals() == {"qdec_fast": 7, "absorb_gemv": 3, "fixed_gather": 5, "mtp_head_fixed_kv": 2, "mtp_head_gather": 1, "fixed_kv_headroom": 9, "fixed_kv_grow_decode": 0}
     monkeypatch.delitem(sys.modules, "kyojin_mlx.foreign_metal")
     assert "qdec_fast" not in FD.totals()
 

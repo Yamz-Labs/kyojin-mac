@@ -40,7 +40,7 @@ def _fixed(m, xs, chunk, compiled, pk=False, trims=None, ring=False):
         L = x.shape[1]
         if trims and i in trims:
             c.trim(trims[i])
-        c.ensure(c._n + L, x.dtype)
+        c.ensure(c._n + L, x.dtype, L)
         if compiled and L == 1:
             if fn is None:
                 def fn(x_, *st):
@@ -374,3 +374,84 @@ def _trim_body(kind, create_causal_mask, KVCache):
         step(x, ref_c, fc)
     mx.eval(outs_ref, outs_new)
     assert _diff(outs_ref, outs_new) <= TOL
+
+
+def _ladder(c, dtype, prefill, decode, rows=1, chunk=20):
+    """Drive the cache's growth like Model.__call__: prompt chunks of `chunk` rows (> the 16-row limit), then `decode` calls of `rows` rows; -> shapes seen during decode."""
+    n = 0
+    while n < prefill:
+        L = min(chunk, prefill - n)
+        c.ensure(c._n + L, dtype, L)
+        c._n += L
+        n += L
+    shapes = []
+    for _ in range(decode):
+        c.ensure(c._n + rows, dtype, rows)
+        c._n += rows
+        shapes.append(c.cache[0].shape[2])
+    return shapes
+
+
+def test_headroom_decode_never_grows(monkeypatch):
+    """KYOJIN_HY4_FIXED_KV_HEADROOM=N: after any prompt length the buffer holds N free rows, so N decode rows never grow it (fires counters: no decode growth); off = the stock growth lands mid-decode."""
+    monkeypatch.setenv("KYOJIN_HY4_FIXED_KV_HEADROOM", "0")
+    for prefill in (47, 48, 60, 63, 64, 100):                      # prompt ends 0..63 rows below a 64-row chunk boundary: some leave < 32 rows of room
+        c = FK.FixedKVCache(8, 4, 0, 64, pk_dx=2)
+        sh = _ladder(c, mx.float32, prefill, 32)
+        grew_off = len(set(sh)) > 1
+        monkeypatch.setenv("KYOJIN_HY4_FIXED_KV_HEADROOM", "32")
+        before = dict(FK.STATS)
+        c2 = FK.FixedKVCache(8, 4, 0, 64, pk_dx=2)
+        sh2 = _ladder(c2, mx.float32, prefill, 32)
+        monkeypatch.setenv("KYOJIN_HY4_FIXED_KV_HEADROOM", "0")
+        assert len(set(sh2)) == 1, (prefill, sh2)
+        assert FK.STATS["grow_decode"] == before["grow_decode"]
+        assert sh2[0] >= prefill + 32 and sh2[0] % 64 == 0
+        if prefill in (47, 48, 60):
+            assert grew_off                                         # the control: without the flag these prompts grow inside the decode window
+    c = FK.FixedKVCache(8, 4, 0, 64, pk_dx=2)                       # decode longer than the headroom: one growth by headroom, not by one chunk per 64 rows
+    monkeypatch.setenv("KYOJIN_HY4_FIXED_KV_HEADROOM", "128")
+    sh = _ladder(c, mx.float32, 100, 300)
+    monkeypatch.setenv("KYOJIN_HY4_FIXED_KV_HEADROOM", "0")
+    sh0 = _ladder(FK.FixedKVCache(8, 4, 0, 64, pk_dx=2), mx.float32, 100, 300)
+    assert len(set(sh)) == 2 and sh[-1] >= 154 + 3 + 128 and len(set(sh0)) == 6
+
+
+def test_headroom_counters_fire(monkeypatch):
+    from kyojin_mlx.foreign_skeleton_mla import MlaAttention
+    monkeypatch.setenv("KYOJIN_HY4_FIXED_KV_HEADROOM", "0")
+    b = dict(FK.STATS); p = dict(MlaAttention.PATHS)
+    c = FK.FixedKVCache(8, 4, 0, 64)
+    _ladder(c, mx.float32, 100, 40)                                 # one prefill growth (64 -> 128), then one decode growth (140 > 128)
+    assert FK.STATS["grow_decode"] == b["grow_decode"] + 1 and FK.STATS["grow_prefill"] > b["grow_prefill"]
+    assert MlaAttention.PATHS["fixed_kv_grow_decode"] == p.get("fixed_kv_grow_decode", 0) + 1
+    assert MlaAttention.PATHS.get("fixed_kv_headroom", 0) == p.get("fixed_kv_headroom", 0)      # flag off: the headroom counter never moves
+    monkeypatch.setenv("KYOJIN_HY4_FIXED_KV_HEADROOM", "32")
+    h0 = MlaAttention.PATHS.get("fixed_kv_headroom", 0)
+    _ladder(FK.FixedKVCache(8, 4, 0, 64), mx.float32, 100, 40)
+    assert MlaAttention.PATHS["fixed_kv_headroom"] > h0               # fires check: the headroom counter moves with the flag on
+    monkeypatch.setenv("KYOJIN_HY4_FIXED_KV_HEADROOM", "0")
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("kind", ["swa", "kpool"])
+def test_headroom_outputs_equal_stock(kind, compiled, monkeypatch):
+    """The extra masked rows change nothing: the attention outputs with the headroom equal the stock growth's (and the concatenating cache's) across a prefill, a growth and decode rows."""
+    rng = np.random.default_rng(5)
+    d = 64
+    if kind == "swa":
+        m = _swa_model(rng, d, 4, 32, 24, 8, 16, 40)
+    else:
+        m = _kp_model(rng, d, 4, 32, 24, 8, 16, 2, 16, top_k=32)
+        m.swa, m.window = False, 0
+    xs = _chunks(rng, d, 150, 6)
+    xs = [xs[0][:, :90], xs[0][:, 90:]] + xs[1:]
+    monkeypatch.setenv("KYOJIN_HY4_FIXED_KV_HEADROOM", "0")
+    a = _fixed(m, xs, 64, compiled, pk=(kind == "kpool"))
+    monkeypatch.setenv("KYOJIN_HY4_FIXED_KV_HEADROOM", "40")
+    b = _fixed(m, xs, 64, compiled, pk=(kind == "kpool"))
+    monkeypatch.setenv("KYOJIN_HY4_FIXED_KV_HEADROOM", "0")
+    dd = _diff(a, b)
+    print(f"fixed_kv headroom {kind} compiled={compiled}: max rel diff {dd:.3g}")
+    assert dd <= TOL
+    assert _diff(_ref(m, xs, m.window), b) <= TOL

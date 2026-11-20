@@ -897,7 +897,7 @@ class Model(nn.Module):
             if AG.MODE:
                 AG.prepare(self)                                    # flag absorb_gemv: 16-bit / Q8_0 absorb copies of the active mode, once per mode, eager
             for c in cache:
-                c.ensure(c._n + inputs.shape[1], AF.kv_dtype(h.dtype))
+                c.ensure(c._n + inputs.shape[1], AF.kv_dtype(h.dtype), inputs.shape[1])
         mask = None if fixed else create_attention_mask(h, cache[0])
         wmask = self._window_mask(h.shape[1], cache[0]) if sp.swa_window and not fixed else None
         freqs, freqs_w = self._freqs(), (self._freqs(True) if sp.swa_window else None)
