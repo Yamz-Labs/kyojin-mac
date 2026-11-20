@@ -18,7 +18,8 @@ Models are not in this repo. You bring the weights.
 
 Python 3.11 or newer, Apple Silicon, macOS with Metal.
 
-    git clone <this repo> kyojin-mlx && cd kyojin-mlx
+    git clone https://github.com/Yamz-Labs/kyojin-mac.git
+    cd kyojin-mac
     python3 -m venv .venv && . .venv/bin/activate
     pip install -e .
 
