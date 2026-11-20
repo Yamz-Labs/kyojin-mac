@@ -59,6 +59,8 @@ GEMVK_COPY_SMALL = 8 << 20                                                 # bel
 MMAK_ROWS = int(os.environ.get("KYOJIN_FOREIGN_MMAK_ROWS", "32"))        # K formats: stored simdgroup-matrix kernel up to here (gate: +30..36 % over decode + matmul at R32, below it at R48), then the copy / decode + matmul; 0 = no mmak
 NBRK = int(os.environ.get("KYOJIN_FOREIGN_NBRK", "2"))
 NBR = int(os.environ.get("KYOJIN_FOREIGN_NBR", "2"))
+NBR_SMALL = int(os.environ.get("KYOJIN_FOREIGN_NBR_SMALL", "0") or 0)       # flag foreign_nbr_small: output rows per simdgroup of the 8-bit stored GEMV on matrices under NBR_SMALL_MAX weights (0 = NBR; 1 doubles the threadgroups)
+NBR_SMALL_MAX = 8 << 20
 NTN = int(os.environ.get("KYOJIN_FOREIGN_NTN", "1"))
 _FMMA_MIN_ENV = os.environ.get("KYOJIN_FOREIGN_FMMA_MIN")                      # one value for every format; unset = FMMA_MIN_FMT
 # 11/11 retune after the K / IQ wrapper cache (a7341f4, the stored GEMV lost 25-46 us of host per call): the GEMV leads up to R4 on IQ3_XXS / IQ3_S /
@@ -847,8 +849,16 @@ class DevPack:
         return _mmak_kern(self.fmt, ntn)(inputs=ins, template=[("R", R), ("KIN", self.k), ("N", self.n), ("NTN", ntn)], grid=(-(-self.n // (32 * ntn)) * 128, 1, 1),
                                          threadgroup=(128, 1, 1), output_shapes=[(R, self.n)], output_dtypes=[mx.float16])[0]
 
+    def _nbr8(self, nbr=None):
+        """Output rows per simdgroup of the 8-bit stored GEMV: the global NBR, or NBR_SMALL on a matrix under NBR_SMALL_MAX weights (flag foreign_nbr_small: more threadgroups on the small projections)."""
+        if nbr:
+            return nbr
+        if NBR_SMALL and self.n * self.k < NBR_SMALL_MAX and self.n % (8 * NBR_SMALL) == 0:
+            return NBR_SMALL
+        return globals()['NBR']
+
     def _gemv8(self, x2, nbr=None):
-        R, NBR = x2.shape[0], nbr or globals()['NBR']
+        R, NBR = x2.shape[0], self._nbr8(nbr)
         ins = [x2, self.qs, self.gs] if self.meta is None else [x2, self.qs, self.meta, self.gs]
         return _gemv8_kern(self.fmt, NBR)(inputs=ins, template=[("R", R), ("KIN", self.k), ("N", self.n), ("NBR", NBR)], grid=(self.n // (8 * NBR) * 128, 1, 1),
                                           threadgroup=(128, 1, 1), output_shapes=[(R, self.n)], output_dtypes=[mx.float16])[0]
@@ -868,7 +878,7 @@ class DevPack:
     def gemv8_cf(self, x2, out_dtype):
         """_gemv8 with x2 half / float32 / bfloat16 read as stored and y in out_dtype (float16 / float32): the values of
         x2.astype(float16) -> _gemv8 -> .astype(out_dtype), bit for bit, in one launch (flag foreign_castfree)."""
-        R, NBR = x2.shape[0], globals()['NBR']
+        R, NBR = x2.shape[0], self._nbr8()
         xin, yout = _CF_X[x2.dtype], _CF_Y[out_dtype]
         ins = [x2, self.qs, self.gs] if self.meta is None else [x2, self.qs, self.meta, self.gs]
         return _gemv8_kern(self.fmt, NBR, False, False, xin, yout)(inputs=ins, template=[("R", R), ("KIN", self.k), ("N", self.n), ("NBR", NBR)],

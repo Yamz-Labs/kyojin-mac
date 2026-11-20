@@ -1169,6 +1169,9 @@ FLAGS: dict[str, Flag] = {
     "split_eval": Flag("KYOJIN_SPLIT", "0", "Plain and verify passes (1 .. 8 rows): mx.async_eval(h) after layers 1 and 8, so the GPU runs the first layers while the host builds the rest of the graph. n10 Mac Studio, Hy4: with one eval at the end the GPU idled for the whole host build (2.6 ms at 1 row, 7.2 ms at 6 rows); plain p4 40.4 -> 43.9 tok/s (ids equal), verify T=6 50.3 -> 44.2 ms. "
                        "Explicit KYOJIN_SPLIT_EVAL / _ROWS / _ROWS_MIN env wins. Read per call",
                        attrs=(("foreign_skeleton", "SPLIT_ON", _on),)),
+    "foreign_nbr_small": Flag("KYOJIN_FOREIGN_NBR_SMALL", "0", "Output rows per simdgroup (NBR) of the 8-bit stored GEMV (gemv8, 1 .. 8 rows) on matrices under 8M weights: 0 = the global NBR (2), 1 = one row per "
+                              "simdgroup = twice the threadgroups (the 96-threadgroup 3072 x 1536 / 1536 x 3072 / 1024-wide projections run at 0.5-0.6 TB/s against 1.0-1.2 for the big ones). "
+                              "Same sums per output row (the row order inside a simdgroup does not change a dot product). Read per call", kind="int", attrs=(("foreign_linear", "NBR_SMALL", int),)),
     "head_q": Flag("KYOJIN_HEAD_Q", "0", "Output head of a 1 .. 16 row pass (plain decode, verify rows; prompt chunks keep the dense head) through an 8- (or 4-) bit affine group-64 copy of the dense head matrix "
                    "(mx.quantized_matmul) instead of the dense float32 matmul (Hy4: 1.6 GB, 1.3 ms of a 22.9 ms step at the bandwidth roof; Q8 reads a quarter). The packed copy is built once and "
                    "shared with the MTP draft's output projection (one low-bit copy; the dense head stays resident for the prompt chunks). Logits differ at the 8-bit rounding: gate with the model's "
