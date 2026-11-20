@@ -56,6 +56,25 @@ Speed numbers: see the benchmark table.
 - One model and one quantization (Q3_K). The model row is marked unproven in the loader, which is why `tools/hy4_mac.env` sets `KYOJIN_SKELETON=1` and `KYOJIN_KIT_UNPROVEN_ROWS=1`.
 - Tests: `tests/test_hy4_*.py`, `tests/test_skeleton_hy4_*.py` and `tests/test_engram_hy4.py` (run one file at a time).
 
+### Decensor spec (optional)
+
+The server can remove a refusal direction from the Hy4-flash hidden stream at run time, without editing or re-quantising the weights. It is off by default. To arm it, point `KYOJIN_ABLIT_SPEC` at a spec directory before the serve command:
+
+    export KYOJIN_ABLIT_SPEC=/path/to/spec_dir
+
+The directory holds `edit_spec.json` (hidden size 3072, 42 layers, per-layer weights, `"r_per_layer": true`) and `edit_spec.safetensors` (tensor `r`, float32, shape `[42, 3072]`, one direction per layer). The path of `edit_spec.json` itself also works. A spec whose hidden size differs from the model is refused at load. To go back to the measured line, unset the variable.
+
+- The hook edits the attention output (after its post norm) and the MLP / MoE output (after its post norm) of the trunk layers whose weight is not 0. The speculative draft head is never edited.
+- Blocks with an armed hook run the unfused sub-layer path, so decode is slower than the unarmed line. The compiled decode step and the fused hyper-connection kernels are not armed.
+
+<!-- bundled-spec (uncomment once the spec has passed its gates and its files are added under specs/hy4/):
+A tested spec ships with the repository in `specs/hy4/`. Use it with:
+
+    export KYOJIN_ABLIT_SPEC=specs/hy4
+
+The sha256 of both files is listed in `specs/hy4/SHA256SUMS`.
+-->
+
 ## Speed
 
 Kyojin 1.8.9 on a Mac Studio M5 Ultra, 256 GB. Served through the real server, real text, tokens per second.
