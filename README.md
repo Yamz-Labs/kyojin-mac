@@ -92,7 +92,7 @@ Hy4-flash (GGUF Q3_K) on a Mac Studio, up to 256K tokens of context. Numbers: se
 |---|---|---|
 | Hy4-flash serve backend on the generic decoder skeleton: prefill, decode, Engram rows read from the GGUF by row | serves the public Q3_K GGUF | - |
 | multi-token-prediction speculation with the model's own head, depth 3 (depth 5 measured slower at 4K, 16K and 24K) | `--mtp-depth 3` | `--mtp-depth 0` |
-| fixed-state gather attention over the kept keys, pooled keys carried in the cache state | long context | `KYOJIN_HY4_FIXED_GATHER=0` |
+| optional gather attention over the kept keys with pooled keys carried in the cache state (same speed and memory as the default path up to 40K tokens) | long context | off by default; `KYOJIN_HY4_FIXED_GATHER=16384`, `KYOJIN_HY4_FIXED_GATHER_DEC=32768`, `KYOJIN_HY4_FIXED_PKCACHE=1` |
 | fused attention, hyper-connection and expert kernels for the skeleton (`tools/hy4_mac.env`) | decode and prefill speed | unset the flag |
 | optional hierarchical candidate-restricted indexer for prompt chunks | `KYOJIN_HY4_HISA` (default off) | - |
 | few-row Q8_0 simdgroup-matrix product for the verify rows (2 to 8 rows) of the dense Q8_0 linears | Hy4-flash speculative decode, TBD-FROM-CELL | `KYOJIN_FOREIGN_FMM8=0` |
