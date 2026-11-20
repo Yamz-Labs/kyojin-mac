@@ -53,7 +53,7 @@ Tested on a Mac Studio with 256 GB of unified memory.
 Memory guard: `KYOJIN_MEM_BUDGET_GIB` (default 0.88 x physical RAM) caps the process. `KYOJIN_MEM_BUDGET_GIB=0` switches the guard off. A prompt whose projected memory is over the budget gets HTTP 413. The projection adds a slope per 1K prompt tokens to what the process holds: the Hy4 backend uses 0.12 GiB, the other backends use no slope (their prompts are not refused by length). `KYOJIN_MEM_GIB_PER_1K` sets the slope on every backend. A request that reaches the budget while running is stopped after the MLX cache and the prefix snapshots are dropped, so the server stays up.
 Speed numbers: see the benchmark table.
 
-- Context: 256K tokens (`--ctx 262144`). 1M tokens is not part of this release.
+- Context: 256K tokens (`--ctx 262144`). Prompts of 64K, 128K and 176K tokens are served (see "Long context" below). 1M tokens is not part of this release.
 - One request decodes at a time; other requests queue. Batched multi-user decode of Hy4 is not in this release.
 - The Engram tables (59 GiB) stay on disk and are read by row (parallel preads with a background prefetch, `KYOJIN_HY4_ENGRAM_PREAD` and `KYOJIN_HY4_ENGRAM_DECPF` in `tools/hy4_mac.env`); nothing is loaded or pinned in memory. The first request after a start is slower while rows are read. The read helper `tools/rowread/rowread.c` is compiled with `clang` on first use; without a compiler the rows are read through the memory map (same results, slower on a cold table).
 - One model and one quantization (Q3_K). The model row is marked unproven in the loader, which is why `tools/hy4_mac.env` sets `KYOJIN_SKELETON=1` and `KYOJIN_KIT_UNPROVEN_ROWS=1`.
@@ -78,7 +78,7 @@ The sha256 of both files is listed in `specs/hy4/SHA256SUMS`. Measured cost of t
 
 ## Speed
 
-Kyojin 1.8.9 on a Mac Studio M5 Ultra, 256 GB. Served through the real server, real text, tokens per second.
+DeepSeek and Qwen rows: Kyojin 1.8.9. Hy4-flash rows: Kyojin 1.10.3, see the Hy4-flash table below. Mac Studio M5 Ultra, 256 GB. Served through the real server, real text, tokens per second.
 One warm-up discarded, then one measured run.
 
 | Model and cell | tok/s |
@@ -103,7 +103,7 @@ DeepSeek V4.1 uses 176-178 GB at 8K context and 187 GB at 983K.
 
 ### Hy4-flash Q3_K (GGUF) against llama.cpp
 
-Decode speed in tokens per second, Mac Studio M5 Ultra 256 GB, same Q3_K GGUF, same fixed text, speculative decode with the model's own head on both sides (ours: `--mtp-depth 3`; llama.cpp: `draft-mtp`). Served through the real server, real text, median of repeated runs. "next" marks a cell that is measured next and added to this table.
+Decode speed in tokens per second, Mac Studio M5 Ultra 256 GB, same Q3_K GGUF, same fixed text, speculative decode with the model's own head on both sides (ours: `--mtp-depth 3`; llama.cpp: `draft-mtp`). Served through the real server, real text, median of repeated runs. "to follow" marks a cell whose paired release run is not in yet; the lead adds it.
 
 | context | ours, speculative (depth 3) | ours, plain | llama.cpp, speculative | llama.cpp, plain |
 |---|---|---|---|---|
@@ -111,13 +111,14 @@ Decode speed in tokens per second, Mac Studio M5 Ultra 256 GB, same Q3_K GGUF, s
 | 16K | 56.88 | 42.42 | 57.17 | 48.85 |
 | 24K | 55.58 | 41.14 | 52.78 | 48.92 |
 | 32K | 46.08 | not measured | 50.4 | 48.7 |
-| 64K | next | next | 52.69 | 48.72 |
-| 128K | next | next | next | next |
+| 64K | measured numbers to follow | measured numbers to follow | 52.69 | 48.72 |
+| 128K | measured numbers to follow | measured numbers to follow | measured numbers to follow | measured numbers to follow |
 
 Where llama.cpp leads:
 
-- Speculative decode: ours is ahead at 4K (+26 %) and 24K (+5 %), level at 16K (57.17 against 56.88, llama.cpp is 0.5 % ahead), and behind at 32K (46.08 against 50.4). The 64K cell is measured next: llama.cpp holds 52.69 there.
+- Speculative decode: ours is ahead at 4K (+26 %) and 24K (+5 %), level at 16K (57.17 against 56.88, llama.cpp is 0.5 % ahead), and behind at 32K (46.08 against 50.4). At 64K llama.cpp holds 52.69; our paired run is to follow.
 - Plain decode (no draft): llama.cpp is faster at every context we measured (4K: 48.66 against 44.38; 16K: 48.85 against 42.42; 24K: 48.92 against 41.14). Our advantage comes from speculation, not from the plain step.
+- Long context (1.10.x, Mac Studio M5 Ultra, 256 GB): 64K and 128K prompts are served. A 141K-token prompt was served at 128K context with passkey retrieval 3 of 3 (decode 31 tok/s on the leak-free lane stack). A 176K-token prompt was served with passkey 3 of 3 (decode 37 tok/s). The peak footprint in these runs was 143 GiB (`phys_footprint`). These are single served checks on one text, not the paired table run: the paired 64K and 128K cells are marked "measured numbers to follow".
 - The speculative cells use the shipped serve line. Passkey retrieval passed 3 of 3 at 4K, 16K and 24K in both modes. The peak footprint is 150-151 GiB for a 144 GiB file (one resident copy of the weights).
 
 ## New in 1.10.3
@@ -147,7 +148,7 @@ What is new against 1.9.x:
 - `attn_vec`: the MLA decode attention runs in one launch per layer (about 20 small launches before).
 - Engram rows are read from disk by parallel pread, with a background prefetch during decode. The 59 GiB table is never loaded or pinned.
 - Four kernels for the verify rows and the output head: `fmm8` (few-row Q8_0 matrix product), `head_q` (shared packed 8-bit output head), `nbr_small` (small 8-bit GEMVs), `moe_route_sel` (fused router selection).
-- Context: 256K tokens are configured. Decode speed at 64K and 128K context is measured next and will be added to the table.
+- Context: 256K tokens are configured. 64K, 128K and 176K-token prompts are served (see "Long context" in the Hy4-flash table notes); the paired decode cells at 64K and 128K are to follow.
 
 Run it (copy and paste; needs the install steps above and about 150 GiB of free memory):
 
