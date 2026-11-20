@@ -14,7 +14,7 @@ class's cost with the real overlap (a single-dispatch profile over-prices small 
     norm        RMSNorm modules -> identity                                                         nn.RMSNorm.__call__ (installed on demand)
     attn        attention core (kv write, compressor, indexer, attend) -> zeros, cache untouched    dsv4_core.core, fuse_attn.core
     idx         indexer only -> fixed first-k positions                                             dsv4_core.core (the idx_short form of the selection)
-    ablit       refusal-direction projection -> identity                                                     ablit.project
+    ablit       direction projection -> identity                                                     ablit.project
     attn_proj attn_core attn_out mlp hc engram head   and attn / idx / norm / router / moe_routed / moe_shared on the generic decoder skeleton (Hy4, GLM, kit models):
                 structural stand-ins found by layer structure, see ablate_struct.py (installed from foreign_skeleton.Model.__call__)
 

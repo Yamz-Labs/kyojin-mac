@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Runtime refusal-direction projection (refusal-direction hook), no weight edit and no re-quantisation. KYOJIN_ABLIT_SPEC=<edit_spec.json>, default off.
+"""Runtime direction projection (direction hook), no weight edit and no re-quantisation. KYOJIN_ABLIT_SPEC=<edit_spec.json>, default off.
 
 Editing a writer as W' = (I - w r r^T) W is linear in the writer output, so it equals projecting the sublayer output before the residual write:
 
@@ -92,7 +92,7 @@ _project_c = mx.compile(_project, shapeless=True)
 _project_affine_c = mx.compile(_project_affine, shapeless=True)
 
 # Flag ablit_fused (KYOJIN_ABLIT_FUSED, runtime): the whole projection of a row in ONE launch. The stock path is ~7 launches per call
-# (fp16 clip = maximum + minimum, the fp32 cast the matmul reads, R y, (R y - mu) R, the fused update), and a refusal-directioned DS4.1 step makes
+# (fp16 clip = maximum + minimum, the fp32 cast the matmul reads, R y, (R y - mu) R, the fused update), and a projected DS4.1 step makes
 # ~58 calls: ~350 of its ~2080 dispatches. Same math in fp32 and the same association as _project_affine; only the summation order of
 # the K dot products differs (one threadgroup per row: per-thread partial sums, simd_sum, then the simdgroup partials in order).
 FUSED = os.environ.get("KYOJIN_ABLIT_FUSED", "1") not in ("0", "")
@@ -161,7 +161,7 @@ def project(y: mx.array, w: float, R: mx.array, mu: mx.array | None = None) -> m
     """y - w * R^T (R y - mu) over the last axis, fp32 inside, y.dtype out. R [K, hidden] fp32. mu [K] (spec fields
     attn_mu / mlp_mu) = mean of R y on harmless text: the writer keeps its harmless level of the direction, which costs
     far less KL than pulling it to zero. Without mu this is the plain ablation."""
-    if AZ.ACTIVE and AZ.on("ablit"):                                           # ablate: the refusal-direction projection is the identity (timing probe)
+    if AZ.ACTIVE and AZ.on("ablit"):                                           # ablate: the direction projection is the identity (timing probe)
         AZ.hit("ablit")
         return y
     if FUSED and R.ndim == 2 and y.shape[-1] == R.shape[1] and R.shape[0] <= 8 and y.size:

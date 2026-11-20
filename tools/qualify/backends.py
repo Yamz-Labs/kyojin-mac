@@ -30,7 +30,7 @@ def mlx_env(repo: str) -> dict:
 PROFILES = {
     "mlx": dict(
         python=_venv_python(None), engine=str(MAIN), locks=[os.path.expanduser(os.environ.get("KYOJIN_GPU_LOCK", str(MAIN / ".gpu.lock")))],
-        env={}, guard_log=str(MAIN / "memory guard/guard.log"), mem_cap_gib=13.0,        # owner/guard rule: one job < 13 GiB footprint on the Air
+        env={}, guard_log=str(MAIN / "guard/guard.log"), mem_cap_gib=13.0,        # owner/guard rule: one job < 13 GiB footprint on the Air
         gpu_used_mib="mx.get_active_memory", host_peak_note="Apple unified memory",
     ),
 }

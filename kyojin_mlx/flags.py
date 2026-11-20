@@ -742,7 +742,7 @@ FLAGS: dict[str, Flag] = {
                      "(sum of all buffer spans) / gpu_kb1_r<rows> (buffers with exactly one dispatch, exact) / gpu_kmix_r<rows> (split evenly). "
                      "MLX_MAX_OPS_PER_BUFFER=1 makes every buffer single-dispatch",
                      attrs=(("gpuspan", "KERN", _on),)),
-    "ablit_fused": Flag("KYOJIN_ABLIT_FUSED", "1", "refusal-direction projection (ablit.project): clamp, the K dot products and the update of a row in ONE launch instead of ~7 "
+    "ablit_fused": Flag("KYOJIN_ABLIT_FUSED", "1", "direction projection (ablit.project): clamp, the K dot products and the update of a row in ONE launch instead of ~7 "
                         "(fp16 clip pair, fp32 cast, two small fp32 matmuls, fused update); fp32 inside like the stock path, only the dot product's "
                         "summation order differs", attrs=(("ablit", "FUSED", _on),)),
     "attn_core_fuse": Flag("KYOJIN_ATTN_CORE_FUSE", "0", "DS4.1 plain decode attention core: the kv chain also writes the stacked window buffer the commit keeps, so the commit's slot scatter launch is gone "
@@ -752,7 +752,7 @@ FLAGS: dict[str, Flag] = {
                    "each replaced by the cheapest stand-in that keeps shapes and dtypes, to read its exposed cost as a round-time difference. Classes: moe_routed (routed experts -> zeros), "
                    "moe_shared (shared expert -> zeros), router (logits + top-k -> fixed ids / weights), moe_glue (routed GEMVs kept, rot / mid / final -> zero buffers), "
                    "mhc (mixes + sinkhorn -> constants, pre -> stream mean, expand -> add; block runs the stock chain), norm (RMSNorm -> identity; block runs the stock chain), "
-                   "attn (attention core -> zeros, cache untouched), idx (indexer -> fixed first-k), ablit (refusal-direction projection -> identity); on the generic decoder skeleton (Hy4, GLM, kit models) "
+                   "attn (attention core -> zeros, cache untouched), idx (indexer -> fixed first-k), ablit (direction projection -> identity); on the generic decoder skeleton (Hy4, GLM, kit models) "
                    "also attn_proj / attn_core / attn_out / mlp / hc / engram / head (kyojin_mlx/ablate_struct.py, structure only; the first ablated call of a shape runs real). \"\" = off, bit-identical",
                    kind="str", attrs=(("ablate", "ACTIVE", _ablate),)),
     "host_sample": Flag("KYOJIN_HOST_SAMPLE", "0", "serve probe: sample the engine thread's own Python stack every N microseconds (0 = off, read per loop "

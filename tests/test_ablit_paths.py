@@ -1,4 +1,4 @@
-"""Runtime refusal-direction hook (kyojin_mlx.ablit) on the engine's fast paths, on a tiny random DS4.1 stack shaped for them (head_dim 512, hc_mult 4, fp16, Metal):
+"""Runtime direction hook (kyojin_mlx.ablit) on the engine's fast paths, on a tiny random DS4.1 stack shaped for them (head_dim 512, hc_mult 4, fp16, Metal):
 compiled fused decode (fuse_layer solo B region) and the row-invariant verify (rows.verify). The compiled chained verify shares its hooked B region code with the solo path
 (fuse_layer `_chain_regions`); the mini model has no EXL3 linears, which `spec.verify` needs, so a chain run waits for a real pack (step 3 compares chain on / off). The mini model is chaotic (router / top-k
 flips amplify a 1e-7 rounding difference across layers), so the stack is cut after the first armed block: layers before it are untouched, hence identical, and the

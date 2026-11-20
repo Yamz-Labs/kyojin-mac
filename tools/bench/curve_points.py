@@ -33,7 +33,8 @@ def filler_text(files):
 
 
 def rep_salt(salt):
-    """CURVE_SALT set: one fixed salt for every decode request (repeat protocol: the same prompt in every arm and every rep); unset: the per-point salt."""
+    """CURVE_SALT set: one fixed salt for every decode request and the chars / token estimate is not refitted (repeat protocol: the same prompt in every arm and every rep; the
+    reps after the first hit the server's prompt cache, so only the first request has a real prefill); unset: the per-point salt."""
     return os.environ.get("CURVE_SALT") or salt
 
 
@@ -118,7 +119,8 @@ def fit(a, st, L, build, max_tokens, ignore_eos=False, rep=0):
                 print(f"curve_points: HTTP {e.code} at ~{tgt} tokens, retry shorter", flush=True); continue
             raise
         if r.get("prompt_tokens"):
-            st["cpt"] = len(prompt) / r["prompt_tokens"]
+            if not os.environ.get("CURVE_SALT"):                  # repeat protocol: the calibrated chars / token stays, so every arm builds the same prompt at every point
+                st["cpt"] = len(prompt) / r["prompt_tokens"]
         r["target_tokens"] = tgt
         for _ in range(rep if max_tokens > 8 else 0):           # --pf-rep N: the identical prompt again (8 tokens): every chunk shape is warm, so its prefill speed is the steady state (the first request also pays the first-seen shapes)
             r2 = ask(a, prompt, 8)

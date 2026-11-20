@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""ablit_fused: the one-launch refusal-direction projection against the exact projection (float64), and against the stock path where the
+"""ablit_fused: the one-launch direction projection against the exact projection (float64), and against the stock path where the
 stock path is exact (one row: a GEMV). With several rows the stock path's fp32 matmul runs at reduced precision on Apple GPUs
 (errors up to ~4e-3 measured 05/11), the fused kernel does not (~5e-7), and it computes every row the same way whatever the row count."""
 import mlx.core as mx
