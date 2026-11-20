@@ -132,7 +132,13 @@ Where llama.cpp leads:
 ## New in 1.10.4
 
 - KV headroom (`KYOJIN_HY4_FIXED_KV_HEADROOM=256`, in `tools/hy4_mac.env`): a prompt chunk leaves 256 free rows in every KV buffer, the draft head's included, and a decode-time growth adds 256. A request of up to 256 new tokens no longer grows (copies and retraces) a buffer in the middle of decode. Before, the growth landed wherever the prompt length happened to sit against the 1024-row chunk boundary. `KYOJIN_HY4_FIXED_KV_HEADROOM=0` restores the stock growth; the code default is `0`.
-- Development build, speculative decode (`--mtp-depth 3`) with the draft-head KV on, Mac Studio, passkey retrieval 3 of 3: 32K 58.05 to 64.03 tok/s (+10.3 %), 64K 65.95 to 65.97 (unchanged), a 141K-token prompt 42.74 to 56.38 (+31.9 %). Decode buffer growths: 258 before, 0 with the headroom. The paired release run adds the final figures.
+- Measured on a development build, one Mac Studio, a 141K-token prompt, speculative decode (`--mtp-depth 3`), same flags otherwise. Four boots in the order without headroom, with headroom, without, with:
+  - Decode: 42.7 to 55.6 tok/s (+30 %).
+  - Accepted-token rate: the same in both arms (tau 2.377).
+  - Buffer growths during decode: 86 before, 0 with the headroom.
+  - Memory: the mean peak footprint is 0.28 GiB higher with the headroom, and the idle footprint after the request is 0.26 GiB lower. Peaks vary by boot: the same arm moved by up to 2.2 GiB from one boot to the next. For that reason the boots were paired, and a single run of each arm cannot show a difference this small.
+  - Earlier single runs: 32K +10 %, 64K equal.
+  - To opt out, set `KYOJIN_HY4_FIXED_KV_HEADROOM=0` (the code default is already `0`; only `tools/hy4_mac.env` turns it on).
 - Fires log: the `[flags 60s]` totals now also show `fixed_kv_headroom=N` (prompt chunks that kept the headroom free, plus decode growths that added it) and `fixed_kv_grow_decode=N` (buffer growths during decode; stays 0 with the headroom on).
 
 ## New in 1.10.3
