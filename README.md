@@ -129,6 +129,12 @@ Where llama.cpp leads:
 - Long context (1.10.x, Mac Studio M5 Ultra, 256 GB): 64K and 128K prompts are served. A 141K-token prompt was served at 128K context with passkey retrieval 3 of 3 (decode 31 tok/s on a development build with the step-compile leak fix). A 176K-token prompt was served with passkey 3 of 3 (decode 37 tok/s). The peak footprint in these runs was 143 GiB (`phys_footprint`). These are single served checks on one text, not the paired table run. The 128K cells of the table are still to follow.
 - The speculative cells use the shipped serve line. Passkey retrieval passed 3 of 3 at 4K, 16K and 24K in both modes. The peak footprint is 150-151 GiB for a 144 GiB file (one resident copy of the weights).
 
+## New in 1.10.4
+
+- KV headroom (`KYOJIN_HY4_FIXED_KV_HEADROOM=256`, in `tools/hy4_mac.env`): a prompt chunk leaves 256 free rows in every KV buffer, the draft head's included, and a decode-time growth adds 256. A request of up to 256 new tokens no longer grows (copies and retraces) a buffer in the middle of decode. Before, the growth landed wherever the prompt length happened to sit against the 1024-row chunk boundary. `KYOJIN_HY4_FIXED_KV_HEADROOM=0` restores the stock growth; the code default is `0`.
+- Development build, speculative decode (`--mtp-depth 3`) with the draft-head KV on, Mac Studio, passkey retrieval 3 of 3: 32K 58.05 to 64.03 tok/s (+10.3 %), 64K 65.95 to 65.97 (unchanged), a 141K-token prompt 42.74 to 56.38 (+31.9 %). Decode buffer growths: 258 before, 0 with the headroom. The paired release run adds the final figures.
+- Fires log: the `[flags 60s]` totals now also show `fixed_kv_headroom=N` (prompt chunks that kept the headroom free, plus decode growths that added it) and `fixed_kv_grow_decode=N` (buffer growths during decode; stays 0 with the headroom on).
+
 ## New in 1.10.3
 
 Long-context and decode levers for Hy4-flash on the Mac, all in `tools/hy4_mac.env`.
