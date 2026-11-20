@@ -3,7 +3,7 @@
 (`mpp::tensor_ops::matmul2d`, int8 operands: 116-145 TOPS against 86-99 TFLOPS for the fp16 matmul MLX runs on the same shapes). Flag `KYOJIN_PF_GEMM_I8_DENSE`
 (default off, read per call; `kyojin_mlx.flags` entry `pf_gemm_i8_dense`). The routed-expert counterpart is `foreign_pfq8` (`KYOJIN_PF_GEMM_I8`).
 
-Weight side: NO resident copy (owner rule 16/11: no second resident copy of weight data). Every call decodes the stored weight to fp16 (`DevPack.dequant()`, the kernel the fp16 prefill
+Weight side: NO resident copy (rule: no second resident copy of weight data). Every call decodes the stored weight to fp16 (`DevPack.dequant()`, the kernel the fp16 prefill
 path runs anyway) and quantizes it in ONE row-quant launch: ONE fp32 scale per output row (amax / 127 over the whole K reduction, round half even). The only approximation is this
 8-bit re-grid. The int8 weight + scale are graph temporaries of the call (n * k bytes + 4 n), freed with the call; the extra cost over the fp16 path is one read of the fp16
 decode and one write of n * k bytes, amortised over the rows of the chunk.
@@ -81,7 +81,7 @@ def quant_weight(w):
 
 
 def weights(dev):
-    """(int8 [n, k], fp32 [n]) of a DevPack's dequantized weight, built ON THE FLY for ONE call (owner rule 16/11: no second resident copy of the weight data). The stored weight is decoded
+    """(int8 [n, k], fp32 [n]) of a DevPack's dequantized weight, built ON THE FLY for ONE call (rule: no second resident copy of the weight data). The stored weight is decoded
     to fp16 by the same kernel the fp16 prefill path runs (dense packs: their resident fp16), then ONE row-quant launch (foreign_pfq8.quant_rows with qb == k: per-row amax / 127, round half
     even, == quant_weight) writes the int8 codes and the row scale. The caller frees both after the GEMM (transient n * k bytes + the fp16 decode, which the fp16 path pays too)."""
     n, k = int(dev.n), int(dev.k)

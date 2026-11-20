@@ -158,7 +158,7 @@ GLM5 = ArchSpec(
                   sites=(("HyperConnection", "_mix", "hc_branch_mix"), ("MoEGate", "__call__", "router_sigmoid_group"),
                          ("Glm5NextIndexer", "_project_keys", "index_gate_keys"),
                          ("Glm5NextAttention", "_attend", "mla_attend_rows"))),
-    # The served GLM-5.3 lane (what the lane's flags.env sets, every value measured and Opus-reviewed there), so an empty flags.env reproduces it. Op names where a lever has
+    # The served GLM-5.3 setup (what its flags.env sets, every value measured there), so an empty flags.env reproduces it. Op names where a lever has
     # one (kyojin_mlx.opflags.OPS; the KYOJIN_GLM_* spelling stays an alias), the existing name otherwise (no rename sweep). NOT here on purpose:
     # KYOJIN_GLM_DENSE_Q (keeps a second resident copy of the dense weights; env-only until the fix lands) and KYOJIN_GLM_MULTI_PLAIN (measured not OK).
     defaults={

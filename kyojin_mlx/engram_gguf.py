@@ -187,7 +187,7 @@ def read_rows(g: "GF.GgufFile", spec: EngramGgufSpec, rows) -> np.ndarray:
 
 # ----------------------------------------------------------------------------------------------------------------- rows from the file: parallel preads
 # The Hy4-flash table is 63 GB (660M rows x 96 B, 4 Engram layers x 16 columns). Rows hash to uniformly random places, so `raw[rows]` on the memory map pays one serial 16 KB page-in per
-# cold row (a 4096-token chunk reads ~260k rows: cold prefill 126-435 tok/s against ~2000 warm, flat-diag / coldbase 19/11). The table stays on disk (owner 19/11: no warm-up, no pinning):
+# cold row (a 4096-token chunk reads ~260k rows: cold prefill 126-435 tok/s against ~2000 warm, flat-diag / coldbase 19/11). The table stays on disk (no warm-up, no pinning):
 # the rows of a request are DEDUPED, read by parallel native preads (engram_rows rowread, GIL released) and decoded by row. Prompt chunks read layer by layer in the background (the
 # forward waits for a layer's rows at that layer, so the GPU runs the layers before it), and a hint of the NEXT chunk (Hy4Backend.warm_prompt) reads its rows during this one.
 # Prefetched rows are content-addressed (row id -> bytes): a stale hint can only miss, never change an output. A row's bytes decode alone, so every path gives the same floats as `read_rows`.
