@@ -45,9 +45,9 @@ Tested on a Mac Studio with 256 GB of unified memory.
     hf download AngelSlim/Hy4-flash-GGUF --include "Hy4-flash-Q3_K-*.gguf" --local-dir ./hy4-flash
     set -a; . tools/hy4_mac.env; set +a
     python -m kyojin_mlx.serve.server --model ./hy4-flash --port 8080 --model-id Hy4-flash \
-        --sessions 1 --ctx 262144 --kv-mode fp16 --no-kv-disk --prefill-chunk 2048 --mtp-depth 5 --cache-limit-mb 16384
+        --sessions 1 --ctx 262144 --kv-mode fp16 --no-kv-disk --prefill-chunk 2048 --mtp-depth 3 --cache-limit-mb 16384
 
-`tools/hy4_mac.env` holds the kernel flags of the measured line. The prefill speed depends on the MLX buffer cache limit: `--cache-limit-mb 16384` is the value of the measured line (without the flag the limit is derived from the weights and the free memory). Speculative decoding uses the model's own multi-token-prediction head (`--mtp-depth 5`).
+`tools/hy4_mac.env` holds the kernel flags of the measured line. The prefill speed depends on the MLX buffer cache limit: `--cache-limit-mb 16384` is the value of the measured line (without the flag the limit is derived from the weights and the free memory). Speculative decoding uses the model's own multi-token-prediction head (`--mtp-depth 3`).
 Speed numbers: see the benchmark table.
 
 - Context: 256K tokens (`--ctx 262144`). 1M tokens is not part of this release.
@@ -70,6 +70,10 @@ One warm-up discarded, then one measured run.
 | DeepSeek V4.1 Flash, prefill at 983K | 2199-2291 |
 | DeepSeek V4.1 Flash, decode at 983K | 48-49 |
 | DeepSeek V4.1 Flash, 4 sessions, 8K, aggregate decode | 112 |
+| Hy4-flash Q3_K, speculative decode (depth 3) at 4K | TBD-FROM-CELL |
+| Hy4-flash Q3_K, speculative decode (depth 3) at 16K | TBD-FROM-CELL |
+| Hy4-flash Q3_K, speculative decode (depth 3) at 24K | TBD-FROM-CELL |
+| Hy4-flash Q3_K, plain decode (no draft) at 4K / 16K / 24K | TBD-FROM-CELL |
 | Qwen 35B-A3B UD-Q4_K_XL (GGUF), prefill 8K | ~7000 |
 | Qwen 35B-A3B UD-Q4_K_XL (GGUF), prefill 32K | 6304 |
 | Qwen 35B-A3B UD-Q4_K_XL (GGUF), decode at 1K | 185 |
@@ -87,10 +91,14 @@ Hy4-flash (GGUF Q3_K) on a Mac Studio, up to 256K tokens of context. Numbers: se
 | change | effect | off |
 |---|---|---|
 | Hy4-flash serve backend on the generic decoder skeleton: prefill, decode, Engram rows read from the GGUF by row | serves the public Q3_K GGUF | - |
-| multi-token-prediction speculation with the model's own head, depth 5 | `--mtp-depth 5` | `--mtp-depth 0` |
+| multi-token-prediction speculation with the model's own head, depth 3 (depth 5 measured slower at 4K, 16K and 24K) | `--mtp-depth 3` | `--mtp-depth 0` |
 | fixed-state gather attention over the kept keys, pooled keys carried in the cache state | long context | `KYOJIN_HY4_FIXED_GATHER=0` |
 | fused attention, hyper-connection and expert kernels for the skeleton (`tools/hy4_mac.env`) | decode and prefill speed | unset the flag |
 | optional hierarchical candidate-restricted indexer for prompt chunks | `KYOJIN_HY4_HISA` (default off) | - |
+| few-row Q8_0 simdgroup-matrix product for the verify rows (2 to 8 rows) of the dense Q8_0 linears | Hy4-flash speculative decode, TBD-FROM-CELL | `KYOJIN_FOREIGN_FMM8=0` |
+| fused MoE router selection: gating, bias, group limit, top-k, normalisation and scale in one launch | Hy4-flash speculative decode, TBD-FROM-CELL | `KYOJIN_MOE_ROUTE_SEL=0` |
+| output head of 1 to 16 row passes through one shared packed 8-bit copy | Hy4-flash speculative decode, TBD-FROM-CELL | `KYOJIN_HEAD_Q=0` |
+| one output row per simdgroup on small 8-bit GEMVs (twice the threadgroups) | Hy4-flash decode, TBD-FROM-CELL | `KYOJIN_FOREIGN_NBR_SMALL=0` |
 
 - Hy4 runs one session at a time; extra requests queue.
 
