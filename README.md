@@ -52,7 +52,7 @@ Speed numbers: see the benchmark table.
 
 - Context: 256K tokens (`--ctx 262144`). 1M tokens is not part of this release.
 - One request decodes at a time; other requests queue. Batched multi-user decode of Hy4 is not in this release.
-- The Engram tables (59 GiB) stay on disk and are read by row: the first request after a start is slower while rows are read.
+- The Engram tables (59 GiB) stay on disk and are read by row (parallel preads with a background prefetch, `KYOJIN_HY4_ENGRAM_PREAD` and `KYOJIN_HY4_ENGRAM_DECPF` in `tools/hy4_mac.env`); nothing is loaded or pinned in memory. The first request after a start is slower while rows are read. The read helper `tools/rowread/rowread.c` is compiled with `clang` on first use; without a compiler the rows are read through the memory map (same results, slower on a cold table).
 - One model and one quantization (Q3_K). The model row is marked unproven in the loader, which is why `tools/hy4_mac.env` sets `KYOJIN_SKELETON=1` and `KYOJIN_KIT_UNPROVEN_ROWS=1`.
 - Tests: `tests/test_hy4_*.py`, `tests/test_skeleton_hy4_*.py` and `tests/test_engram_hy4.py` (run one file at a time).
 
@@ -99,6 +99,9 @@ Hy4-flash (GGUF Q3_K) on a Mac Studio, up to 256K tokens of context. Numbers: se
 | fused MoE router selection: gating, bias, group limit, top-k, normalisation and scale in one launch | Hy4-flash speculative decode, TBD-FROM-CELL | `KYOJIN_MOE_ROUTE_SEL=0` |
 | output head of 1 to 16 row passes through one shared packed 8-bit copy | Hy4-flash speculative decode, TBD-FROM-CELL | `KYOJIN_HEAD_Q=0` |
 | one output row per simdgroup on small 8-bit GEMVs (twice the threadgroups) | Hy4-flash decode, TBD-FROM-CELL | `KYOJIN_FOREIGN_NBR_SMALL=0` |
+| one-launch flash-attention core for the MLA decode attention (windowed layers and pooled-key layers, 1 to 8 rows; replaces about 20 small launches per layer) | Hy4-flash decode at long context, TBD-FROM-CELL | `KYOJIN_HY4_ATTN_VEC=0` |
+| Engram rows read by deduplicated parallel preads instead of one page-in per row from the memory map (the table stays on disk: no warm-up, no pinning) | Hy4-flash first request and prompt chunks, TBD-FROM-CELL | `KYOJIN_HY4_ENGRAM_PREAD=0` |
+| Engram rows of a speculative round read in the background while the draft head runs (rows stay on disk, only the cold rows are read) | Hy4-flash speculative decode, TBD-FROM-CELL | `KYOJIN_HY4_ENGRAM_DECPF=0` |
 
 - Hy4 runs one session at a time; extra requests queue.
 
