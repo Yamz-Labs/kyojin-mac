@@ -117,6 +117,12 @@ Where llama.cpp leads:
 - Plain decode (no draft): llama.cpp is faster at every context we measured (4K: 48.66 against 44.38; 16K: 48.85 against 42.42; 24K: 48.92 against 41.14). Our advantage comes from speculation, not from the plain step.
 - The speculative cells use the shipped serve line. Passkey retrieval passed 3 of 3 at 4K, 16K and 24K in both modes. The peak footprint is 150-151 GiB for a 144 GiB file (one resident copy of the weights).
 
+## New in 1.10.2
+
+Memory fix for long-running Hy4 servers (step compile of the fixed KV cache).
+
+- Memory: the footprint no longer grows with earlier requests. The compiled layer programs were keyed on the per-request cache object and kept every finished request's KV buffers alive (about 0.11 GiB per 1K tokens of each earlier request); they are now keyed on shapes only and reused by every request. `KYOJIN_STEP_COMPILE_LEAK=1` restores the old key.
+
 ## New in 1.10.0
 
 Hy4-flash (GGUF Q3_K) on a Mac Studio, up to 256K tokens of context. Numbers: see the benchmark table. Guide: the Hy4-flash section above.
