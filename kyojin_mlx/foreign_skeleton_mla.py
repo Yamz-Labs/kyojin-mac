@@ -96,7 +96,7 @@ class KpoolProj(nn.Module):
 
 
 class MlaAttention(nn.Module):
-    PATHS = {"swa_slice": 0, "kpool_gather": 0, "kpool_fuse": 0, "kpool_keycache": 0, "kpool_fuse_fixed": 0, "qblocks": 0, "attn_fuse": 0, "attn_flash": 0, "attn_flash_swa": 0}          # how often each flagged path ran (tests / the c76 cell read it)
+    PATHS = {"swa_slice": 0, "kpool_gather": 0, "kpool_fuse": 0, "kpool_keycache": 0, "kpool_fuse_fixed": 0, "qblocks": 0, "attn_fuse": 0, "attn_flash": 0, "attn_flash_swa": 0, "attn_vec": 0}          # how often each flagged path ran (tests / the c76 cell read it)
 
     def __init__(self, d, nh, q_lora, kv_lora, nope, rope, v, eps=1e-6, base=10000.0, gate=False, sinks=False, kpool=None):
         """kpool: None, or dict(H, dx, kp, top_k, select_tail, n_rot, base) for the N3 selection."""
@@ -190,6 +190,17 @@ class MlaAttention(nn.Module):
         if rows.dtype != mx.float16 or qa.dtype != mx.float16 or q_pe.dtype != mx.float16 or self.kv != MF.D or self.r != MF.DR or not MF.supported(qa, q_pe, rows, ids, self.sinks):
             return None
         return _amm(MF.attend(qa, q_pe, rows, ids, self.scale, self.sinks), vb)
+
+    def _attend_vec(self, q_nope, q_pe, buf, off, kind, extra, window, ab16):
+        """Flag mla_decode_vec: k_b absorb, the ONE-launch attention core over the cells of `kind` (0 window, 1 keep mask, 2 key ids), v_b absorb -> [B, nh, L, v], or None outside the kernel's contract
+        (the caller then runs the stock core)."""
+        from . import mla_decode_vec as MV
+        kb, vb = self._absorbs(mx.float16 if ab16 else mx.float32)
+        qa = _amm(q_nope.astype(kb.dtype), kb)
+        if not MV.eligible(qa, q_pe, buf, kind, extra, MlaAttention.PATHS):
+            return None
+        MlaAttention.PATHS["attn_vec"] += 1
+        return _amm(MV.attend(qa, q_pe, buf, off, kind, extra, self.sinks, self.scale, window), vb)
 
     def _absorbs(self, dt):
         """k_b / v_b of the dtype of the cache rows: the fp16 copies (attn_fp16.prepare) for fp16 rows, else the stored ones."""
@@ -299,6 +310,12 @@ class MlaAttention(nn.Module):
             if o is not None:
                 MlaAttention.PATHS["attn_flash_swa"] += 1
                 return self._finish(o.transpose(0, 2, 1, 3), x, B, L, a16)
+        from . import mla_decode_vec as MV
+        vec = MV.MODE and L <= MV.MAX_ROWS and not ring and not pf16
+        if vec and win and not self.kp:                                                 # flag mla_decode_vec: the windowed layer's attention core in one launch over the window read from the buffer
+            o = self._attend_vec(q_nope, q_pe, buf, off, 0, None, win, ab16)
+            if o is not None:
+                return self._finish(o.transpose(0, 2, 1, 3), x, B, L, a16)
         keep = None
         if self.kp:
             kp, dx, a = self.kp, self.kp["dx"], self.kv + self.r
@@ -321,6 +338,10 @@ class MlaAttention(nn.Module):
                 s = sel.pools_fixed_top(iq, w, kv[:, 0, :, a:a + dx], kv[:, 0, :, a + dx:a + 2 * dx], off, pk=pkc)
                 slots, ok = KP.gather_slots(s, sort=not (L <= 16 and os.environ.get("KYOJIN_HY4_GATHER_NOSORT", "0") == "1"))
                 MlaAttention.PATHS["fixed_gather"] = MlaAttention.PATHS.get("fixed_gather", 0) + 1
+                if vec and MV.MODE >= 2:                                                # flag mla_decode_vec 2: the key ids of the gather path straight into the one-launch core
+                    o = self._attend_vec(q_nope, q_pe, buf, off, 2, mx.where(ok, slots, -1).astype(mx.int32), 0, ab16)
+                    if o is not None:
+                        return self._finish(o.transpose(0, 2, 1, 3), x, B, L, a16)
                 o = self.attend_gather(q_nope, q_pe, lat, k_pe, slots, ok).transpose(0, 2, 1, 3)
                 return self._finish(o, x, B, L, a16)
             if KF.use(L, Sw):                                                           # flag kpool_fuse: selection + mask in one launch (left-aligned slots); stock selection past KYOJIN_KPOOL_FUSE_MAXS slots
@@ -328,6 +349,10 @@ class MlaAttention(nn.Module):
                 MlaAttention.PATHS["kpool_fuse_fixed"] += 1
             else:
                 keep = KP.keep_mask(sel.pools_fixed(iq, w, kv[:, 0, :, a:a + dx], kv[:, 0, :, a + dx:a + 2 * dx], off, pk=pkc))
+        if vec and MV.MODE >= 2 and self.kp and keep is not None:                       # flag mla_decode_vec 2: the keep mask of the kpool layer (below the gather threshold) into the one-launch core
+            o = self._attend_vec(q_nope, q_pe, buf, off, 1, keep, 0, ab16)
+            if o is not None:
+                return self._finish(o.transpose(0, 2, 1, 3), x, B, L, a16)
         from . import mla_attend_fused as MAF
         MlaAttention.PATHS["attend_seen"] = MlaAttention.PATHS.get("attend_seen", 0) + 1
         if MAF.ON and not ring:                                                         # flag mla_attend_fuse: scores + mask + keep + sinks + softmax + P @ latent in two launches

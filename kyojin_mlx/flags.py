@@ -1176,6 +1176,11 @@ FLAGS: dict[str, Flag] = {
     "head_fmm8": Flag("KYOJIN_HEAD_FMM8", "0", "Output head of a 1 .. 16 row pass (decode, verify rows) through a Q8_0 copy of the dense head matrix (symmetric int8 + fp16 scale per 32, 1.06 bytes per weight) read by the few-row "
                       "simdgroup-matrix kernel (fmm8, float32 logits) instead of the dense float32 matmul. Takes precedence over head_q. One copy shared with the MTP draft's trunk-side head. Logits differ at the "
                       "8-bit rounding: gate with the model's noise band. Metal only. Read per call", kind="int", attrs=(("headq", "FMM8", int),)),
+    "mla_decode_vec": Flag("KYOJIN_HY4_ATTN_VEC", "0", "Decode / verify (1 .. 8 rows) attention core of an absorbed-MLA layer on the fixed-state KV buffer as ONE launch (mla_decode_vec: flash-attention-vec shape of llama.cpp, one threadgroup of 4 simdgroups per "
+                        "head and row, online softmax + attention sink + P @ latent, V = the first 512 columns of the key row) instead of the stock chain of ~15-25 small launches, between the k_b and v_b absorb products. "
+                        "1 = windowed (SWA) layers: the window is read straight from the buffer with the device offset; 2 = also kpool layers (keep mask below the gather threshold, key ids above it). The buffer and queries keep their dtype "
+                        "(fp32 or fp16), scores / accumulation fp32. Metal only; rows or dtypes outside the contract run the stock core. Read per call",
+                        kind="int", attrs=(("mla_decode_vec", "MODE", int),)),
     "foreign_nbr_small": Flag("KYOJIN_FOREIGN_NBR_SMALL", "0", "Output rows per simdgroup (NBR) of the 8-bit stored GEMV (gemv8, 1 .. 8 rows) on matrices under 8M weights: 0 = the global NBR (2), 1 = one row per "
                               "simdgroup = twice the threadgroups (the 96-threadgroup 3072 x 1536 / 1536 x 3072 / 1024-wide projections run at 0.5-0.6 TB/s against 1.0-1.2 for the big ones). "
                               "Same sums per output row (the row order inside a simdgroup does not change a dot product). Read per call", kind="int", attrs=(("foreign_linear", "NBR_SMALL", int),)),
