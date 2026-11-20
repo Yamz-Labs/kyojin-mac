@@ -340,14 +340,14 @@ def memoize_fake_quant() -> bool:
     return True
 
 
-_WINDOW_PART_SHA = "181647ecfd8c236489aec35eaeb9e11c8da45c472e15d2c62124269ef4f9eabb"        # mlx-vlm 0.7.10 DeepseekV41Attention._window_part
+_WINDOW_PART_SHA = "181647ecfd8c236489aec35eaeb9e11c8da45c472e15d2c62124269ef4f9eabb"        # mlx-vlm 0.7.12 DeepseekV41Attention._window_part (source identical in 0.7.10)
 _win_memo: dict = {}
 
 
 def share_window_math() -> bool:
     """DS4.1 attention builds the ring-buffer indices and the sliding-window mask (6 arange / remainder / compare nodes ... about 10 dispatches) in EVERY
     layer from Python ints that are the same for all layers of a token (start_pos, seqlen, window). They are built once per token and shared by the
-    layers (same arrays, same values). Only applied when `_window_part` is the audited mlx-vlm 0.7.10 source; otherwise the model is left as is."""
+    layers (same arrays, same values). Only applied when `_window_part` is the audited mlx-vlm 0.7.12 source; otherwise the model is left as is."""
     try:
         import hashlib
         import inspect

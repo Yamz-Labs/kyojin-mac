@@ -4,7 +4,7 @@ model tree (Linear, MultiLinear, fused gate_up / qkv, head class, routed experts
 tensor names map onto module paths, which dense tensors need a rename, which pack linears mlx-vlm / mlx-lm fuse, and how the
 routed-expert module is called (activation, where the routing weight is applied, output convention).
 
-Arch = the model package: `glm5_next` (GLM-5.3) and `deepseek_v41` (DS4.1) on mlx-vlm 0.7.10. MiniMax-M3.1: see ULTRA.md."""
+Arch = the model package: `glm5_next` (GLM-5.3) and `deepseek_v41` (DS4.1) on mlx-vlm 0.7.12. MiniMax-M3.1: see ULTRA.md."""
 from __future__ import annotations
 
 import re

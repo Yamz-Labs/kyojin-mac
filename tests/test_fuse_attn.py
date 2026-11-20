@@ -1,6 +1,6 @@
 """DS4.1 attention decode cut (kyojin_mlx.fuse_attn): kv_ring is value-identical (signed zeros aside) to the stock rope + fp8 round trip + ring write; attend matches the stock
 sparse attention + inverse rope to the error of the stock composite (against an fp64 reference, not bit equality: the stock fp32 matmuls are ~1e-3 accurate
-on the M5 tensor units, the kernel sums in fp32 FMA). Needs a Mac (Metal) and mlx-vlm 0.7.10 on the path."""
+on the M5 tensor units, the kernel sums in fp32 FMA). Needs a Mac (Metal) and mlx-vlm 0.7.12 on the path."""
 import numpy as np
 import pytest
 

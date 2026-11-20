@@ -23,7 +23,7 @@ Python 3.11 or newer, Apple Silicon, macOS with Metal.
     python3 -m venv .venv && . .venv/bin/activate
     pip install -e .
 
-DeepSeek and GLM packs need `mlx-vlm` (pinned to 0.7.10 in `pyproject.toml`).
+DeepSeek and GLM packs need `mlx-vlm` (pinned to 0.7.12 in `pyproject.toml`).
 
 ## Serve
 
