@@ -23,12 +23,13 @@ mx.set_default_device(mx.cpu)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kyojin_mlx import fired as FD  # noqa: E402
+from kyojin_mlx import fixed_kv as FK  # noqa: E402
 from kyojin_mlx import hy4_mtp as M  # noqa: E402
 from kyojin_mlx.foreign_skeleton_mla import MlaAttention as MLA  # noqa: E402
 from mlx_lm.models.cache import KVCache  # noqa: E402
 from test_hy4_mtp import _PATH, V, _fresh, _prompts, built  # noqa: E402,F401  (the synthetic Hy4 model + head of the MTP tests)
 
-FLAGS = ("KYOJIN_HY4_MTP_HEAD_KV", "KYOJIN_HY4_FIXED_PKCACHE", "KYOJIN_HY4_FIXED_GATHER", "KYOJIN_HY4_FIXED_GATHER_DEC")
+FLAGS = ("KYOJIN_HY4_MTP_HEAD_KV", "KYOJIN_HY4_FIXED_PKCACHE", "KYOJIN_HY4_FIXED_GATHER", "KYOJIN_HY4_FIXED_GATHER_DEC", "KYOJIN_HY4_FIXED_KV_HEADROOM")
 
 
 @pytest.fixture(autouse=True)
@@ -215,6 +216,28 @@ def test_fires_totals_carry_the_head_counters(monkeypatch):
     t = FD.totals()
     assert t["mtp_head_fixed_kv"] == 11 and t["mtp_head_gather"] == 4
     assert "mtp_head_fixed_kv=11 mtp_head_gather=4" in FD.format_line(60, "x 1/0", t)
+
+
+def test_headroom_covers_the_head_buffer(built, monkeypatch):
+    """KYOJIN_HY4_FIXED_KV_HEADROOM: the prompt chunk leaves N free rows in the head buffer too, so a decode of up to N rows never grows it; without the flag the same decode grows."""
+    _, path, model, head, mtp = built
+    _PATH[0] = path
+    ids = [int(t) for t in np.random.default_rng(9).integers(0, V, 21)]            # > 16 rows: a prompt chunk for the headroom rule
+    grown = {}
+    for head_room in ("0", "40"):
+        _arm(monkeypatch, "1", "0")
+        monkeypatch.setenv("KYOJIN_HY4_FIXED_KV_HEADROOM", head_room)
+        cache, st, pending = _primed(model, mtp, ids)
+        g0 = FK.STATS["grow_decode"]
+        cache_n = pending
+        for _ in range(8):                                                       # a decode: a round feeds the pending row and 3 drafts (scratch rows are trimmed back)
+            d = mtp.draft(st, cache_n, 3)
+            toks = [cache_n] + d
+            lg, h = mtp.forward(cache, toks)
+            mtp.feed(st, toks, h)
+            cache_n = int(mx.argmax(lg[-1]).item())
+        grown[head_room] = FK.STATS["grow_decode"] - g0
+    assert grown["0"] > 0 and grown["40"] == 0, grown
 
 
 def test_head_block_is_not_a_step_compile_layer_and_no_kv_is_pinned(built, monkeypatch):

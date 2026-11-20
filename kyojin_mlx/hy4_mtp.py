@@ -113,7 +113,7 @@ class MtpHead(nn.Module):
         fixed = getattr(cache, "fixed_kv", False)
         if fixed:                                                   # fixed-state head KV: the buffer grows here (eager, host), the masks are built in the attention from the device offset
             from . import attn_fp16 as AF
-            cache.ensure(cache._n + x.shape[1], AF.kv_dtype(x.dtype))
+            cache.ensure(cache._n + x.shape[1], AF.kv_dtype(x.dtype), x.shape[1])
             mask = None
             count_path("mtp_head_fixed_kv")                           # fires check: one per head call on the fixed-state head KV
         else:

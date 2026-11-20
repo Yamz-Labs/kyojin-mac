@@ -26,6 +26,18 @@ PK_DTYPE = mx.float16 if os.environ.get("KYOJIN_HY4_FIXED_PKCACHE_F16", "0") == 
 RING_ALIGN = 256                                                  # ring rows are a multiple of this (tests use a small value to force wrap-around)
 RING_ROWS = int(os.environ.get("KYOJIN_HY4_SWA_RING_ROWS", "4864"))   # initial ring rows (>= window + prefill chunk + 16; grows when a longer chunk arrives)
 CHUNK = int(os.environ.get("KYOJIN_HY4_FIXED_KV_CHUNK", "1024"))
+# KYOJIN_HY4_FIXED_KV_HEADROOM=N (read per call, default 0 = off): a prompt chunk leaves at least N free rows in every buffer and a decode-time growth adds N rows, so a request of up to N new tokens never
+# grows a buffer mid-decode. Without it the growth lands on a chunk boundary the prompt happens to sit next to: one eager copy of every layer's buffer (110 KB per token) plus a retrace per layer (a 141K prompt
+# with 65 free rows grew inside a 128-token decode window: round 75.6 ms vs 59 ms on the smooth 64K..176K trend).
+STATS = {"grow_prefill": 0, "grow_decode": 0, "grow_rows": 0}                  # buffer growth events by phase (fires check); also mirrored in MlaAttention.PATHS
+
+
+def _count_path(k: str) -> None:
+    try:
+        from .foreign_skeleton_mla import MlaAttention
+        MlaAttention.PATHS[k] = MlaAttention.PATHS.get(k, 0) + 1
+    except Exception:
+        pass
 
 
 class FixedKVCache(_BaseCache):
@@ -46,15 +58,26 @@ class FixedKVCache(_BaseCache):
     def offset(self, v):
         self._n = int(v)
 
-    def ensure(self, need: int, dtype) -> None:
-        """Eager, host side: room for `need` rows (rounded up to a chunk); the new buffer keeps the rows written so far."""
+    def ensure(self, need: int, dtype, rows: int = 0) -> None:
+        """Eager, host side: room for `need` rows (rounded up to a chunk); the new buffer keeps the rows written so far. rows = the rows of this call (flag KYOJIN_HY4_FIXED_KV_HEADROOM: a prompt chunk
+        (rows > the step-compile row limit) keeps the headroom free after it, a decode / verify call grows only when it must and then adds the headroom)."""
         if self.ring:
             return self._ensure_ring(need, dtype)
         buf = self.cache[0]
         slack = self.align - 1 if self.pk_dx else 0
-        if buf is not None and need + slack <= buf.shape[2]:
+        head = max(int(os.environ.get("KYOJIN_HY4_FIXED_KV_HEADROOM", "0") or 0), 0)
+        pf = rows > int(os.environ.get("KYOJIN_STEP_COMPILE_ROWS", "16"))
+        if head and pf:
+            _count_path("fixed_kv_headroom")                    # fires check: a prompt chunk kept the headroom free
+        if buf is not None and need + slack + (head if pf else 0) <= buf.shape[2]:
             return
-        cap = max(-(-max(need + slack, self.window, 1) // self.step) * self.step, self.step)       # pk_dx: the pooled-key update reads up to align - 1 rows past the write end
+        cap = max(-(-max(need + slack + head, self.window, 1) // self.step) * self.step, self.step)       # pk_dx: the pooled-key update reads up to align - 1 rows past the write end
+        if buf is not None:
+            STATS["grow_prefill" if pf else "grow_decode"] += 1
+            STATS["grow_rows"] += cap - buf.shape[2]
+            _count_path("fixed_kv_grow_prefill" if pf else "fixed_kv_grow_decode")
+            if head and not pf:
+                _count_path("fixed_kv_headroom")                # a decode-time growth that added the headroom
         nb = mx.zeros((1, 1, cap, self.width), dtype=dtype if buf is None else buf.dtype)
         if buf is not None and self._n:
             nb = mx.concatenate([buf[:, :, :self._n], nb[:, :, self._n:]], axis=2)

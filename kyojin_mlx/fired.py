@@ -84,7 +84,9 @@ _TOTALS = (("qdec_fast", "kyojin_mlx.foreign_metal", "PATHS", "qdec_fast"),
            ("absorb_gemv", "kyojin_mlx.foreign_skeleton_mla", "MlaAttention.PATHS", "absorb_gemv"),
            ("fixed_gather", "kyojin_mlx.foreign_skeleton_mla", "MlaAttention.PATHS", "fixed_gather"),
            ("mtp_head_fixed_kv", "kyojin_mlx.foreign_skeleton_mla", "MlaAttention.PATHS", "mtp_head_fixed_kv"),
-           ("mtp_head_gather", "kyojin_mlx.foreign_skeleton_mla", "MlaAttention.PATHS", "mtp_head_gather"))
+           ("mtp_head_gather", "kyojin_mlx.foreign_skeleton_mla", "MlaAttention.PATHS", "mtp_head_gather"),
+           ("fixed_kv_headroom", "kyojin_mlx.foreign_skeleton_mla", "MlaAttention.PATHS", "fixed_kv_headroom"),
+           ("fixed_kv_grow_decode", "kyojin_mlx.foreign_skeleton_mla", "MlaAttention.PATHS", "fixed_kv_grow_decode"))
 
 
 def totals() -> dict:
@@ -104,7 +106,7 @@ def totals() -> dict:
 
 
 def format_line(period: float, line: str, tot: dict | None = None) -> str:
-    """`[flags 60s] <fire/fallback per flag>[ | totals qdec_fast=N absorb_gemv=N fixed_gather=N mtp_head_fixed_kv=N mtp_head_gather=N]` (the totals part only when FIRES and a counter exists)."""
+    """`[flags 60s] <fire/fallback per flag>[ | totals qdec_fast=N absorb_gemv=N fixed_gather=N mtp_head_fixed_kv=N mtp_head_gather=N fixed_kv_headroom=N fixed_kv_grow_decode=N]` (the totals part only when FIRES and a counter exists)."""
     out = "[flags %ds] %s" % (period, line)
     if FIRES and tot:
         out += " | totals " + " ".join(f"{k}={v}" for k, v in tot.items())
