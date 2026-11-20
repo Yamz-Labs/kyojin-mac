@@ -126,7 +126,7 @@ Where llama.cpp leads:
 
 - Speculative decode: ours is ahead at 4K (+26 %) and 24K (+5 %), level at 16K (57.17 against 56.88, llama.cpp is 0.5 % ahead), and behind at 32K (46.08 against 50.4). At 64K llama.cpp holds 52.69 (1.10.0 prompt set); our 1.10.3 figure at 64K is in "New in 1.10.3".
 - Plain decode (no draft): llama.cpp is faster at every context we measured (4K: 48.66 against 44.38; 16K: 48.85 against 42.42; 24K: 48.92 against 41.14). Our advantage comes from speculation, not from the plain step.
-- Long context (1.10.x, Mac Studio M5 Ultra, 256 GB): 64K and 128K prompts are served. A 141K-token prompt was served at 128K context with passkey retrieval 3 of 3 (decode 31 tok/s on the leak-free lane stack). A 176K-token prompt was served with passkey 3 of 3 (decode 37 tok/s). The peak footprint in these runs was 143 GiB (`phys_footprint`). These are single served checks on one text, not the paired table run. The 128K cells of the table are still to follow.
+- Long context (1.10.x, Mac Studio M5 Ultra, 256 GB): 64K and 128K prompts are served. A 141K-token prompt was served at 128K context with passkey retrieval 3 of 3 (decode 31 tok/s on a development build with the step-compile leak fix). A 176K-token prompt was served with passkey 3 of 3 (decode 37 tok/s). The peak footprint in these runs was 143 GiB (`phys_footprint`). These are single served checks on one text, not the paired table run. The 128K cells of the table are still to follow.
 - The speculative cells use the shipped serve line. Passkey retrieval passed 3 of 3 at 4K, 16K and 24K in both modes. The peak footprint is 150-151 GiB for a 144 GiB file (one resident copy of the weights).
 
 ## New in 1.10.3
@@ -144,7 +144,7 @@ Speculative decode (`--mtp-depth 3`), Mac Studio, same prompts at each length, s
 
 Peak footprint: 127.4 GiB (1.10.2), 127.5 GiB (1.10.3).
 
-- About 43 tok/s at a 141K-token prompt on the development lane with the draft-head KV cache (`KYOJIN_HY4_MTP_HEAD_KV=1`). The same prompt ran at 31 tok/s before that change.
+- About 43 tok/s at a 141K-token prompt on a development build with the draft-head KV cache (`KYOJIN_HY4_MTP_HEAD_KV=1`). The same prompt ran at 31 tok/s before that change.
 
 - Q3_K expert decode (`KYOJIN_QDEC_FAST=1`): one fused decode and dot per 32-weight unit, without decoding the weights to floats first. The products match the old text up to float rounding. `KYOJIN_QDEC_FAST=0` restores the decode-to-float text.
 - Absorb GEMV (`KYOJIN_ABSORB_GEMV=1`): the two MLA absorb products read one fp16 copy of `k_b` / `v_b` (the copy that the fp16 attention already makes, so there is one resident fp16 copy) in one launch per product. `KYOJIN_ABSORB_GEMV=0` runs the stock fp32 matmul.
