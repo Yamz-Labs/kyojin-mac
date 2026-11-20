@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Runtime direction projection (direction hook), no weight edit and no re-quantisation. KYOJIN_ABLIT_SPEC=<edit_spec.json>, default off.
+"""Runtime direction projection (direction hook), no weight edit and no re-quantisation. KYOJIN_ABLIT_SPEC=<edit_spec.json or its directory>, default off.
 
 Editing a writer as W' = (I - w r r^T) W is linear in the writer output, so it equals projecting the sublayer output before the residual write:
 
@@ -34,10 +34,16 @@ def spec_path() -> str | None:
     return None if p.lower() in _OFF else p
 
 
+def spec_file(path: str) -> str:
+    """KYOJIN_ABLIT_SPEC may name the spec json or the directory that holds edit_spec.json (and edit_spec.safetensors beside it)."""
+    return os.path.join(path, "edit_spec.json") if os.path.isdir(path) else path
+
+
 def load(path: str) -> SimpleNamespace:
     """-> (n_layers, hidden, attn_w, mlp_w, R) with R fp32 [K, hidden] or [n_layers, K, hidden], rows normalised."""
     from safetensors.numpy import load_file
     import numpy as np
+    path = spec_file(path)
     if not os.path.isfile(path):
         raise FileNotFoundError(f"ablit: spec not found: {path}")
     spec = json.load(open(path))
@@ -53,6 +59,10 @@ def load(path: str) -> SimpleNamespace:
     R = R / np.maximum(np.linalg.norm(R, axis=-1, keepdims=True), 1e-12)
     if R.shape[-1] != spec["hidden"] or R.ndim not in (1, 2, 3) or (R.ndim == 3 and R.shape[0] < spec["n_layers"]):
         raise ValueError(f"ablit: direction shape {R.shape} does not fit the spec (hidden {spec['hidden']}, layers {spec['n_layers']})")
+    if spec.get("r_per_layer") and R.ndim == 2:                  # per-layer layout: tensor "r" [n_layers, hidden], one direction per layer (not a K-row subspace)
+        if R.shape[0] < spec["n_layers"]:
+            raise ValueError(f"ablit: r_per_layer direction rows {R.shape[0]} < n_layers {spec['n_layers']}")
+        R = R[:, None, :]
     if R.ndim == 1:
         R = R[None]
     if len(spec["attn_w"]) < spec["n_layers"] or len(spec["mlp_w"]) < spec["n_layers"]:
@@ -69,6 +79,7 @@ def signature(path: str | None = None) -> str | None:
     path = path or spec_path()
     if path is None:
         return None
+    path = spec_file(path)
     d = os.path.dirname(os.path.abspath(path))
     rf = json.load(open(path)).get("r_file")
     rf = (rf if os.path.isabs(rf) else os.path.join(d, rf)) if rf else os.path.splitext(path)[0] + ".safetensors"
@@ -199,6 +210,35 @@ def attach(model, path: str | None = None) -> int:
         mua = mx.array([float(x) for x in np.atleast_1d(s.attn_mu[L])], dtype=mx.float32) if s.attn_mu else None
         mum = mx.array([float(x) for x in np.atleast_1d(s.mlp_mu[L])], dtype=mx.float32) if s.mlp_mu else None
         blk._ablit = SimpleNamespace(L=L, wa=wa, wm=wm, R=R, mua=mua, mum=mum)
+        n += 1
+    return n
+
+
+def attach_skeleton(model, path: str | None = None) -> int:
+    """Hy4 (generic skeleton, hyper-connection streams): arm `model.layers` from the spec; returns the armed block count. Sites: the attention
+    output AFTER its post norm and the MLP / MoE output AFTER the post-ffw norm, right before the hc expand (Block._hc_call). The MTP draft head is a separate
+    module and is never armed. A spec whose hidden size differs from the model is refused."""
+    path = path or spec_path()
+    if path is None:
+        return 0
+    import numpy as np
+    s = load(path)
+    if s.hidden != model.args.hidden_size:
+        raise ValueError(f"ablit: spec hidden {s.hidden} != model hidden {model.args.hidden_size}")
+    R_all = mx.array(s.R)
+    n = 0
+    for L, blk in enumerate(model.layers):
+        blk.__dict__.pop("_ablit", None)
+        if L >= s.n_layers:
+            continue
+        wa, wm = s.attn_w[L], s.mlp_w[L]
+        wa, wm = (0.0 if abs(wa) <= 1e-9 else wa), (0.0 if abs(wm) <= 1e-9 else wm)
+        if wa == 0.0 and wm == 0.0:
+            continue
+        R = R_all[L] if R_all.ndim == 3 else R_all
+        mua = mx.array([float(x) for x in np.atleast_1d(s.attn_mu[L])], dtype=mx.float32) if s.attn_mu else None
+        mum = mx.array([float(x) for x in np.atleast_1d(s.mlp_mu[L])], dtype=mx.float32) if s.mlp_mu else None
+        blk.__dict__["_ablit"] = SimpleNamespace(L=L, wa=wa, wm=wm, R=R, mua=mua, mum=mum)
         n += 1
     return n
 

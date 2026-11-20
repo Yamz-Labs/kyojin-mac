@@ -716,6 +716,9 @@ class EngramParams(nn.Module):
         return out[None]
 
 
+from . import ablit as _AB  # noqa: E402  (decensor hook; unarmed blocks never call it)
+
+
 class Block(nn.Module):
     def __init__(self, sp: ModelArgs, il: int, ffn_factory):
         super().__init__()
@@ -771,17 +774,20 @@ class Block(nn.Module):
             h = self.engram(h, *engram_in, sp.engram_eps)
         sand = sp.norm_pos == "sandwich"
         sa = self.hc_attn.stream(sp)
-        if sa.fusable(h):                                          # KYOJIN_HC_ID_FUSE: the identity-form seams fused, norms folded (foreign_skeleton_hc.fused)
+        ab = self.__dict__.get("_ablit")                           # decensor hook (ablit.attach_skeleton): armed block = the unfused path, the edit sits after the post norms
+        if ab is None and sa.fusable(h):                                          # KYOJIN_HC_ID_FUSE: the identity-form seams fused, norms folded (foreign_skeleton_hc.fused)
             h = sa.fused(h, lambda x: self.self_attn(x, mask, cache, freqs), self.input_layernorm, self.post_self_attn_layernorm if sand else None)
             return self.hc_ffn.stream(sp).fused(h, self.mlp, self.post_attention_layernorm, self.post_mlp_layernorm if sand else None)
 
         def attn(x):
             a = self.self_attn(self.input_layernorm(x), mask, cache, freqs)
-            return self.post_self_attn_layernorm(a) if sand else a
+            a = self.post_self_attn_layernorm(a) if sand else a
+            return _AB.attn_out(self, a) if ab is not None else a
 
         def ffn(x):
             f = self.mlp(self.post_attention_layernorm(x))
-            return self.post_mlp_layernorm(f) if sand else f
+            f = self.post_mlp_layernorm(f) if sand else f
+            return _AB.ffn_out(self, f) if ab is not None else f
         h = self.hc_attn.stream(sp)(h, attn)
         return self.hc_ffn.stream(sp)(h, ffn)
 
@@ -836,6 +842,8 @@ class Model(nn.Module):
         self.model = Inner(args, ffn_factory or dense_ffn_factory)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        if args.hc_count and _AB.spec_path():                       # KYOJIN_ABLIT_SPEC: Hy4 decensor hook on the sub-layer outputs (off = untouched)
+            _AB.attach_skeleton(self)
 
     @property
     def layers(self):
