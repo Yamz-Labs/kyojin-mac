@@ -32,6 +32,11 @@ def filler_text(files):
     return "\n\n".join(parts)
 
 
+def rep_salt(salt):
+    """CURVE_SALT set: one fixed salt for every decode request (repeat protocol: the same prompt in every arm and every rep); unset: the per-point salt."""
+    return os.environ.get("CURVE_SALT") or salt
+
+
 def make_text(corpus, n_chars, salt):
     """n_chars of filler starting at a salted offset (unique prompt: no prefix-cache hit between points); wraps with a changing header when the corpus is short."""
     if not corpus:
@@ -76,7 +81,10 @@ def ask(a, prompt, max_tokens, ignore_eos=False):
     msg = ch0.get("message") or {}
     tm = out.get("timings") or {}
     use = out.get("usage") or {}
-    r = {"content": (msg.get("content") or "")[:200], "reasoning": (msg.get("reasoning_content") or msg.get("reasoning") or "")[:300], "finish": ch0.get("finish_reason"), "prompt_tokens": use.get("prompt_tokens"), "completion_tokens": use.get("completion_tokens"), "wall_s": round(out["_wall_s"], 2)}
+    r = {"content": (msg.get("content") or "")[:200], "reasoning": (msg.get("reasoning_content") or msg.get("reasoning") or "")[:300], "finish": ch0.get("finish_reason"), "prompt_tokens": use.get("prompt_tokens"), "completion_tokens": use.get("completion_tokens"), "wall_s": round(out["_wall_s"], 2),
+         "prompt_md5": hashlib.md5(prompt.encode()).hexdigest(), "text_md5": hashlib.md5(((msg.get("content") or "") + "\x00" + (msg.get("reasoning_content") or msg.get("reasoning") or "")).encode()).hexdigest()}
+    for k in ("tau", "draft_n", "draft_n_accepted"):                  # speculative replies: equal prompt_md5 + text_md5 + tau between two arms = the same state
+        if k in (out.get("timings") or {}): r[k] = out["timings"][k]
     if io0 and io1:
         r["io_disk_mb"] = round(io1[0] - io0[0], 1); r["io_pagein_mb"] = round(io1[1] - io0[1], 1)
     if tm.get("prompt_per_second") is not None:
@@ -129,6 +137,7 @@ def main():
     p.add_argument("--pk-tokens", type=int, default=256, help="max_tokens of the passkey request (the model may think first)"); p.add_argument("--warm", type=int, default=0, help="throwaway decode requests (other filler) before each measured one: first-seen chunk shapes compile on the server")
     p.add_argument("--pf-rep", type=int, default=0, help="repeat the decode point's prompt N times (8 tokens) and report that prefill as the warm figure (prefill_cold_tok_s keeps the first)")
     p.add_argument("--reps", type=int, default=1, help="decode requests per point (each on its own text offset; the first one is the same text as with --reps 1): the point reports the median decode and prefill speed, the single requests stay in decode_reps")
+    p.add_argument("--drop-cold", action="store_true", help="the median over the reps leaves the first one out (cold prefill / first-seen shapes)")
     p.add_argument("--seed", type=int, default=7); p.add_argument("--ctx", type=int, default=0, help="server context: prompts are capped at ctx - (max_tokens + 512)")
     a = p.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -142,14 +151,14 @@ def main():
         try:
             if L <= a.plain_max:
                 for w in range(a.warm):
-                    fit(a, st, L, lambda n: make_text(corpus, n, f"warm{w}{L}{a.tag}") + "\nContinue the text with a long story.", 8)
-                res["decode"] = fit(a, st, L, lambda n: make_text(corpus, n, f"dec{L}{a.tag}") + "\nContinue the text with a long story.", a.decode_tokens, ignore_eos=True, rep=getattr(a, "pf_rep", 0))
+                    fit(a, st, L, lambda n: make_text(corpus, n, rep_salt(f"warm{w}{L}{a.tag}")) + "\nContinue the text with a long story.", 8)
+                res["decode"] = fit(a, st, L, lambda n: make_text(corpus, n, rep_salt(f"dec{L}{a.tag}")) + "\nContinue the text with a long story.", a.decode_tokens, ignore_eos=True, rep=getattr(a, "pf_rep", 0))
                 if a.reps > 1:
                     res["decode_reps"] = [res["decode"]]
                     for k in range(1, a.reps):
-                        res["decode_reps"].append(fit(a, st, L, lambda n: make_text(corpus, n, f"dec{L}{a.tag}r{k}") + "\nContinue the text with a long story.", a.decode_tokens, ignore_eos=True, rep=getattr(a, "pf_rep", 0)))
+                        res["decode_reps"].append(fit(a, st, L, lambda n: make_text(corpus, n, rep_salt(f"dec{L}{a.tag}r{k}")) + "\nContinue the text with a long story.", a.decode_tokens, ignore_eos=True, rep=getattr(a, "pf_rep", 0)))
                     for key in ("prefill_tok_s", "decode_tok_s"):
-                        v = [r[key] for r in res["decode_reps"] if r.get(key)]
+                        v = [r[key] for r in (res["decode_reps"][1:] if a.drop_cold else res["decode_reps"]) if r.get(key)]
                         if v: res["decode"][key + "_median"] = statistics.median(v)
                 print(f"RESULTS curve {a.tag} L={L} decode: prompt {res['decode'].get('prompt_tokens')} prefill {res['decode'].get('prefill_tok_s')} decode {res['decode'].get('decode_tok_s')} tok/s, cold prefill {res['decode'].get('prefill_cold_tok_s')}, io disk MB cold/warm {res['decode'].get('io_cold_disk_mb')}/{res['decode'].get('io_disk_mb')}, pagein MB cold/warm {res['decode'].get('io_cold_pagein_mb')}/{res['decode'].get('io_pagein_mb')}", flush=True)
             for d in [float(x) for x in a.depths.split(",") if x.strip()]:
