@@ -1187,6 +1187,10 @@ FLAGS: dict[str, Flag] = {
     "head_fmm8": Flag("KYOJIN_HEAD_FMM8", "0", "Output head of a 1 .. 16 row pass (decode, verify rows) through a Q8_0 copy of the dense head matrix (symmetric int8 + fp16 scale per 32, 1.06 bytes per weight) read by the few-row "
                       "simdgroup-matrix kernel (fmm8, float32 logits) instead of the dense float32 matmul. Takes precedence over head_q. One copy shared with the MTP draft's trunk-side head. Logits differ at the "
                       "8-bit rounding: gate with the model's noise band. Metal only. Read per call", kind="int", attrs=(("headq", "FMM8", int),)),
+    "absorb_gemv": Flag("KYOJIN_ABSORB_GEMV", "0", "Absorbed-MLA decode / verify (1 .. 8 rows, fixed-state cache, x fp32 or fp16, stored fp32 k_b / v_b): the two absorb products (q_nope @ k_b^T, (P @ latent) @ v_b^T) are one per-head GEMV launch each over "
+                        "a 16-bit (1) or Q8_0 (2: int8 + fp16 scale per 32, rebuilt from the dequantised weights) copy of k_b / v_b made once per mode, instead of the stock fp32 matmul over the fp32 weights (n10 Mac Studio, Hy4: 3.6 ms of 21.8 ms GPU busy at "
+                        "one row, ~2.1 GB per step). fp32 accumulate, fp32 output; the weights differ at fp16 / Q8_0 rounding (gate with the model's noise band). Extra copies stay resident (0.9 / 0.5 GB on Hy4). Metal only. Read per call",
+                        kind="int", attrs=(("absorb_gemv", "MODE", int),)),
     "mla_decode_vec": Flag("KYOJIN_HY4_ATTN_VEC", "0", "Decode / verify (1 .. 8 rows) attention core of an absorbed-MLA layer on the fixed-state KV buffer as ONE launch (mla_decode_vec: flash-attention-vec shape of llama.cpp, one threadgroup of 4 simdgroups per "
                         "head and row, online softmax + attention sink + P @ latent, V = the first 512 columns of the key row) instead of the stock chain of ~15-25 small launches, between the k_b and v_b absorb products. "
                         "1 = windowed (SWA) layers: the window is read straight from the buffer with the device offset; 2 = also kpool layers (keep mask below the gather threshold, key ids above it). The buffer and queries keep their dtype "
@@ -1242,6 +1246,12 @@ FLAGS: dict[str, Flag] = {
                                "the router-weighted sum over the K slots of GenericMoE is one kernel (moe_reduce: f32 products added in slot order, written in the stream dtype) instead of 4 stock ops. "
                                "The activation is computed in f32 inside the kernel (not rounded to half first): not bit-identical, greedy ids are the gate. Read per call",
                                attrs=(("foreign_linear", "GATEUP_PAIR", _on), ("foreign_moe_generic", "GATEUP_PAIR", _on))),
+    "qdec_fast": Flag("KYOJIN_QDEC_FAST", "0", "foreign formats, K-class stored kernels (foreign_metal.gemvk_source: GEMV, routed gather, gate | up pair, glu, union) of the formats in foreign_metal.QDEC_FAST_FMTS (q3_k today): "
+                      "the weights are not decoded to floats first; one fused decode + dot per 32-weight unit (dot_q3k): the 2-bit codes and the high bits of two weights are built together as one half2 "
+                      "(magic 0x6400, exact), the 6-bit scale and the -4 offset are folded into one fma per 16 weights (dot(code, x) - 4 sum(x), the x sums computed once per row and chunk), 4 accumulators. "
+                      "Same products to float rounding (the order of the adds differs; tests/test_qdec_fast.py); cuts the Q3_K decode ALU so the expert pair reaches the byte roof like Q4_K. "
+                      "Read per call (a flip retraces: GEN). 0 = the decode-to-float text, byte for byte as before",
+                      attrs=()),
 }
 _GLUE = ("glue_fuse", "glue_fuse_norm")
 

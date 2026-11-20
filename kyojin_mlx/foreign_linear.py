@@ -400,13 +400,23 @@ def _deq8_kern(fmt):
                     source=FM.dequant8_source(fmt))
 
 
+def _gemvk_kern(fmt, nbr, gather=False, glu=False, act=None, partial=False):
+    fast = FM.qdec_fast(fmt)                                                              # flag qdec_fast (read per call) is part of the cache key
+    if fast:
+        FM.PATHS["qdec_fast"] += 1
+    return _gemvk_kern_c(fmt, nbr, gather, glu, act, partial, fast)
+
+
 # cached: the K / IQ headers rebuild their grid tables as source text (IQ3_S ~40 us of host time per call)
 @functools.lru_cache(maxsize=None)
-def _gemvk_kern(fmt, nbr, gather=False, glu=False, act=None, partial=False):
-    return KN._kern(("fgemvk", fmt, nbr) + (("g",) if gather else ()) + (("glu",) if glu else ()) + ((act,) if act else ()) + (("part",) if partial else ()),
-                    name=f"kyojin_fg_gemvk_{fmt}_n{nbr}" + ("g" if gather else "") + ("u" if glu else "") + ("_situ" if act else "") + ("_p" if partial else ""),
+def _gemvk_kern_c(fmt, nbr, gather, glu, act, partial, fast):
+    return KN._kern(("fgemvk", fmt, nbr) + (("g",) if gather else ()) + (("glu",) if glu else ()) + ((act,) if act else ()) + (("part",) if partial else ()) + (("qf",) if fast else ()),
+                    name=f"kyojin_fg_gemvk_{fmt}_n{nbr}" + ("g" if gather else "") + ("u" if glu else "") + ("_situ" if act else "") + ("_p" if partial else "") + ("_qf" if fast else ""),
                     input_names=FM.gemvk_inputs(fmt, gather, glu), output_names=["y"], header=FM.hdrk(fmt) + (FM.glu_helper(act) if glu else ""),
                     source=FM.gemvk_source(fmt, nbr, gather, glu, partial))
+
+
+_gemvk_kern.cache_clear = _gemvk_kern_c.cache_clear
 
 
 # cached: the K / IQ headers rebuild their grid tables as source text (IQ3_S ~40 us of host time per call)
@@ -1129,7 +1139,7 @@ class DevPack:
             part = self._part()
             names, mk = FM.gemvk_inputs(self.fmt, True)[3:], (lambda: (FM.hdrk(self.fmt), FM.gemvk_source(self.fmt, nbr, True, False, part)))
             arrs = lambda d: [d.qs, d.meta] + ([d.hi] if d.hi is not None else [])
-            tag = "kp" if part else "k"
+            tag = ("kp" if part else "k") + ("q" if FM.qdec_fast(self.fmt) else "")         # flag qdec_fast: its own kernel
         elif self.fmt in FM.FORMATS8:
             names, mk = FM.gemv8_inputs(self.fmt, True)[3:], (lambda: (FM.header8(self.fmt), FM.gemv8_source(self.fmt, nbr, True)))
             arrs = lambda d: [d.qs, d.gs] if d.meta is None else [d.qs, d.meta, d.gs]

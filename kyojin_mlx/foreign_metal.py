@@ -629,6 +629,22 @@ inline void dec_q3k(KU c, uint u, thread float* w) {
     w[e] = s0 * float(int((c.q.x >> (2u * e)) & 3u) + int(((c.h.x >> e) & 1u) << 2) - 4);
     w[16u + e] = s1 * float(int((c.q.y >> (2u * e)) & 3u) + int(((c.h.x >> (16u + e)) & 1u) << 2) - 4); }
 }
+// Flag qdec_fast: the product of one unit with its 32 activations WITHOUT decoding the weights to floats (used by gemvk_source fast=True; sx0 / sx1 = sums of xv[0..15] / xv[16..31]).
+// w = s * (code - 4), code = 2-bit + 4 * high bit (0..7): dot = s0 * (sum code x - 4 sx0) + s1 * (sum code x - 4 sx1), one fma per 16 weights for scale and offset.
+// The codes of weights e and e + 8 are built together as one half2 (one integer op chain for two weights): 1024 + code exact in half (magic 0x6400), - 1024 exact; the products
+// and the sums stay float (4 accumulators: the order of the adds differs from dec_q3k + the 32-term sum, float rounding only).
+inline float dot_q3k(KU c, uint u, const thread float* xv, float sx0, float sx1) {
+  float d = float(as_type<half2>(c.d).x); uint ib = (u & 7u) * 2u;
+  float a = d * q6sc(c.m, ib), b = d * q6sc(c.m, ib + 1u);
+  uint ha = ((c.h.x & 0xFFu) | ((c.h.x & 0xFF00u) << 8)) << 2, hb = (((c.h.x >> 16) & 0xFFu) | ((c.h.x >> 8) & 0x00FF0000u)) << 2;   // hi bits of e / e + 8 on bits 2 / 18
+  float a0 = 0.0f, a1 = 0.0f, b0 = 0.0f, b1 = 0.0f;
+  UNR for (uint e = 0; e < 8; ++e) {
+    half2 x0 = as_type<half2>(((c.q.x >> (2u * e)) & 0x00030003u) | ((ha >> e) & 0x00040004u) | 0x64006400u) - half2(1024.0h);
+    half2 x1 = as_type<half2>(((c.q.y >> (2u * e)) & 0x00030003u) | ((hb >> e) & 0x00040004u) | 0x64006400u) - half2(1024.0h);
+    a0 = fma(float(x0.x), xv[e], a0); a1 = fma(float(x0.y), xv[8u + e], a1);
+    b0 = fma(float(x1.x), xv[16u + e], b0); b1 = fma(float(x1.y), xv[24u + e], b1); }
+  return a * ((a0 + a1) - 4.0f * sx0) + b * ((b0 + b1) - 4.0f * sx1);
+}
 """
 HDRK3I = r"""
 inline KU ld_iq3x(device const uint* qs, device const uint* mt, device const uint* hi, uint n, uint u, uint UPR) {
@@ -960,6 +976,15 @@ _KDEC = {"q5_k": "dec_q5k", "q6_k": "dec_q6k", "iq4_xs": "dec_iqxs", "q3_k": "de
          "iq2_xxs": "dec_iq2xxs", "iq2_xs": "dec_iq2xs", "iq2_s": "dec_iq2s_sd" if IQ2S_SEED else "dec_iq2s", "iq1_s": "dec_iq1s", "iq1_m": "dec_iq1m", "q4_1": "dec_q41", "q5_0": "dec_q50", "q5_1": "dec_q51", "q2_0": "dec_q20"}
 
 
+QDEC_FAST_FMTS = ("q3_k",)       # K formats with a fused decode + dot text (dot_q3k); the others keep decode-to-float
+PATHS = {"qdec_fast": 0}                  # fires check: K-class kernels built / dispatched with the fused decode + dot (flag qdec_fast)
+
+
+def qdec_fast(fmt) -> bool:
+    """Flag qdec_fast (KYOJIN_QDEC_FAST, default 0, read per call): the K-class GEMV / gather / glu kernels of a format in QDEC_FAST_FMTS use the fused decode + dot (no float weights, scale and offset folded)."""
+    return fmt in QDEC_FAST_FMTS and os.environ.get("KYOJIN_QDEC_FAST", "0") not in ("0", "")
+
+
 def gemvk_inputs(fmt, gather=False, glu=False):
     base = ["x", "qs", "mt"] if fmt in _NOHI else ["x", "qs", "mt", "hi"]
     if glu and not gather:
@@ -971,8 +996,13 @@ def dequantk_inputs(fmt):
     return gemvk_inputs(fmt)[1:]
 
 
-@functools.lru_cache(maxsize=None)
 def gemvk_source(fmt: str, nbr: int = 2, gather: bool = False, glu: bool = False, partial: bool = False) -> str:
+    """The K-class GEMV body (see _gemvk_source); the flag qdec_fast picks the fused decode + dot text of the formats in QDEC_FAST_FMTS, resolved per call (the cached text is keyed by it)."""
+    return _gemvk_source(fmt, nbr, gather, glu, partial, qdec_fast(fmt))
+
+
+@functools.lru_cache(maxsize=None)
+def _gemvk_source(fmt: str, nbr: int, gather: bool, glu: bool, partial: bool, fast: bool) -> str:
     """Body. Template ints: R (1..16), KIN, N, NBR (= nbr). Inputs x (half [R, KIN]), qs (uint32 [N, KIN/8]), mt, [hi] (see gemvk_inputs); output y half [R, N], saturated to +-65504.
     Needs KIN % 512 == 0 and N % (8 NBR) == 0.
     gather (routed experts, R = 1): the arrays hold E stacked matrices as E * N rows; slot = grid y reads row xrows[slot] of x and expert eids[slot] (rows EXO = eid * N on),
@@ -993,6 +1023,14 @@ def gemvk_source(fmt: str, nbr: int = 2, gather: bool = False, glu: bool = False
     const uint EXO = 0u;"""
     xa, xboff = _gemv_xmap("q4_k" if _LAYOUTK[fmt] == "Q" else fmt)
     ld = _KLD[fmt]
+    assert not fast or fmt in QDEC_FAST_FMTS
+    if fast:
+        dotblk = ("float sx0 = 0.0f, sx1 = 0.0f; UNR for (uint e = 0; e < 16; ++e) { sx0 += xv[e]; sx1 += xv[16u + e]; }\n"
+                  "        UNR for (uint j = 0; j < NBR; ++j) acc[j * R + r] += dot_" + fmt.replace("_", "") + "(cu[j], ul, xv, sx0, sx1);")
+    else:
+        dotblk = ("UNR for (uint j = 0; j < NBR; ++j) { float s = 0.0f;\n"
+                  "          UNR for (uint e = 0; e < 32; ++e) s += w[j * 32u + e] * xv[e];\n"
+                  "          acc[j * R + r] += s; }")
     src = f"""
     const uint tid = thread_position_in_threadgroup.x;
     const uint lane = thread_index_in_simdgroup;
@@ -1005,7 +1043,7 @@ def gemvk_source(fmt: str, nbr: int = 2, gather: bool = False, glu: bool = False
     device const uint4* q4 = (device const uint4*)qs;
     threadgroup uint4 xs_v[R * 80]; threadgroup half* xs = (threadgroup half*)xs_v;
     {ktab_decl(fmt, TGTAB)}
-    float w[NBR * 32];
+    {"" if fast else "float w[NBR * 32];"}
     float acc[NBR * R];
     UNR for (uint i = 0; i < NBR * R; ++i) acc[i] = 0.0f;
     KU cu[NBR], nu[NBR];
@@ -1019,16 +1057,14 @@ def gemvk_source(fmt: str, nbr: int = 2, gather: bool = False, glu: bool = False
         UNR for (uint j = 0; j < NBR; ++j) {{ const uint n = rbase + j + EXO, u = (c + 1u) * 16u + ul; nu[j] = {ld.format(n='n', u='u')}; }}
       }}
       const uint xa = {xa}, xb = xa + {xboff}u;
-      UNR for (uint j = 0; j < NBR; ++j) {_KDEC[fmt]}(cu[j], ul, &w[j * 32u]{ktab_arg(fmt)});
+      {"" if fast else f"UNR for (uint j = 0; j < NBR; ++j) {_KDEC[fmt]}(cu[j], ul, &w[j * 32u]{ktab_arg(fmt)});"}
       const uint pa = xa + (xa >> 5) * 8u, pb = xb + (xb >> 5) * 8u;
       UNR for (uint r = 0; r < R; ++r) {{
         threadgroup const half* xr = xs + r * 640u;
         float xv[32];
         UNR for (uint t = 0; t < 4; ++t) {{ float4 va = float4(*(threadgroup const half4*)(xr + pa + 4u * t)); float4 vb = float4(*(threadgroup const half4*)(xr + pb + 4u * t));
           UNR for (uint k = 0; k < 4; ++k) {{ xv[4u * t + k] = va[k]; xv[16u + 4u * t + k] = vb[k]; }} }}
-        UNR for (uint j = 0; j < NBR; ++j) {{ float s = 0.0f;
-          UNR for (uint e = 0; e < 32; ++e) s += w[j * 32u + e] * xv[e];
-          acc[j * R + r] += s; }}
+        {dotblk}
       }}
       threadgroup_barrier(mem_flags::mem_threadgroup);
       UNR for (uint j = 0; j < NBR; ++j) cu[j] = nu[j];

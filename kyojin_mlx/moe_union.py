@@ -135,7 +135,8 @@ def _kern(fam, fmt, nbr, glu, pair, partial):
     ins = ["x"] + (["x2"] if glu else []) + ["oslot", "eids"] + names
     cf = FL.cfmt() if fam == "n" else False
     hdr = FM.hdrk(fmt) + (FM.glu_helper(None) if glu else "") if fam == "k" else FM.header(fmt, "gemv", cf)
-    return KN._kern(("moe_union", fam, fmt, nbr, glu, pair, partial, cf), name=f"kyojin_moe_union_{fam}_{fmt}_n{nbr}" + ("u" if glu else "") + ("p" if pair else "") + ("_p" if partial else ""),
+    qf = fam == "k" and FM.qdec_fast(fmt)                              # flag qdec_fast (source() above already took the fused text)
+    return KN._kern(("moe_union", fam, fmt, nbr, glu, pair, partial, cf) + (("qf",) if qf else ()), name=f"kyojin_moe_union_{fam}_{fmt}_n{nbr}" + ("u" if glu else "") + ("p" if pair else "") + ("_p" if partial else "") + ("_qf" if qf else ""),
                     input_names=ins, output_names=["y"], header=hdr, source=src)
 
 
@@ -156,6 +157,8 @@ def plan(g, u, d, T: int, K: int, nbr: int):
 def gate_up(g, u, fam, x, eids, oslot, R: int, S: int, nbr: int, K: int):
     """x half [T, k] -> y half [2 S, n]: rows [0, S) = gate, [S, 2 S) = up, slot order (slot = row * K + k)."""
     kern = _kern(fam, g.fmt, nbr, False, True, g._part())
+    if fam == "k" and FM.qdec_fast(g.fmt):
+        FM.PATHS["qdec_fast"] += 1
     return kern(inputs=[x, oslot, eids] + _arrs(g, fam) + _arrs(u, fam), template=[("R", R), ("KIN", g.k), ("N", g.n), ("NBR", nbr), ("SP", S), ("SO", S), ("SLOTIN", 0), ("KK", K)],
                 grid=(g.n // (8 * nbr) * 128, 2 * S, 1), threadgroup=(128, 1, 1), output_shapes=[(2 * S, g.n)], output_dtypes=[mx.float16])[0]
 
@@ -163,5 +166,7 @@ def gate_up(g, u, fam, x, eids, oslot, R: int, S: int, nbr: int, K: int):
 def down(d, fam, glu, a, b, eids, oslot, R: int, S: int, nbr: int):
     """glu: a, b half [S, k] (gate / up of every slot), the input of slot s is silu(a) * b (K family only); else a = h half [S, k] (b unused). -> y half [S, n]."""
     kern = _kern(fam, d.fmt, nbr, glu, False, d._part())
+    if fam == "k" and FM.qdec_fast(d.fmt):
+        FM.PATHS["qdec_fast"] += 1
     return kern(inputs=([a, b] if glu else [a]) + [oslot, eids] + _arrs(d, fam), template=[("R", R), ("KIN", d.k), ("N", d.n), ("NBR", nbr), ("SP", S), ("SO", S), ("SLOTIN", 1), ("KK", 1)],
                 grid=(d.n // (8 * nbr) * 128, S, 1), threadgroup=(128, 1, 1), output_shapes=[(S, d.n)], output_dtypes=[mx.float16])[0]

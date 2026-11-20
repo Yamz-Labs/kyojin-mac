@@ -119,6 +119,16 @@ Where llama.cpp leads:
 - Plain decode (no draft): llama.cpp is faster at every context we measured (4K: 48.66 against 44.38; 16K: 48.85 against 42.42; 24K: 48.92 against 41.14). Our advantage comes from speculation, not from the plain step.
 - The speculative cells use the shipped serve line. Passkey retrieval passed 3 of 3 at 4K, 16K and 24K in both modes. The peak footprint is 150-151 GiB for a 144 GiB file (one resident copy of the weights).
 
+## New in 1.10.3
+
+Long-context and decode levers for Hy4-flash on the Mac, all in `tools/hy4_mac.env`. Measured numbers to follow.
+
+- Q3_K expert decode (`KYOJIN_QDEC_FAST=1`): one fused decode and dot per 32-weight unit, without decoding the weights to floats first. The products match the old text up to float rounding. `KYOJIN_QDEC_FAST=0` restores the decode-to-float text.
+- Absorb GEMV (`KYOJIN_ABSORB_GEMV=1`): the two MLA absorb products read one fp16 copy of `k_b` / `v_b` (the copy that the fp16 attention already makes, so there is one resident fp16 copy) in one launch per product. `KYOJIN_ABSORB_GEMV=0` runs the stock fp32 matmul.
+- Long-context gather (`KYOJIN_HY4_FIXED_GATHER=16384`, `KYOJIN_HY4_FIXED_GATHER_DEC=8192`, `KYOJIN_HY4_FIXED_PKCACHE=1`): from that many key slots on, attention reads only the keys the indexer kept, and the pooled keys live in the cache state. Set each to `0` to opt out.
+- The one-launch decode attention core keeps its row gate (`KYOJIN_HY4_ATTN_VEC_MIN_ROWS`, default 2): plain decode keeps the stock core, speculative verify rounds use the kernel.
+- Code defaults are unchanged: every lever above is off unless the env file (or your own environment) turns it on.
+
 ## New in 1.10.2
 
 Memory fix for long-running Hy4 servers (step compile of the fixed KV cache).
@@ -149,7 +159,7 @@ Run it (copy and paste; needs the install steps above and about 150 GiB of free 
 |---|---|---|
 | Hy4-flash serve backend on the generic decoder skeleton: prefill, decode, Engram rows read from the GGUF by row | serves the public Q3_K GGUF | - |
 | multi-token-prediction speculation with the model's own head, depth 3 (depth 5 measured slower at 4K, 16K and 24K) | `--mtp-depth 3` | `--mtp-depth 0` |
-| optional gather attention over the kept keys with pooled keys carried in the cache state (same speed and memory as the default path up to 40K tokens) | long context | off by default; `KYOJIN_HY4_FIXED_GATHER=16384`, `KYOJIN_HY4_FIXED_GATHER_DEC=32768`, `KYOJIN_HY4_FIXED_PKCACHE=1` |
+| optional gather attention over the kept keys with pooled keys carried in the cache state (same speed and memory as the default path up to 40K tokens) | long context | off by default in the code; on in `tools/hy4_mac.env` since 1.10.3: `KYOJIN_HY4_FIXED_GATHER=16384`, `KYOJIN_HY4_FIXED_GATHER_DEC=8192`, `KYOJIN_HY4_FIXED_PKCACHE=1` |
 | fused attention, hyper-connection and expert kernels for the skeleton (`tools/hy4_mac.env`) | decode and prefill speed | unset the flag |
 | optional hierarchical candidate-restricted indexer for prompt chunks | `KYOJIN_HY4_HISA` (default off) | - |
 | few-row Q8_0 simdgroup-matrix product for the verify rows (2 to 8 rows) of the dense Q8_0 linears | Hy4-flash speculative decode, the four 8-bit and router levers (FMM8, ROUTE_SEL, HEAD_Q, NBR_SMALL) measured together, no single-lever served number: 58.50 -> 60.94 tok/s at 4K (+4.2 %), 42.06 -> 42.70 at 16K (+1.5 %), 39.14 -> 40.21 at 24K (+2.7 %), speculative depth 3, same prompt repeated (bundle) | `KYOJIN_FOREIGN_FMM8=0` |
