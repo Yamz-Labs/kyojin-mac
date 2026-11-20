@@ -1132,6 +1132,8 @@ class Engine:
         self.plain_ahead = lookahead                                  # plain rounds of the speculative path launch the next step before reading the one in flight
         if kv_budget is not None:
             prefix_bytes = min(prefix_bytes, kv_budget // 4)                 # snapshots are part of the budget; they never take more than a quarter
+        if mem_guard is not None:                                            # the memory budget bounds the snapshots too: a quarter of what the weights leave under it
+            prefix_bytes = min(prefix_bytes, max(0, (mem_guard.budget - mem_guard.base()) // 4))
         self.log = log or (lambda *a: None)
         self.prefix = PrefixCache(backend, block, prefix_bytes, disk=disk, log=self.log)
         self._lk_kept = collections.deque(maxlen=LK_KEEP)
@@ -1625,7 +1627,7 @@ class Engine:
         if ad is not None and s.sid is not None:
             ad(s.sid)                                                # flag engram_adopt: a session that never reached its first chunk frees its row jobs
         s.t_done = time.perf_counter()
-        s.cache = s.draft = None
+        s.cache = s.draft = s.share_seed = None                      # no restore copy or shared seed outlives its request (the handle keeps the session object)
         t_first = s.t_first or s.t_done
         stats = {"prompt_tokens": s.n_prompt, "completion_tokens": s.n_gen + s.rw_tok, "cached_tokens": s.cached,
                  "queue_s": (s.t_start or s.t_done) - s.t_submit, "ttft_s": t_first - s.t_submit, "total_s": s.t_done - s.t_submit}
