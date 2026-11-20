@@ -82,7 +82,9 @@ FIRES = os.environ.get("KYOJIN_HY4_FIRES_LOG", "1") not in ("0", "")      # leve
 # (label, module, dict, key): cumulative lever counters of already-imported modules (never imports one: a lane that did not load the module has no lever there)
 _TOTALS = (("qdec_fast", "kyojin_mlx.foreign_metal", "PATHS", "qdec_fast"),
            ("absorb_gemv", "kyojin_mlx.foreign_skeleton_mla", "MlaAttention.PATHS", "absorb_gemv"),
-           ("fixed_gather", "kyojin_mlx.foreign_skeleton_mla", "MlaAttention.PATHS", "fixed_gather"))
+           ("fixed_gather", "kyojin_mlx.foreign_skeleton_mla", "MlaAttention.PATHS", "fixed_gather"),
+           ("mtp_head_fixed_kv", "kyojin_mlx.foreign_skeleton_mla", "MlaAttention.PATHS", "mtp_head_fixed_kv"),
+           ("mtp_head_gather", "kyojin_mlx.foreign_skeleton_mla", "MlaAttention.PATHS", "mtp_head_gather"))
 
 
 def totals() -> dict:
@@ -102,7 +104,7 @@ def totals() -> dict:
 
 
 def format_line(period: float, line: str, tot: dict | None = None) -> str:
-    """`[flags 60s] <fire/fallback per flag>[ | totals qdec_fast=N absorb_gemv=N fixed_gather=N]` (the totals part only when FIRES and a counter exists)."""
+    """`[flags 60s] <fire/fallback per flag>[ | totals qdec_fast=N absorb_gemv=N fixed_gather=N mtp_head_fixed_kv=N mtp_head_gather=N]` (the totals part only when FIRES and a counter exists)."""
     out = "[flags %ds] %s" % (period, line)
     if FIRES and tot:
         out += " | totals " + " ".join(f"{k}={v}" for k, v in tot.items())

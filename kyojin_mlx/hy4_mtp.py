@@ -51,6 +51,21 @@ def default_depth() -> int:
     return int(os.environ.get(DEPTH_ENV, "5"))
 
 
+def head_kv_fixed() -> bool:
+    """Flag KYOJIN_HY4_MTP_HEAD_KV (default 0, read per new draft state): the draft head's KV cache is a fixed-state FixedKVCache laid out like the trunk's layer of the same kind
+    (fixed_kv.make_caches: KYOJIN_HY4_FIXED_PKCACHE / KPOOL_RAWRING decide the layout), not the fp32 plain KVCache that concatenates a new buffer every call and whose attention
+    reads the whole context per draft step. The head attention then takes the trunk's kept-key gather path (KYOJIN_HY4_FIXED_GATHER[_DEC]) once the context is long enough.
+    The head block runs eager on that cache (it is not a step-compile layer)."""
+    return os.environ.get("KYOJIN_HY4_MTP_HEAD_KV", "0") == "1"
+
+
+def count_path(name: str, inc: int = 1) -> int:
+    """Fires-check counter (foreign_skeleton_mla.MlaAttention.PATHS, summed into the `[flags 60s]` totals by fired.py); returns the new value (inc 0: read it)."""
+    from .foreign_skeleton_mla import MlaAttention
+    MlaAttention.PATHS[name] = MlaAttention.PATHS.get(name, 0) + inc
+    return MlaAttention.PATHS[name]
+
+
 def fixed_depth() -> bool:
     """KYOJIN_HY4_MTP_FIXED (default on, 0 = the engine's adaptive depth policy): every round drafts exactly the default depth. The adaptive policy under-used
     depth on this engine (c117 default policy: p4 56-66 / p1 47-52 tok/s against 67-77 / 60 pinned)."""
@@ -90,13 +105,26 @@ class MtpHead(nn.Module):
         self.il = il
 
     def __call__(self, model, toks, h, cache):
-        """toks int32 [1, n], h [1, n, D] (trunk state of the previous position of each token), cache: the head's KVCache -> y [1, n, D] (after shared_head_norm)."""
+        """toks int32 [1, n], h [1, n, D] (trunk state of the previous position of each token), cache: the head's KVCache (or a fixed_kv.FixedKVCache) -> y [1, n, D] (after shared_head_norm)."""
         from mlx_lm.models.base import create_attention_mask
         m = model.model
         x = self.eh_proj(mx.concatenate([self.enorm(m.embed_tokens(toks)), self.hnorm(h)], axis=-1))
         sw = self.block.self_attn.swa
-        mask = model._window_mask(x.shape[1], cache) if sw else create_attention_mask(x, cache)
-        return self.shared_head_norm(self.block(x, mask, cache, model._freqs(sw)))
+        fixed = getattr(cache, "fixed_kv", False)
+        if fixed:                                                   # fixed-state head KV: the buffer grows here (eager, host), the masks are built in the attention from the device offset
+            from . import attn_fp16 as AF
+            cache.ensure(cache._n + x.shape[1], AF.kv_dtype(x.dtype))
+            mask = None
+            count_path("mtp_head_fixed_kv")                           # fires check: one per head call on the fixed-state head KV
+        else:
+            mask = model._window_mask(x.shape[1], cache) if sw else create_attention_mask(x, cache)
+        g0 = count_path("fixed_gather", 0) if fixed else 0        # fires check: the trunk's gather attend (kept keys only) ran inside the head block
+        y = self.block(x, mask, cache, model._freqs(sw))
+        if fixed:
+            cache._n += x.shape[1]                                  # host mirror of the device write offset (the block only touches cache.cache)
+            if count_path("fixed_gather", 0) > g0:
+                count_path("mtp_head_gather")
+        return self.shared_head_norm(y)
 
 
 def head_logits(model, y):
@@ -274,8 +302,25 @@ class Mtp:
             out = mx.tanh(out / sp.logit_softcap) * sp.logit_softcap
         return out
 
+    _fixed = None                                          # flag hy4_mtp_head_kv: the head's attention can run on a fixed-state cache (cached answer)
+
     def new_state(self) -> DraftState:
-        return DraftState(self.dim)
+        st = DraftState(self.dim)
+        if head_kv_fixed() and self._fixed_ok():
+            st.cache = self._fixed_cache()
+        return st
+
+    def _fixed_ok(self) -> bool:
+        """The head's attention can run on the fixed-state cache (the MLA block): its KV is then one static buffer + a device offset."""
+        if self._fixed is None:
+            at = self.head.block.self_attn
+            self._fixed = hasattr(at, "kv") and hasattr(at, "kp") and hasattr(at, "_call_fixed")
+        return self._fixed
+
+    def _fixed_cache(self):
+        import types
+        from . import fixed_kv as FKV
+        return FKV.make_caches(types.SimpleNamespace(layers=[self.head.block]))[0]
 
     # -- trunk forward with the hidden rows
     def forward(self, cache, ids):

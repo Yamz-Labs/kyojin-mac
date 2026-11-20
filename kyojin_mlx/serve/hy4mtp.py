@@ -60,6 +60,9 @@ class Hy4MtpBackend(Hy4Backend):
         from mlx_lm.models.cache import KVCache
         n = M.DraftState.__new__(M.DraftState)
         n.dim, n.toks, n.pend = d.dim, list(d.toks), [p[...] for p in d.pend]
+        if getattr(d.cache, "fixed_kv", False):                    # flag KYOJIN_HY4_MTP_HEAD_KV: the head KV is a fixed-state cache (copy on write)
+            n.cache = d.cache.fork()
+            return n
         c = KVCache()
         c.keys = None if d.cache.keys is None else d.cache.keys[...]
         c.values = None if d.cache.values is None else d.cache.values[...]
