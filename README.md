@@ -50,7 +50,7 @@ Tested on a Mac Studio with 256 GB of unified memory.
 
 `tools/hy4_mac.env` holds the kernel flags of the measured line. The prefill speed depends on the MLX buffer cache limit: `--cache-limit-mb 16384` is the value of the measured line (without the flag the limit is derived from the weights and the free memory). Speculative decoding uses the model's own multi-token-prediction head (`--mtp-depth 3`).
 
-Memory guard: `KYOJIN_MEM_BUDGET_GIB` (default 0.88 x physical RAM, 0 = off) caps the process; a prompt whose projected memory (`KYOJIN_MEM_GIB_PER_1K`, default 0.12 GiB per 1K tokens) is over it gets HTTP 413, and a request that reaches it while running is stopped after the MLX cache and the prefix snapshots are dropped, so the server stays up.
+Memory guard: `KYOJIN_MEM_BUDGET_GIB` (default 0.88 x physical RAM) caps the process. `KYOJIN_MEM_BUDGET_GIB=0` switches the guard off. A prompt whose projected memory is over the budget gets HTTP 413. The projection adds a slope per 1K prompt tokens to what the process holds: the Hy4 backend uses 0.12 GiB, the other backends use no slope (their prompts are not refused by length). `KYOJIN_MEM_GIB_PER_1K` sets the slope on every backend. A request that reaches the budget while running is stopped after the MLX cache and the prefix snapshots are dropped, so the server stays up.
 Speed numbers: see the benchmark table.
 
 - Context: 256K tokens (`--ctx 262144`). 1M tokens is not part of this release.

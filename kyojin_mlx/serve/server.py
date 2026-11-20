@@ -823,7 +823,7 @@ def build_app(args, log=print):
     if args.sessions > backend.max_rows:                             # a backend that decodes fewer rows at once (Hy4: 1): the extra requests queue for the slot
         log(f"{backend.kind}: --sessions {args.sessions} -> {backend.max_rows} (rows decoded at once); further requests queue")
         args.sessions = backend.max_rows
-    mem_guard = MemGuard.from_env()                                  # KYOJIN_MEM_BUDGET_GIB (default 0.88 x RAM; 0 = off)
+    mem_guard = MemGuard.from_env(backend_gib_per_1k=getattr(backend, "mem_gib_per_1k", None))   # KYOJIN_MEM_BUDGET_GIB (default 0.88 x RAM; 0 = off)
     log("memory guard: " + ("off" if mem_guard is None else f"budget {mem_guard.budget / GIB:.0f} GiB, {mem_guard.slope * 1000 / GIB:.2f} GiB per 1K prompt tokens"))
     engine = Engine(backend, sessions=args.sessions, ctx=args.ctx, chunk=args.prefill_chunk, block=args.prefix_block,
                     prefix_bytes=int(args.prefix_cache_mb * 2 ** 20), decode_per_chunk=args.decode_per_chunk, log=log,

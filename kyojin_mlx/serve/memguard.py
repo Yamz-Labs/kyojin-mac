@@ -2,9 +2,12 @@
 
 Budget: KYOJIN_MEM_BUDGET_GIB (default 0.88 x the physical RAM, i.e. about 225 GiB on a 256 GB Mac; 0 switches the guard off).
 Used memory: the larger of MLX active + buffer cache and the process physical footprint (the footprint also sees what MLX does not count).
-Slope: KYOJIN_MEM_GIB_PER_1K (default 0.12), GiB of active memory per 1000 prompt tokens: the leak-free footprint of 1.10.2 (KV ~0.11 GiB per 1K
-plus cache, 106 -> 126 GiB from 4.7K to 134K tokens; 1.10.0 / 1.10.1 grew 0.36 per 1K through the step-compile leak). It is a constant on purpose: the engine's own bytes-per-token (`Engine.bpt`) bills the
-cache ledger, which does not see the private copy a prefix hit makes, so it under-estimates what the process really holds.
+Slope: GiB of active memory per 1000 prompt tokens, used to refuse a prompt that cannot fit. It is per backend (`Backend.mem_gib_per_1k`): the Hy4
+backend sets 0.12 (the leak-free footprint of 1.10.2: KV ~0.11 GiB per 1K plus cache, 106 -> 126 GiB from 4.7K to 134K tokens; 1.10.0 / 1.10.1 grew
+0.36 per 1K through the step-compile leak); a backend without a value has no slope (no admission by length; the in-flight check still stops a request
+that reaches the budget). KYOJIN_MEM_GIB_PER_1K overrides the backend value on every backend. The value is a constant on purpose: the engine's own
+bytes-per-token (`Engine.bpt`) bills the cache ledger, which does not see the private copy a prefix hit makes, so it under-estimates what the process
+really holds.
 
 The class is pure (readers are injected), so the projection and the escalation are tested on CPU without Metal."""
 from __future__ import annotations
@@ -59,9 +62,12 @@ def budget_bytes(env=None, ram: int | None = None) -> int | None:
     return int(DEFAULT_FRACTION * ram) if ram else None
 
 
-def slope_bytes_per_token(env=None) -> float:
+def slope_bytes_per_token(env=None, backend_gib_per_1k: float | None = None) -> float:
+    """Bytes per prompt token: KYOJIN_MEM_GIB_PER_1K when set (any backend), else the backend's own value, else 0 (no slope)."""
     env = os.environ if env is None else env
-    return float(env.get("KYOJIN_MEM_GIB_PER_1K") or DEFAULT_GIB_PER_1K) * GIB / 1000.0
+    raw = env.get("KYOJIN_MEM_GIB_PER_1K")
+    gib = float(raw) if raw not in (None, "") else float(backend_gib_per_1k or 0.0)
+    return gib * GIB / 1000.0
 
 
 class MemGuard:
@@ -71,14 +77,14 @@ class MemGuard:
         self.check_ticks = max(1, int(check_ticks))
 
     @classmethod
-    def from_env(cls, env=None, ram: int | None = None):
-        """The guard the server runs with, on MLX readers; None when switched off."""
+    def from_env(cls, env=None, ram: int | None = None, backend_gib_per_1k: float | None = None):
+        """The guard the server runs with, on MLX readers; None when switched off. backend_gib_per_1k: the backend's slope (None = no slope)."""
         env = os.environ if env is None else env
         b = budget_bytes(env, ram)
         if b is None:
             return None
         import mlx.core as mx
-        return cls(b, slope_bytes_per_token(env), mx.get_active_memory, mx.get_cache_memory, phys_footprint_bytes, mx.clear_cache,
+        return cls(b, slope_bytes_per_token(env, backend_gib_per_1k), mx.get_active_memory, mx.get_cache_memory, phys_footprint_bytes, mx.clear_cache,
                    int(env.get("KYOJIN_MEM_CHECK_TICKS") or DEFAULT_CHECK_TICKS))
 
     def active(self) -> int:
@@ -106,14 +112,15 @@ class MemGuard:
     def project(self, tokens: int) -> int:
         return self.base() + int(tokens * self.slope)
 
-    def max_tokens(self) -> int:
-        return max(int((self.budget - self.base()) / self.slope), 0) if self.slope > 0 else 0
+    def max_tokens(self) -> int | None:
+        """Most prompt tokens that still fit now; None when there is no slope (the length is not bounded by the guard)."""
+        return max(int((self.budget - self.base()) / self.slope), 0) if self.slope > 0 else None
 
     def admit(self, tokens: int) -> None:
         """Refuse a prompt whose projected memory (everything held now + all its tokens, which also covers a prefix-restore copy) is over the budget."""
         if self.project(tokens) > self.budget:
             raise PromptTooLong(f"prompt too long for the memory budget: {tokens} tokens would take the process to about {self.project(tokens) / GIB:.0f} GiB, "
-                                f"the budget is {self.budget / GIB:.0f} GiB (KYOJIN_MEM_BUDGET_GIB); max ~{self.max_tokens()} tokens now")
+                                f"the budget is {self.budget / GIB:.0f} GiB (KYOJIN_MEM_BUDGET_GIB); max ~{self.max_tokens() or 0} tokens now")
 
     def over(self, extra: int = 0) -> bool:
         return self.used() + int(extra) > self.budget
