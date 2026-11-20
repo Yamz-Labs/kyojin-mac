@@ -31,6 +31,12 @@ DeepSeek and GLM packs need `mlx-vlm` (pinned to 0.7.12 in `pyproject.toml`).
 
 or `tools/mac_serve.sh /path/to/model ...` (same options, keeps the Mac awake).
 
+The port opens only after the model is loaded and warmed up (a big model takes minutes). Wait for the log line `serving <model id> (...) on http://127.0.0.1:8080 ...` before you send requests; until then a request fails with "connection refused". Check that the server is ready:
+
+    curl localhost:8080/health
+
+It answers `{"status": "ok", "model": ...}` once the server is ready.
+
     curl localhost:8080/v1/chat/completions -H 'content-type: application/json' \
          -d '{"messages":[{"role":"user","content":"Hello"}],"stream":true}'
 
@@ -47,6 +53,8 @@ Tested on a Mac Studio with 256 GB of unified memory.
     set -a; . tools/hy4_mac.env; set +a
     python -m kyojin_mlx.serve.server --model ./hy4-flash --port 8080 --model-id Hy4-flash \
         --sessions 1 --ctx 262144 --kv-mode fp16 --no-kv-disk --prefill-chunk 2048 --mtp-depth 3 --cache-limit-mb 16384
+
+Wait for the log line `serving Hy4-flash (...) on http://127.0.0.1:8080 ...` (the port opens after the 144 GiB of weights are loaded) and check `curl localhost:8080/health` before the first request.
 
 `tools/hy4_mac.env` holds the kernel flags of the measured line. The prefill speed depends on the MLX buffer cache limit: `--cache-limit-mb 16384` is the value of the measured line (without the flag the limit is derived from the weights and the free memory). Speculative decoding uses the model's own multi-token-prediction head (`--mtp-depth 3`).
 
