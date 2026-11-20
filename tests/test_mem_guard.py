@@ -50,3 +50,26 @@ def test_over_uses_active_plus_cache_or_footprint():
     assert not g.over() and g.over(10 * G)
     g, _ = guard(active=100, cache=0, foot=230)
     assert g.over()
+
+
+def _engine(g):
+    import collections
+    import itertools
+    import threading
+
+    from kyojin_mlx.serve import engine as E
+    e = E.Engine.__new__(E.Engine)
+    e.memguard, e.ctx, e.sessions, e.rq_floor, e.kv_budget = g, 1 << 20, 1, None, None
+    e.stats, e._ids, e.cv, e._inbox = collections.Counter(), itertools.count(1), threading.Condition(), collections.deque()
+    e.backend = type("B", (), {})()
+    return e
+
+
+def test_submit_refuses_a_prompt_over_the_budget_and_keeps_the_slot_free():
+    g, _ = guard(active=190)
+    e = _engine(g)
+    with pytest.raises(M.PromptTooLong):
+        e.submit(list(range(1, 100_001)))
+    assert e.stats["mem_refused"] == 1 and not e._inbox
+    h = e.submit(list(range(1, 1001)))                      # a short prompt still goes in
+    assert h.session is e._inbox[0]

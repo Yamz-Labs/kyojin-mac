@@ -68,6 +68,7 @@ from . import ticktrace as TT
 import numpy as np
 
 from .sampling import Sampling, sample_rows
+from .memguard import MemoryBudgetExceeded
 from . import hostloop as HL
 from . import loopguard as LG
 from . import pysample as PS
@@ -1067,8 +1068,8 @@ class Engine:
                  prefix_bytes: int = 1 << 30, decode_per_chunk: int = 1, lookahead: bool = True, log=None,
                  mtp_depth: int = 0, kv_budget: int | None = None, replay_chunk: int = 16, rq_floor: int | None = None,
                  row_cost: float = 0.4, draft_cost: float = 0.15, probe_every: int = 16, cap_probe: int = 8, kv_refresh: int = 16,
-                 depth_override: int | None = None, disk=None, spec_costs: dict | None = None):
-        """mtp_depth: most drafts per session and round (0 = no speculative decode; needs backend.supports_spec). kv_budget: bytes (None = no
+                 depth_override: int | None = None, disk=None, spec_costs: dict | None = None, mem_guard=None):
+        """mem_guard: a serve.memguard.MemGuard (hard memory budget: admission, in-flight checks); None = off. mtp_depth: most drafts per session and round (0 = no speculative decode; needs backend.supports_spec). kv_budget: bytes (None = no
         limit, see the module doc). replay_chunk: tokens replayed per tick when a dropped cache is rebuilt. rq_floor: smallest reply share before
         a session yields its slot (default RQ_MIN_TOKENS). row_cost / draft_cost: cost of one more verify row / of a draft call in solo steps
         (the depth policy); probe_every: rounds at D = 0 between two probes with D = 1; cap_probe: rounds below the cap between two rounds at
@@ -1096,6 +1097,7 @@ class Engine:
         self.depth_override = depth_override
         self.spec_costs = {int(c): list(v) for c, v in spec_costs.items() if v} if spec_costs else None
         self.bpt = 0.0                              # bytes of cache per token (measured), to size a session before it is admitted
+        self.memguard = mem_guard
         self.backend, self.sessions, self.ctx = backend, sessions, ctx
         if chunk > MAX_PREFILL_CHUNK:
             raise ValueError(f"prefill chunk {chunk} > {MAX_PREFILL_CHUNK}: 16384-row chunks panicked the Ultra (29/10 00:26)")
@@ -1207,6 +1209,12 @@ class Engine:
             raise ValueError("empty prompt")
         if len(ids) >= self.ctx:
             raise ValueError(f"context length exceeded: prompt is {len(ids)} tokens, the server context is {self.ctx}")
+        if self.memguard is not None:                                # hard memory budget: a prompt that cannot fit is refused (HTTP 413) before it takes the live slot
+            try:
+                self.memguard.admit(len(ids))
+            except MemoryBudgetExceeded:
+                self.stats["mem_refused"] += 1
+                raise
         room = self.ctx - len(ids) - 1
         limit = room if max_new is None else min(max_new, room)
         sampling = sampling or Sampling()
@@ -1252,6 +1260,7 @@ class Engine:
         return {"sessions": self.sessions, "waiting": len(self.waiting) + len(self._inbox), "prefilling": len(self.prefilling),
                 "decoding": len(self.members) + len(self.ready), "prefix_entries": len(p.entries), "prefix_bytes": p.bytes,
                 "prefix_hits": p.hits, "prefix_misses": p.misses, "prefix_reasons": dict(p.reasons), "peak_gb": round(mx.get_peak_memory() / 2 ** 30, 3),
+                "mem_budget_gb": None if self.memguard is None else round(self.memguard.budget / 2 ** 30, 1),
                 "active_gb": round(mx.get_active_memory() / 2 ** 30, 3), "cache_gb": round(mx.get_cache_memory() / 2 ** 30, 3), "mtp_depth": self.mtp_depth,
                 "kv_budget_gb": None if self.kv_budget is None else round(self.kv_budget / 2 ** 30, 3),
                 "kv_gb": round(self.kv_bytes() / 2 ** 30, 4), "kv_peak_gb": round(self.kv_peak / 2 ** 30, 4),
