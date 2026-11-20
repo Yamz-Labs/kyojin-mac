@@ -562,6 +562,10 @@ FLAGS: dict[str, Flag] = {
                              "bytes, same floats: exact; 0 = the map; read per load", attrs=(("engram_gguf", "PREAD", _on),)),
     "hy4_engram_lazy": Flag("KYOJIN_HY4_ENGRAM_LAZY", "0", "Hy4-flash Engram, prompt chunks (>= 256 positions): the layers' rows are read one layer after the other in the background and the forward waits for a "
                             "layer's rows at that layer (the layers before it run on the GPU: mx.async_eval). Same rows: exact", attrs=(("engram_gguf", "LAZY", _on),)),
+    "hy4_engram_decpf": Flag("KYOJIN_HY4_ENGRAM_DECPF", "0", "Hy4-flash Engram, speculative decode rounds (needs hy4_engram_pread): the rows of the pending token are read in the background when the draft chain "
+                             "starts, the rows of each draft as soon as the id is known (the draft head reads no Engram row), by parallel preads of only the page-cache-cold rows; the verify "
+                             "pass takes them by row id (a miss is read at once) and waits per layer, so the layers before the first Engram layer run on the GPU meanwhile. "
+                             "Rows stay on disk (no warm-up, no pinning). Same rows: exact; read per load", attrs=(("engram_gguf", "DECPF", _on),)),
     "hy4_engram_ahead": Flag("KYOJIN_HY4_ENGRAM_AHEAD", "0", "Hy4-flash Engram: the engine's next-chunk hint (Hy4Backend.warm_prompt) reads the NEXT prompt chunk's rows in the background while this one "
                              "runs (content-addressed pieces: a stale hint only misses). Same rows: exact", attrs=(("engram_gguf", "AHEAD", _on),)),
     "engram_one_batch": Flag("KYOJIN_ENGRAM_ONE_BATCH", "1", "Engram rows of a decode / verify pass (under 2048 rows): the value rows and the scale rows of a layer in ONE parallel batch of preads "

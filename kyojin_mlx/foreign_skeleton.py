@@ -1032,10 +1032,31 @@ def engram_source_of(g):
             rm.reset()
         if len(rm.history) != offset:
             raise SkeletonError(f"Engram history holds {len(rm.history)} positions, the cache {offset}")
+        dec = EG.DEC_LOG and EG.PHASE[0] == "dec"                  # KYOJIN_HY4_ENGRAM_DEC_LOG=1: the decode-phase counters (every read path)
+        if dec:
+            import time
+            t0 = time.perf_counter()
         rows, valid = rm.rows_valid(ids)
+        if dec and rows.shape[0] >= EG.LAZY_MIN:
+            dec = False                                            # a prompt chunk that reached us outside EG.phase("pf")
+        if dec:
+            uq = np.unique(rows)
+            EG.dec_add(calls=1, pos=rows.shape[0], rows=rows.size, unique=uq.size)
         if not EG.PREAD:                                           # KYOJIN_HY4_ENGRAM_PREAD=0: the memory-map gather (serial page-ins on a cold row)
-            return {lid: (EG.read_rows(g, spec, rows[:, i]), valid) for i, lid in enumerate(spec.layer_ids)}
-        return rd.layers(rows, valid, offset)
+            if dec:
+                cold = rd.cold_count(uq)                           # before the gather: the pages it faults in are cached afterwards
+                t1 = time.perf_counter()
+            out = {lid: (EG.read_rows(g, spec, rows[:, i]), valid) for i, lid in enumerate(spec.layer_ids)}
+            if dec:
+                EG.dec_add(cold=cold, cold_sync=cold, miss=uq.size, sync_read_s=time.perf_counter() - t1, map_calls=1)
+        else:
+            out = rd.layers(rows, valid, offset)
+        if dec:
+            EG.dec_add(src_s=time.perf_counter() - t0)
+            EG._DEC_N[0] += 1
+            if EG._DEC_N[0] % EG.DEC_EVERY == 0:
+                EG.dec_flush("run")
+        return out
 
     def truncate(n):
         """Speculative rollback: the history keeps its first n positions (the rows of rejected drafts leave it)."""
@@ -1054,7 +1075,22 @@ def engram_source_of(g):
         rd.hint(EG.hash_rows(spec, prev, cids, start=a), a)
         return True
     src.truncate, src.history_len = truncate, lambda: len(rm.history)
-    src.hint, src.reader = hint, rd
+
+    def dec_begin(first):
+        """A speculative round starts with the pending token `first` (position len(history)): its rows are read in the background (flag KYOJIN_HY4_ENGRAM_DECPF)."""
+        if not (EG.PREAD and EG.DECPF):
+            return False
+        rd.dec_begin(rm.history, len(rm.history))
+        rd.dec_push(EG.compressed_ids(spec, [first])[0])
+        return True
+
+    def dec_push(toks):
+        """The next tokens of the round (drafts) are known: the rows of their positions are read in the background."""
+        if not (EG.PREAD and EG.DECPF) or len(toks) == 0:
+            return False
+        rd.dec_push(EG.compressed_ids(spec, toks)[0])
+        return True
+    src.hint, src.reader, src.dec_begin, src.dec_push = hint, rd, dec_begin, dec_push
     src.get_history = lambda: rm.history                         # per-session history: the serve backend parks / restores it when the live session changes (arrays are replaced, never edited in place)
     src.set_history = lambda h: setattr(rm, "history", h)
     return src

@@ -84,8 +84,8 @@ class Hy4MtpBackend(Hy4Backend):
         if draft is None or not self.supports_spec or vl is not None:
             return super().prefill_chunk(cache, ids, vl)
         self._claim(cache)
-        from .. import headlast
-        with headlast.last_row():                                      # the head runs on the last row of a prompt chunk only (the hidden sink keeps every row for the draft head)
+        from .. import headlast, engram_gguf as EG
+        with EG.phase("pf"), headlast.last_row():                      # the head runs on the last row of a prompt chunk only (the hidden sink keeps every row for the draft head)
             lg, h = self.mtp.forward(cache, [int(t) for t in ids])
         self.mtp.feed(draft, ids, h)
         self.mtp.absorb(draft)

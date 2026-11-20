@@ -1579,7 +1579,9 @@ class Hy4Backend(Backend):
     def prefill_chunk(self, cache, ids, vl=None):
         if vl is not None:
             raise ValueError("Hy4: no image input")
-        return self._logits(cache, mx.array(ids, dtype=mx.int32)[None])
+        from .. import engram_gguf as EG
+        with EG.phase("pf"):                                       # the decode counters (KYOJIN_HY4_ENGRAM_DEC_LOG) close the request before and skip the prompt
+            return self._logits(cache, mx.array(ids, dtype=mx.int32)[None])
 
     def batch(self, caches):
         if len(caches) != 1:

@@ -309,6 +309,8 @@ class Mtp:
         if depth <= 0 or rows.shape[1] != len(tk):
             return None
         tb0 = time.perf_counter()
+        es = getattr(self.model, "engram_source", None)       # flag hy4_engram_decpf: the verify pass will read the Engram rows of [pending, *drafts]; the draft head reads none, so the rows of the pending
+        push = es.dec_push if getattr(es, "dec_begin", None) is not None and es.dec_begin(int(pending)) else None   # token are read in the background from here on, the drafts' as soon as their ids are known
         y = self.head(self.model, mx.array(tk, dtype=mx.int32)[None], rows, st.cache)[:, -1:]
         keep = st.cache.offset
         st.pend = []
@@ -325,6 +327,8 @@ class Mtp:
         if st.cache.offset > keep:
             st.cache.trim(st.cache.offset - keep)
         out = [int(t.item()) for t in ds]
+        if push is not None:
+            push(out)                                        # the drafts' rows start reading now, while the verify pass is built
         STATS["drafted"] += len(out)
         return out
 

@@ -195,11 +195,75 @@ PREAD = os.environ.get("KYOJIN_HY4_ENGRAM_PREAD", "0") not in ("0", "")      # f
 LAZY = os.environ.get("KYOJIN_HY4_ENGRAM_LAZY", "0") not in ("0", "")        # flags.py hy4_engram_lazy: prompt chunks read layer by layer in the background
 AHEAD = os.environ.get("KYOJIN_HY4_ENGRAM_AHEAD", "0") not in ("0", "")      # flags.py hy4_engram_ahead: the next chunk's rows are read while this one runs
 LOG = os.environ.get("KYOJIN_HY4_ENGRAM_LOG", "0") not in ("0", "")          # one serve-log line per prompt chunk
+DECPF = os.environ.get("KYOJIN_HY4_ENGRAM_DECPF", "0") not in ("0", "")      # flags.py hy4_engram_decpf: decode / verify rows prefetched while the draft head runs (needs PREAD)
+DEC_LOG = os.environ.get("KYOJIN_HY4_ENGRAM_DEC_LOG", "0") not in ("0", "")  # decode-phase counters: one serve-log line per request (+ a running line every DEC_EVERY calls)
+DEC_EVERY = int(os.environ.get("KYOJIN_HY4_ENGRAM_DEC_EVERY", "64"))
 LAZY_MIN = 256                                                              # rows (positions) from which a request is a prompt chunk
 AHEAD_MAX = int(os.environ.get("KYOJIN_HY4_ENGRAM_AHEAD_MAX", "8192"))       # positions of one hint that are read ahead
 READ_THREADS = int(os.environ.get("KYOJIN_HY4_ENGRAM_THREADS", "64"))
 HOT_SAMPLE = 256
 STATS = {"calls": 0, "chunks": 0, "rows": 0, "unique": 0, "ahead_hit": 0, "read_rows": 0, "map_rows": 0, "read_s": 0.0, "wait_s": 0.0, "hints": 0, "hint_rows": 0, "hint_s": 0.0}
+
+
+# ----------------------------------------------------------------------------------------------------------------- decode-phase counters (KYOJIN_HY4_ENGRAM_DEC_LOG=1)
+# One decode / verify call of the engine = one source call of < LAZY_MIN positions (a spec round: pending + drafts = ~4 positions x 4 layers x 16 columns = ~256 row ids). The
+# counters cover those calls only (prompt chunks run in phase "pf", see `phase`), on every read path (map, pread, prefetch). `cold` = rows whose 16 KB page was NOT in the page
+# cache when the read started (mincore, exact; a pread cannot be timed from the native reader). `exposed` = what the engine thread waited on the source: the whole call plus the
+# future waits of LazyRows (the time the GPU may sit idle at the Engram layers); `read` = time inside the row reads on any thread (read - exposed = overlapped).
+import threading as _th
+
+PHASE = ["dec"]
+_DLOCK = _th.Lock()
+_DKEYS = ("calls", "pos", "rows", "unique", "pf_hit", "miss", "cold", "cold_sync", "sync_read_s", "pf_read_s", "wait_s", "pf_wait_s", "src_s", "pf_pieces", "map_calls")
+DEC = {k: 0 for k in _DKEYS}
+DEC_RUN = {k: 0 for k in _DKEYS}                                              # since the last request line
+_DEC_N = [0]
+_RB = [96]                                                                      # bytes of a table row (set by RowReader)
+
+
+def dec_on() -> bool:
+    return DEC_LOG and PHASE[0] == "dec"
+
+
+def dec_add(**kw) -> None:
+    with _DLOCK:
+        for k, v in kw.items():
+            DEC[k] += v
+            DEC_RUN[k] += v
+
+
+def dec_flush(tag: str = "request") -> None:
+    """One line: the decode counters since the previous request line (tag "request": reset) or since the request began (tag "run")."""
+    with _DLOCK:
+        d = dict(DEC_RUN)
+        if tag == "request":
+            for k in _DKEYS:
+                DEC_RUN[k] = 0
+            _DEC_N[0] = 0
+    if not d["calls"]:
+        return
+    page = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 16384
+    print(f"[kyojin] hy4 engram dec {tag}: calls {d['calls']} pos {d['pos']} rows {d['rows']} unique {d['unique']} pf_hit {d['pf_hit']} miss {d['miss']} "
+          f"cold {d['cold']} (sync {d['cold_sync']}) ~{d['cold'] * page / 1e6:.1f} MB pages / {d['unique'] * _RB[0] / 1e6:.2f} MB rows | exposed {1e3 * (d['src_s'] + d['wait_s']):.1f} ms "
+          f"(call {1e3 * d['src_s']:.1f} wait {1e3 * d['wait_s']:.1f}) pf_wait {1e3 * d['pf_wait_s']:.1f} sync_read {1e3 * d['sync_read_s']:.1f} ms pf_read {1e3 * d['pf_read_s']:.1f} ms pieces {d['pf_pieces']}", flush=True)
+
+
+class phase:
+    """`with phase("pf"):` the Engram calls inside are prompt-phase calls (not counted); entering it closes the decode counters of the request before."""
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def __enter__(self):
+        self.prev = PHASE[0]
+        PHASE[0] = self.name
+        if DEC_LOG and self.name == "pf" and self.prev == "dec":
+            dec_flush("request")
+        return self
+
+    def __exit__(self, *a):
+        PHASE[0] = self.prev
+        return False
 
 
 class RowReader:
@@ -220,6 +284,11 @@ class RowReader:
         self._gen = 0
         self._lay = ThreadPoolExecutor(1, thread_name_prefix="hy4eng-lay")   # one prompt chunk's layers, in order
         self._ahd = ThreadPoolExecutor(1, thread_name_prefix="hy4eng-ahead")
+        self._dpool = ThreadPoolExecutor(2, thread_name_prefix="hy4eng-dec")  # decode rounds: the pending token's rows and each draft's rows (DECPF)
+        self._dec: list = []                                             # this round's pieces: [first position, Future -> (rows sorted unique, bytes)]; dropped when the next round begins
+        self._dh = np.zeros(0, np.int64)                                 # compressed ids of the last ngram_size - 1 positions of the round so far
+        self._dp = self._dkey = 0                                        # position of the next token the round will push; position of the round's first token (= the verify offset)
+        _RB[0] = self.rb
 
     def fd(self) -> int:
         if self._fd is None:
@@ -227,16 +296,52 @@ class RowReader:
         return self._fd
 
     def close(self) -> None:
-        for ex in (self._lay, self._ahd):
+        for ex in (self._lay, self._ahd, self._dpool):
             ex.shutdown(wait=True)
         if self._fd is not None:
             os.close(self._fd)
             self._fd = None
 
     # ---- the bytes of sorted unique rows
-    def read_unique(self, u: np.ndarray) -> np.ndarray:
+    def cold_count(self, u: np.ndarray) -> int:
+        """Rows of `u` whose pages are NOT in the page cache now (mincore of every row up to 4096 rows, else an estimate from an even sample)."""
+        from .engram_rows import _rowread
+        rr = _rowread()
+        n = u.size
+        if rr is None or n == 0:
+            return 0
+        uc = np.ascontiguousarray(u, np.int64)
+        k = min(n, 4096)
+        return max(0, int(round((k - rr.hot(self.raw.ctypes.data, uc.ctypes.data, n, self.rb, k)) * n / k)))
+
+    def _hotmask(self, rr, uc: np.ndarray) -> np.ndarray:
+        """bool [n]: row i is in the page cache (native mask when the library has it, else one mincore call per row)."""
+        n = uc.size
+        hm = getattr(rr, "hotmask", None)
+        out = np.zeros(n, np.uint8)
+        if hm is not None:
+            hm(self.raw.ctypes.data, uc.ctypes.data, n, self.rb, out.ctypes.data)
+        else:
+            for i in range(n):
+                out[i] = 1 if rr.hot(self.raw.ctypes.data, uc.ctypes.data + 8 * i, 1, self.rb, 1) > 0 else 0
+        return out.astype(bool)
+
+    def read_unique(self, u: np.ndarray, kind: str = "sync", split: bool = False) -> np.ndarray:
         """uint8 [n, rb] of the sorted unique table rows `u`: the map when most of them are in the page cache (hot reads cost ~1 us there, preads of cached pages serialize),
-        else native preads from READ_THREADS threads."""
+        else native preads from READ_THREADS threads. `split` (small decode requests): each row on its own path, the cached ones from the map and ONLY the cold ones by preads
+        (the all-or-nothing sample above would send a half-warm request through serial page faults). `kind`: "sync" (the request waits for it) or "pf" (a prefetch job), for the counters."""
+        import time
+        t0 = time.perf_counter()
+        on = dec_on() and u.size < LAZY_MIN
+        cold = [-1]
+        out = self._read_unique(u, split, cold)
+        if on:
+            dt = time.perf_counter() - t0
+            c = cold[0] if cold[0] >= 0 else 0                           # counted BEFORE the read by the path itself (a pread fills the page cache)
+            dec_add(cold=c, **({"cold_sync": c, "sync_read_s": dt} if kind == "sync" else {"pf_read_s": dt}))
+        return out
+
+    def _read_unique(self, u, split, cold) -> np.ndarray:
         from .engram_rows import _rowread
         n = u.size
         if n == 0:
@@ -245,10 +350,28 @@ class RowReader:
         rr = _rowread()
         if rr is None:
             STATS["map_rows"] += n
+            cold[0] = self.cold_count(u) if dec_on() else 0
             return self.raw[u]
         uc = np.ascontiguousarray(u, np.int64)
+        if split:
+            hot = self._hotmask(rr, uc)
+            nc = int(n - hot.sum())
+            cold[0] = nc
+            dst = np.empty((n, self.rb), np.uint8)
+            if hot.any():
+                dst[hot] = self.raw[uc[hot]]
+                STATS["map_rows"] += n - nc
+            if nc:
+                cr, cd = np.ascontiguousarray(uc[~hot]), np.empty((nc, self.rb), np.uint8)
+                if rr.read(self.fd(), self.base, cr.ctypes.data, nc, self.rb, cd.ctypes.data, max(1, min(READ_THREADS, nc))) != 0:
+                    raise IOError(f"short read in {self.path}")
+                dst[~hot] = cd
+                STATS["read_rows"] += nc
+            return dst
         k = min(n, HOT_SAMPLE)
-        if rr.hot(self.raw.ctypes.data, uc.ctypes.data, n, self.rb, k) * 2 >= k:
+        nh = rr.hot(self.raw.ctypes.data, uc.ctypes.data, n, self.rb, k)
+        cold[0] = max(0, int(round((k - nh) * n / k))) if dec_on() else 0
+        if nh * 2 >= k:
             STATS["map_rows"] += n
             return self.raw[u]
         dst = np.empty((n, self.rb), np.uint8)
@@ -267,6 +390,27 @@ class RowReader:
         u, inv = np.unique(r.reshape(-1), return_inverse=True)
         buf = np.empty((u.size, self.rb), np.uint8)
         miss = np.ones(u.size, bool)
+        n_dec = 0
+        for pc in self._dec_live(offset):                                # this round's prefetched rows (DECPF): not consumed, every layer's fetch reads them
+            if not miss.any():
+                break
+            tw = time.perf_counter()
+            try:
+                pu, pb = pc[1].result()
+            except Exception:                                             # a failed prefetch is a miss, never an error
+                continue
+            wt = time.perf_counter() - tw
+            STATS["wait_s"] += wt
+            if dec_on():
+                dec_add(**{("pf_wait_s" if _th.current_thread().name.startswith("hy4eng") else "wait_s"): wt})
+            if pu.size == 0:
+                continue
+            ix = np.minimum(np.searchsorted(pu, u), pu.size - 1)
+            hit = (pu[ix] == u) & miss
+            if hit.any():
+                buf[hit] = pb[ix[hit]]
+                miss &= ~hit
+                n_dec += int(hit.sum())
         for pc in self._live(layer_pos, offset):
             if not miss.any():
                 break
@@ -283,13 +427,46 @@ class RowReader:
                 pc[3] = True
         n_hit = int(u.size - miss.sum())
         if miss.any():
-            buf[miss] = self.read_unique(u[miss])
+            buf[miss] = self.read_unique(u[miss], "sync", split=DECPF and u.size < LAZY_MIN)
+        if dec_on() and u.size < LAZY_MIN:
+            dec_add(pf_hit=n_dec, miss=int(miss.sum()))
         STATS["calls"] += 1
         STATS["rows"] += r.size
         STATS["unique"] += u.size
         STATS["ahead_hit"] += n_hit
         STATS["read_s"] += time.perf_counter() - t0
         return GF.dequant(self.spec.table_type, buf[inv.reshape(-1)], self.spec.head_dim).reshape(r.shape + (self.spec.head_dim,))
+
+    def _dec_live(self, offset):
+        with self._lock:
+            return [pc for pc in self._dec if pc[0] == offset]
+
+    # ---- decode rounds: the rows of tokens that are known before the verify pass is built
+    def dec_begin(self, history, p0: int) -> None:
+        """A speculative round starts: its verify pass will begin at position p0 (`history`: compressed ids of the positions before it). Drops the previous round's pieces."""
+        with self._lock:
+            self._dec = []
+        self._dh = np.asarray(history, np.int64)[-(self.spec.ngram_size - 1):].copy()
+        self._dp = self._dkey = int(p0)
+
+    def dec_push(self, cids: np.ndarray) -> None:
+        """The compressed ids of the round's next positions are known (the pending token, then each draft): hash their rows and read the missing ones in the background, so the
+        reads run while the GPU does the draft chain; the verify pass asks for them by row id (fetch). Piece = (rows sorted unique, bytes); a wrong guess is only a miss."""
+        cids = np.asarray(cids, np.int64).reshape(-1)
+        if cids.size == 0:
+            return
+        spec, start, hist = self.spec, self._dp, self._dh
+        self._dh = np.concatenate([hist, cids])[-(spec.ngram_size - 1):]
+        self._dp = start + cids.size
+
+        def job():
+            u = np.unique(hash_rows(spec, hist, cids, start=start).reshape(-1))
+            return u, self.read_unique(u, "pf", split=True)
+        fut = self._dpool.submit(job)
+        with self._lock:
+            self._dec.append([self._dkey, fut])
+        if dec_on():
+            dec_add(pf_pieces=1)
 
     def _live(self, layer_pos, offset):
         with self._lock:
@@ -323,6 +500,9 @@ class RowReader:
         """rows [L, nl, n_cols] -> {layer_id: (float32 [L, n_cols, head_dim], valid)}: a prompt chunk is read per layer in the background (the result of a layer blocks when asked),
         a small request (decode / verify rows) is read at once on the calling thread."""
         ids = self.spec.layer_ids
+        if DECPF and rows.shape[0] < LAZY_MIN and self._dec_live(offset):      # a decode round with prefetched rows: per layer, the layers before an Engram layer run on the GPU meanwhile
+            futs = {lid: self._lay.submit(self.fetch, np.ascontiguousarray(rows[:, i]), i, offset) for i, lid in enumerate(ids)}
+            return LazyRows(futs, valid)
         if rows.shape[0] < LAZY_MIN or not LAZY:
             if rows.shape[0] >= LAZY_MIN or not self._live(None, offset):
                 rd = self.fetch(rows, None, offset)                                  # one request over every layer (their row ranges are disjoint: one dedupe)
@@ -351,6 +531,8 @@ class LazyRows:
         t0 = time.perf_counter()
         r = f.result()
         STATS["wait_s"] += time.perf_counter() - t0
+        if dec_on() and len(r) < LAZY_MIN:
+            dec_add(wait_s=time.perf_counter() - t0)
         return (r, self._v)
 
     def __getitem__(self, lid):
