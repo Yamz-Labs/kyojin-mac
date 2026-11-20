@@ -34,6 +34,7 @@ import mlx.core as mx
 from .. import ds41_vision
 from .. import ds41_vision as DV
 from .. import hostsync as HS
+from .memguard import DEFAULT_GIB_PER_1K as MEMGUARD_DEFAULT_GIB_PER_1K
 
 MAX_PREFILL_CHUNK = 8192                                                    # hard cap of every prefill chunk (see Engine / server.resolve_chunk)
 LAZY_DRAFT = os.environ.get("KYOJIN_LAZY_DRAFT", "1") != "0"      # drafts stay on the GPU while the verify graph is built (VlmBackend.draft_lazy)
@@ -76,6 +77,7 @@ class Backend:
     supports_spec = False                           # speculative verify passes (see the module doc)
     default_mtp_depth = 3                           # most drafts per round when the server picks the depth itself
     max_spec_rows = 0                               # most rows (sessions + drafts) of one verify pass
+    mem_gib_per_1k = None                           # memory guard slope (GiB per 1K prompt tokens) used to refuse a prompt that cannot fit; None = no slope
 
     def disk_namespace(self) -> dict | None:
         """Everything that changes the cached values besides the tokens (kvdisk.KvDisk namespace), or None: this backend cannot checkpoint to disk."""
@@ -1444,6 +1446,7 @@ class Hy4Backend(Backend):
     session's cache raises, it is never decoded on the wrong history). Per-session KV and history = delivery B."""
     kind = "hy4"
     max_rows = 1
+    mem_gib_per_1k = MEMGUARD_DEFAULT_GIB_PER_1K    # leak-free 1.10.x footprint (KV ~0.11 GiB per 1K tokens plus cache)
     one_session = HY4_ONE_SESSION if os.environ.get("KYOJIN_HY4_ONE_SESSION", "0") == "1" else None   # KYOJIN_HY4_ONE_SESSION=1: delivery A (a second live session is a 503). Default: every
     #                                                                          session owns its Engram history (swapped in when it runs), so prefix snapshots and a queue of requests work
 

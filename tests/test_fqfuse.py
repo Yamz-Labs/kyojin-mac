@@ -1,5 +1,5 @@
 """Fp8 fake quant folded into the rot kernels (metal_src.with_fq8): rot(fq(x)) == rot(x, fq8=True) to the bit for the single, grouped-gather and multi-member rots,
-random inputs over many scales plus exact zeros, powers of two and block ties. Needs a Mac (Metal) and mlx-vlm 0.7.10."""
+random inputs over many scales plus exact zeros, powers of two and block ties. Needs a Mac (Metal) and mlx-vlm 0.7.12."""
 import numpy as np
 import pytest
 

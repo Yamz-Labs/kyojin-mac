@@ -500,7 +500,7 @@ def serve_command(path: str, port: int, ctx: int | None, backend: str | None, ve
         if vlm:
             prefix = f"PYTHONPATH={REPO}:{vlm} "
         else:
-            unknown.append("vlm_pkg (mlx-vlm 0.7.10 directory: tools/mac_serve.sh looks for ./vlm_pkg or KYOJIN_VLM_PKG; not found here): UNKNOWN")
+            unknown.append("vlm_pkg (mlx-vlm 0.7.12 directory: tools/mac_serve.sh looks for ./vlm_pkg or KYOJIN_VLM_PKG; not found here): UNKNOWN")
     if tok is not None and tok.get("verdict") == "TOKENIZER NEEDED":
         unknown.append("--tokenizer DIR (a directory with tokenizer.json for this model; none found next to it): UNKNOWN")
     res = dict(command=prefix + launcher + " " + " ".join(argv), unknown=unknown, derived=None, runnable=verdict.startswith("READY") and not unknown and (tok is None or tok.get("verdict") == "TOKENIZER OK"))

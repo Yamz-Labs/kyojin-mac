@@ -512,9 +512,15 @@ def make_handler(app: App):
                     state["started"] = True
                     if chat:
                         self._sse(chunk({"role": "assistant", "content": ""}))
+                watch = None if stream else HL.ClientWatch(self.connection)   # a non-stream reply writes nothing until the end: look at the socket instead
                 while True:
+                    if watch is not None and watch.gone():       # the client left (during the queue wait, the prefill or the decode): stop generating
+                        app.log(f"{rid[-6:]} client left: request cancelled")
+                        handle.cancel()
+                        self.close_connection = True
+                        return
                     try:
-                        ev = handle.events.get(timeout=10.0)
+                        ev = handle.events.get(timeout=10.0 if stream else HL.DISCONNECT_PERIOD_S)
                     except queue.Empty:                          # a long prefill or a wait for a slot: tell a stream client we are alive
                         if stream:                               # (and find out if it left)
                             self.wfile.write(b": waiting\n\n")
@@ -817,7 +823,7 @@ def build_app(args, log=print):
     if args.sessions > backend.max_rows:                             # a backend that decodes fewer rows at once (Hy4: 1): the extra requests queue for the slot
         log(f"{backend.kind}: --sessions {args.sessions} -> {backend.max_rows} (rows decoded at once); further requests queue")
         args.sessions = backend.max_rows
-    mem_guard = MemGuard.from_env()                                  # KYOJIN_MEM_BUDGET_GIB (default 0.88 x RAM; 0 = off)
+    mem_guard = MemGuard.from_env(backend_gib_per_1k=getattr(backend, "mem_gib_per_1k", None))   # KYOJIN_MEM_BUDGET_GIB (default 0.88 x RAM; 0 = off)
     log("memory guard: " + ("off" if mem_guard is None else f"budget {mem_guard.budget / GIB:.0f} GiB, {mem_guard.slope * 1000 / GIB:.2f} GiB per 1K prompt tokens"))
     engine = Engine(backend, sessions=args.sessions, ctx=args.ctx, chunk=args.prefill_chunk, block=args.prefix_block,
                     prefix_bytes=int(args.prefix_cache_mb * 2 ** 20), decode_per_chunk=args.decode_per_chunk, log=log,

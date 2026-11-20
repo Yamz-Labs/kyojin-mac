@@ -21,7 +21,9 @@ import os
 import mlx.core as mx
 import mlx.nn as nn
 
+from . import absorb_gemv as AG
 from . import attn_fp16 as AF
+from . import fired as FD
 from . import fixed_kv as FK
 from . import mla_flash_pf as MF
 from . import foreign_skeleton_kpool as KP
@@ -93,6 +95,11 @@ class KpoolProj(nn.Module):
         iq = ln(self.q_b_proj, qr).reshape(B, L, self.H, self.dx).transpose(0, 2, 1, 3)
         w = ln(self.weights_proj, x) * (self.dx * self.H) ** -0.5
         return iq, w
+
+
+def gather_skip(gmin: int, Sw: int, a16: bool) -> str:
+    """Why the kept-key gather branch (`gmin and Sw >= gmin and not a16`) was not taken: 'off' (flag 0), 'below_min' (fewer key slots than the minimum), 'fp16_copy' (the fp16 attention path, a16, owns the call)."""
+    return "off" if not gmin else "below_min" if Sw < gmin else "fp16_copy"
 
 
 class MlaAttention(nn.Module):
@@ -191,16 +198,24 @@ class MlaAttention(nn.Module):
             return None
         return _amm(MF.attend(qa, q_pe, rows, ids, self.scale, self.sinks), vb)
 
+    def _absorb(self, x, w, kind):
+        """x [B, nh, L, K] @ w^T per head (k_b: kind "k", v_b: "v"); flag absorb_gemv: 1 .. 8 rows read a 16-bit / Q8_0 copy of the stored fp32 weights in one launch (x keeps its dtype)."""
+        pk = AG.active(self, x, w, kind)
+        if pk is not None:
+            MlaAttention.PATHS["absorb_gemv"] = MlaAttention.PATHS.get("absorb_gemv", 0) + 1
+            return AG.apply(x[0], pk, w.dtype)[None]
+        return _amm(x, w)
+
     def _attend_vec(self, q_nope, q_pe, buf, off, kind, extra, window, ab16):
         """Flag mla_decode_vec: k_b absorb, the ONE-launch attention core over the cells of `kind` (0 window, 1 keep mask, 2 key ids), v_b absorb -> [B, nh, L, v], or None outside the kernel's contract
         (the caller then runs the stock core)."""
         from . import mla_decode_vec as MV
         kb, vb = self._absorbs(mx.float16 if ab16 else mx.float32)
-        qa = _amm(q_nope.astype(kb.dtype), kb)
+        qa = self._absorb(q_nope.astype(kb.dtype), kb, "k")
         if not MV.eligible(qa, q_pe, buf, kind, extra, MlaAttention.PATHS):
             return None
         MlaAttention.PATHS["attn_vec"] += 1
-        return _amm(MV.attend(qa, q_pe, buf, off, kind, extra, self.sinks, self.scale, window), vb)
+        return self._absorb(MV.attend(qa, q_pe, buf, off, kind, extra, self.sinks, self.scale, window), vb, "v")
 
     def _absorbs(self, dt):
         """k_b / v_b of the dtype of the cache rows: the fp16 copies (attn_fp16.prepare) for fp16 rows, else the stored ones."""
@@ -215,7 +230,7 @@ class MlaAttention(nn.Module):
             lat, k_pe, mask = self._swa_slice(L, S, lat, k_pe, mask)
         S = lat.shape[2]
         kb, vb = self._absorbs(lat.dtype if ab16 is None else (mx.float16 if ab16 else mx.float32))
-        qa = _amm(q_nope.astype(kb.dtype), kb)                             # [B, nh, L, kv_lora]
+        qa = self._absorb(q_nope.astype(kb.dtype), kb, "k")                                      # [B, nh, L, kv_lora]
         if L > 16 and os.environ.get("KYOJIN_HY4_ATTN_FUSE", "0") == "1" and (mask is None or isinstance(mask, (str, mx.array))):    # prefill chunks only: decode / verify rows (<= 16) keep the measured decode path (absorb_mm, step compile)
             return self._attend_fused(qa, q_pe, lat, k_pe, mask, keep, L, S)
         sc = (qa @ lat.swapaxes(-1, -2)).astype(mx.float32) * self.scale
@@ -232,7 +247,7 @@ class MlaAttention(nn.Module):
             B, nh = sc.shape[:2]
             sc = mx.concatenate([sc, mx.broadcast_to(self.sinks.astype(mx.float32)[None, :, None, None], (B, nh, L, 1))], axis=-1)
         p = mx.softmax(sc, axis=-1, precise=True)[..., :S]
-        return _amm(p.astype(lat.dtype) @ lat, vb)
+        return self._absorb(p.astype(lat.dtype) @ lat, vb, "v")
 
     def kpool_sel(self):
         """The KpoolSelect of this layer (pooling weights + selection constants)."""
@@ -323,6 +338,10 @@ class MlaAttention(nn.Module):
             iq, w = self.kpool.query(x, qr, a16)
             from . import kpool_fuse as KF
             gmin = int(os.environ.get("KYOJIN_HY4_FIXED_GATHER_DEC" if L <= 16 else "KYOJIN_HY4_FIXED_GATHER", "0") or 0)
+            if pkc is not None:                                                         # fires log: the pooled keys came from the cache (flag KYOJIN_HY4_FIXED_PKCACHE) or were rebuilt
+                FD.fire("hy4_pkcache")
+            else:
+                FD.fb("hy4_pkcache", "no_cache")
             if pf16 and MF.on() and not win:                                            # KYOJIN_HY4_ATTN_FLASH=1: the fused flash kernel over the kept key list (fp16 prompt path only)
                 v_, g_ = kv[:, 0, :, a:a + dx], kv[:, 0, :, a + dx:a + 2 * dx]
                 pools = sel.pools_fixed_top(iq, w, v_, g_, off, pk=pkc) if gmin and Sw >= gmin else sel.pools_fixed(iq, w, v_, g_, off, pk=pkc)       # radix top-k from KYOJIN_HY4_FIXED_GATHER slots on
@@ -338,12 +357,14 @@ class MlaAttention(nn.Module):
                 s = sel.pools_fixed_top(iq, w, kv[:, 0, :, a:a + dx], kv[:, 0, :, a + dx:a + 2 * dx], off, pk=pkc)
                 slots, ok = KP.gather_slots(s, sort=not (L <= 16 and os.environ.get("KYOJIN_HY4_GATHER_NOSORT", "0") == "1"))
                 MlaAttention.PATHS["fixed_gather"] = MlaAttention.PATHS.get("fixed_gather", 0) + 1
+                FD.fire("hy4_gather")
                 if vec and MV.MODE >= 2:                                                # flag mla_decode_vec 2: the key ids of the gather path straight into the one-launch core
                     o = self._attend_vec(q_nope, q_pe, buf, off, 2, mx.where(ok, slots, -1).astype(mx.int32), 0, ab16)
                     if o is not None:
                         return self._finish(o.transpose(0, 2, 1, 3), x, B, L, a16)
                 o = self.attend_gather(q_nope, q_pe, lat, k_pe, slots, ok).transpose(0, 2, 1, 3)
                 return self._finish(o, x, B, L, a16)
+            FD.fb("hy4_gather", gather_skip(gmin, Sw, a16))                             # fires log: why the kept-key gather did not run on this call
             if KF.use(L, Sw):                                                           # flag kpool_fuse: selection + mask in one launch (left-aligned slots); stock selection past KYOJIN_KPOOL_FUSE_MAXS slots
                 keep = sel.keep_fused_fixed(iq, w, kv[:, 0, :, a:a + dx], kv[:, 0, :, a + dx:a + 2 * dx], off, pk=pkc)
                 MlaAttention.PATHS["kpool_fuse_fixed"] += 1
@@ -357,10 +378,10 @@ class MlaAttention(nn.Module):
         MlaAttention.PATHS["attend_seen"] = MlaAttention.PATHS.get("attend_seen", 0) + 1
         if MAF.ON and not ring:                                                         # flag mla_attend_fuse: scores + mask + keep + sinks + softmax + P @ latent in two launches
             kb, vb = self._absorbs(mx.float16 if ab16 else mx.float32)
-            qa = _amm(q_nope.astype(kb.dtype), kb)
+            qa = self._absorb(q_nope.astype(kb.dtype), kb, "k")
             if MAF.eligible(qa, q_pe, buf, self.kv, self.r, keep, MlaAttention.PATHS):
                 MlaAttention.PATHS["attend_fuse"] = MlaAttention.PATHS.get("attend_fuse", 0) + 1
-                o = _amm(MAF.attend(qa, q_pe, buf, off, keep, self.sinks, self.scale, win, self.kv, self.r), vb).transpose(0, 2, 1, 3)
+                o = self._absorb(MAF.attend(qa, q_pe, buf, off, keep, self.sinks, self.scale, win, self.kv, self.r), vb, "v").transpose(0, 2, 1, 3)
                 return self._finish(o, x, B, L, a16)
         if L > 16:                                                                      # prefill chunk on the fixed-state cache: the query blocks (KYOJIN_HY4_ATTN_QBLK[_SWA]) apply as on the concatenating cache; the window slice above already cut the keys, so attend's own slice is a no-op
             o = self.attend_qblocks(q_nope, q_pe, lat, k_pe, mask, keep).transpose(0, 2, 1, 3)

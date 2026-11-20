@@ -233,6 +233,30 @@ def test_fixed_gather_attend_equals_concat(compiled, nosort, monkeypatch):
     assert dd <= 1e-5
 
 
+@pytest.mark.parametrize("gather,gather_dec,want", [("0", "0", {"hy4_gather.fb.off"}), ("1000000", "1000000", {"hy4_gather.fb.below_min"}), ("1", "1", {"hy4_gather.fire"})])
+def test_fixed_gather_fires_counters(gather, gather_dec, want, monkeypatch):
+    """Fires log: hy4_gather counts fire / off / below_min on the fixed-state cache (CPU, eager), hy4_pkcache counts the carried pooled keys."""
+    from kyojin_mlx import fired as FD
+    monkeypatch.setattr(FD, "AUDIT", True)
+    monkeypatch.setattr(FD, "LOG", False)
+    FD.reset()
+    rng = np.random.default_rng(11)
+    d = 64
+    m = _kp_model(rng, d, 4, 32, 24, 8, 16, 2, 16, top_k=32)
+    m.swa, m.window = False, 0
+    xs = _chunks(rng, d, 150, 4)
+    xs = [xs[0][:, :90], xs[0][:, 90:]] + xs[1:]
+    monkeypatch.setenv("KYOJIN_HY4_FIXED_GATHER", gather)
+    monkeypatch.setenv("KYOJIN_HY4_FIXED_GATHER_DEC", gather_dec)
+    _fixed(m, xs, 64, False, pk=True)
+    assert {k for k in FD.STATS if k.startswith("hy4_gather")} == want, FD.STATS
+    assert FD.STATS.get("hy4_pkcache.fire", 0) > 0 and "hy4_pkcache.fb.no_cache" not in FD.STATS
+    FD.reset()
+    _fixed(m, xs, 64, False, pk=False)
+    assert FD.STATS.get("hy4_pkcache.fb.no_cache", 0) > 0 and "hy4_pkcache.fire" not in FD.STATS
+    FD.reset()
+
+
 @pytest.mark.parametrize("compiled", [False, True])
 def test_fixed_pooled_key_cache_equals_recompute(compiled):
     """KYOJIN_HY4_FIXED_PKCACHE (pooled keys carried in cache[2], updated by the groups a call completes) equals the per-call recompute: ragged prefill chunks, a rewind into the middle of a

@@ -20,8 +20,43 @@ def test_budget_default_is_88_percent_of_ram():
 
 
 def test_slope_env():
-    assert M.slope_bytes_per_token({}) == pytest.approx(0.12 * G / 1000)
-    assert M.slope_bytes_per_token({"KYOJIN_MEM_GIB_PER_1K": "0.5"}) == pytest.approx(0.5 * G / 1000)
+    assert M.slope_bytes_per_token({}, 0.12) == pytest.approx(0.12 * G / 1000)
+    assert M.slope_bytes_per_token({"KYOJIN_MEM_GIB_PER_1K": "0.5"}, 0.12) == pytest.approx(0.5 * G / 1000)
+    assert M.slope_bytes_per_token({"KYOJIN_MEM_GIB_PER_1K": "0.5"}) == pytest.approx(0.5 * G / 1000)     # the override wins on a backend without a value too
+    assert M.slope_bytes_per_token({"KYOJIN_MEM_GIB_PER_1K": ""}, 0.12) == pytest.approx(0.12 * G / 1000)
+    assert M.slope_bytes_per_token({"KYOJIN_MEM_GIB_PER_1K": "0"}, 0.12) == 0.0
+
+
+def test_slope_is_per_backend_and_defaults_to_none():
+    assert M.slope_bytes_per_token({}) == 0.0                      # a backend without a value: no slope
+    assert M.slope_bytes_per_token({}, None) == 0.0
+    from kyojin_mlx.serve import backends as B
+    assert B.Hy4Backend.mem_gib_per_1k == M.DEFAULT_GIB_PER_1K == 0.12
+    assert B.Backend.mem_gib_per_1k is None and B.GenericBackend.mem_gib_per_1k is None and B.VlmBackend.mem_gib_per_1k is None
+
+
+def test_no_slope_admits_a_long_prompt_that_the_old_constant_refused():
+    g, _ = guard(active=177, slope=0.0)                            # a DS4.1-like footprint: 0.12 x 500K = 60 GiB would not fit under 225
+    g.admit(500_000)
+    assert g.max_tokens() is None and g.project(500_000) == 177 * G
+    assert not g.over()                                            # the in-flight check is unchanged
+    g2, _ = guard(active=177, slope=0.12)
+    with pytest.raises(M.PromptTooLong):
+        g2.admit(500_000)
+
+
+def test_from_env_takes_the_backend_slope_and_the_override(monkeypatch):
+    import sys
+    import types
+    mx = types.SimpleNamespace(get_active_memory=lambda: 0, get_cache_memory=lambda: 0, clear_cache=lambda: None)
+    monkeypatch.setitem(sys.modules, "mlx", types.SimpleNamespace(core=mx))
+    monkeypatch.setitem(sys.modules, "mlx.core", mx)
+    env = {"KYOJIN_MEM_BUDGET_GIB": "200"}
+    assert M.MemGuard.from_env(env, backend_gib_per_1k=0.12).slope == pytest.approx(0.12 * G / 1000)
+    assert M.MemGuard.from_env(env).slope == 0.0
+    assert M.MemGuard.from_env({**env, "KYOJIN_MEM_GIB_PER_1K": "0.3"}, backend_gib_per_1k=0.12).slope == pytest.approx(0.3 * G / 1000)
+    assert M.MemGuard.from_env({**env, "KYOJIN_MEM_GIB_PER_1K": "0.3"}).slope == pytest.approx(0.3 * G / 1000)
+    assert M.MemGuard.from_env({"KYOJIN_MEM_BUDGET_GIB": "0"}, backend_gib_per_1k=0.12) is None
 
 
 def test_projection_and_max_tokens():

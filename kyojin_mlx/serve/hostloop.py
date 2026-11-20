@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import gc
 import os
+import select
+import socket
 import sys
 import threading
 import time
@@ -151,6 +153,37 @@ class Reply:
             self.buf += self.detok.flush()
             ev += self._release(True)
         return ev + self.parser.finish()
+
+
+DISCONNECT_PERIOD_S = 1.0          # a reply that writes nothing while it runs (non-stream) looks at its client socket at most this often
+
+
+def client_gone(sock) -> bool:
+    """True when the peer closed (or reset) the connection. Reads nothing: a readable socket is peeked, and only an end-of-file counts
+    (a pipelined next request is data, not a hang-up)."""
+    try:
+        if not select.select([sock], [], [], 0)[0]:
+            return False
+        return sock.recv(1, socket.MSG_PEEK) == b""
+    except (BlockingIOError, InterruptedError):
+        return False
+    except (OSError, ValueError):
+        return True
+
+
+class ClientWatch:
+    """Rate-limited `client_gone` for a reply that never writes until the end. `gone()` is cheap to call on every loop turn."""
+    def __init__(self, sock, period: float | None = None, clock=time.monotonic):
+        self.sock, self.clock = sock, clock
+        self.period = DISCONNECT_PERIOD_S if period is None else period
+        self.next = clock() + self.period
+
+    def gone(self) -> bool:
+        now = self.clock()
+        if now < self.next:
+            return False
+        self.next = now + self.period
+        return client_gone(self.sock)
 
 
 def drain(q, first, nowait_exc) -> tuple:

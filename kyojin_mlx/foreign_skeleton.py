@@ -893,6 +893,9 @@ class Model(nn.Module):
             AF.prepare(self)                                        # flags attn_fp16 / KYOJIN_HY4_PF_FP16: fp16 absorb weights, once, eager
         fixed = cache[0] is not None and getattr(cache[0], "fixed_kv", False)
         if fixed:                                                   # fixed-state caches: the buffers grow here (eager, host), the masks are built in the attention from the offset array
+            from . import absorb_gemv as AG
+            if AG.MODE:
+                AG.prepare(self)                                    # flag absorb_gemv: 16-bit / Q8_0 absorb copies of the active mode, once per mode, eager
             for c in cache:
                 c.ensure(c._n + inputs.shape[1], AF.kv_dtype(h.dtype))
         mask = None if fixed else create_attention_mask(h, cache[0])
