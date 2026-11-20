@@ -111,21 +111,22 @@ DeepSeek V4.1 uses 176-178 GB at 8K context and 187 GB at 983K.
 
 ### Hy4-flash Q3_K (GGUF) against llama.cpp
 
-Decode speed in tokens per second, Mac Studio M5 Ultra 256 GB, same Q3_K GGUF, same fixed text, speculative decode with the model's own head on both sides (ours: `--mtp-depth 3`; llama.cpp: `draft-mtp`). Served through the real server, real text, median of repeated runs. The 1.10.0 figures in this table (4K 64.2, 16K 56.9, and the rest) were measured on an earlier prompt set and are not directly comparable with the 1.10.3 numbers in "New in 1.10.3".
+Decode speed in tokens per second, Mac Studio M5 Ultra 256 GB, same Q3_K GGUF, same fixed text, speculative decode with the model's own head on both sides (ours: `--mtp-depth 3`; llama.cpp: `draft-mtp`). Served through the real server, real text, median of repeated runs. The table has two prompt sets. The columns labelled 1.10.0 prompt set (ours and llama.cpp) use the older set. The last column uses the 1.10.3 release smoke prompts. The two sets are not directly comparable.
 
-| context | ours, speculative (depth 3) | ours, plain | llama.cpp, speculative | llama.cpp, plain |
-|---|---|---|---|---|
-| 4K | 64.20 | 44.38 | 50.92 | 48.66 |
-| 16K | 56.88 | 42.42 | 57.17 | 48.85 |
-| 24K | 55.58 | 41.14 | 52.78 | 48.92 |
-| 32K | 46.08 | not measured | 50.4 | 48.7 |
-| 64K | see "New in 1.10.3" | not measured | 52.69 | 48.72 |
-| 128K | measured numbers to follow | measured numbers to follow | measured numbers to follow | measured numbers to follow |
+| context | ours, speculative (depth 3), 1.10.0 prompt set | ours, plain, 1.10.0 prompt set | llama.cpp, speculative, 1.10.0 prompt set | llama.cpp, plain, 1.10.0 prompt set | ours, speculative (depth 3), 1.10.3 release smoke prompts |
+|---|---|---|---|---|---|
+| 4K | 64.20 | 44.38 | 50.92 | 48.66 | 61.3 |
+| 16K | 56.88 | 42.42 | 57.17 | 48.85 | 64.1 |
+| 24K | 55.58 | 41.14 | 52.78 | 48.92 | not measured |
+| 32K | 46.08 | not measured | 50.4 | 48.7 | 62.5 |
+| 64K | not measured | not measured | 52.69 | 48.72 | 62.9 |
+| 128K | to follow | to follow | to follow | to follow | to follow |
 
 Where llama.cpp leads:
 
-- Speculative decode: ours is ahead at 4K (+26 %) and 24K (+5 %), level at 16K (57.17 against 56.88, llama.cpp is 0.5 % ahead), and behind at 32K (46.08 against 50.4). At 64K llama.cpp holds 52.69 (1.10.0 prompt set); our 1.10.3 figure at 64K is in "New in 1.10.3".
-- Plain decode (no draft): llama.cpp is faster at every context we measured (4K: 48.66 against 44.38; 16K: 48.85 against 42.42; 24K: 48.92 against 41.14). Our advantage comes from speculation, not from the plain step.
+- Speculative decode, 1.10.0 prompt set: ours is ahead at 4K (+26 %) and 24K (+5 %), level at 16K (57.17 against 56.88, llama.cpp is 0.5 % ahead). At 32K ours is behind (46.08 against 50.4). At 64K llama.cpp holds 52.69.
+- Speculative decode, 1.10.3 release smoke prompts: ours is 62.5 at 32K and 62.9 at 64K. A same-prompt llama.cpp run on these prompts is pending, so there is no head-to-head ranking yet.
+- Plain decode, 1.10.0 prompt set (no draft): llama.cpp is faster at every context we measured (4K: 48.66 against 44.38; 16K: 48.85 against 42.42; 24K: 48.92 against 41.14). Our advantage comes from speculation, not from the plain step.
 - Long context (1.10.x, Mac Studio M5 Ultra, 256 GB): 64K and 128K prompts are served. A 141K-token prompt was served at 128K context with passkey retrieval 3 of 3 (decode 31 tok/s on a development build with the step-compile leak fix). A 176K-token prompt was served with passkey 3 of 3 (decode 37 tok/s). The peak footprint in these runs was 143 GiB (`phys_footprint`). These are single served checks on one text, not the paired table run. The 128K cells of the table are still to follow.
 - The speculative cells use the shipped serve line. Passkey retrieval passed 3 of 3 at 4K, 16K and 24K in both modes. The peak footprint is 150-151 GiB for a 144 GiB file (one resident copy of the weights).
 
