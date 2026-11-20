@@ -24,7 +24,7 @@ from pathlib import Path
 
 from .chat import ChatError, FAMILIES, GGUF_ARCH_FAMILIES, family_of, render_resume, think_tags, think_token_ids, token_cuts
 from .engine import SessionRefused
-from .memguard import MemGuard, PromptTooLong
+from .memguard import MemGuard, MemoryBudgetExceeded, PromptTooLong
 from .sampling import Sampling
 from .tokinc import IncTok
 from . import autoconfig
@@ -289,6 +289,8 @@ def make_handler(app: App):
                 self._error(503, str(exc))
             except PromptTooLong as exc:                           # memory budget: the prompt cannot fit, the server stays up
                 self._error(413, str(exc))
+            except MemoryBudgetExceeded as exc:                    # stopped in flight by the memory guard (before the reply started)
+                self._error(503, str(exc))
             except (ChatError, ValueError) as exc:
                 self._error(400, str(exc))
             except (BrokenPipeError, ConnectionResetError):
@@ -565,6 +567,13 @@ def make_handler(app: App):
             except Exception:
                 handle.cancel()
                 raise
+            if reason == "memory":
+                msg_mem = "request stopped: the server hit its memory budget (KYOJIN_MEM_BUDGET_GIB); shorten the prompt or retry"
+                if stream:
+                    self._sse({"error": {"message": msg_mem, "type": "server_error"}})
+                    self._sse("[DONE]")
+                    return
+                raise MemoryBudgetExceeded(msg_mem)
             if reason in ("error", "shutdown"):
                 if stream:
                     self._sse({"error": {"message": "engine error", "type": "server_error"}})

@@ -297,6 +297,7 @@ class Session:
     cap_n: int = 0                  # rounds at the depth cap in the window (a probe opens a fresh one)
     rate_gap: int = 0               # rounds at D = 0 between two cap probes (0 = probe_every; doubles while a probe confirms plain)
     rounds: int = 0
+    mem_abort: bool = False         # the memory guard stopped this session (it ends with reason "memory")
     t_submit: float = field(default_factory=time.perf_counter)
     t_tok: float = 0.0              # when the last token of this reply was accepted
     park_now: bool = False          # flag kv_admit: leave the batch at the next round (the memory budget is over and nothing else can be dropped)
@@ -1098,6 +1099,7 @@ class Engine:
         self.spec_costs = {int(c): list(v) for c, v in spec_costs.items() if v} if spec_costs else None
         self.bpt = 0.0                              # bytes of cache per token (measured), to size a session before it is admitted
         self.memguard = mem_guard
+        self._mem_ticks = 0
         self.backend, self.sessions, self.ctx = backend, sessions, ctx
         if chunk > MAX_PREFILL_CHUNK:
             raise ValueError(f"prefill chunk {chunk} > {MAX_PREFILL_CHUNK}: 16384-row chunks panicked the Ultra (29/10 00:26)")
@@ -1339,6 +1341,10 @@ class Engine:
         if self.members or self.ready:
             self._decode_phase()
         HL.mark("tick_body")
+        if self.memguard is not None and not self.prefilling:
+            self._mem_ticks += 1
+            if self._mem_ticks % self.memguard.check_ticks == 0:
+                self._mem_relieve()
         self._enforce_kv()
         self._note_kv()
         HL.mark("tick_post")
@@ -1503,6 +1509,34 @@ class Engine:
                 self.stats["kv_over_budget"] += 1
                 return
 
+    def _mem_relieve(self, extra: float = 0, victim: Session | None = None) -> bool:
+        """Hard memory guard (serve.memguard). Over the budget (MLX active + buffer cache or the process footprint, plus `extra` bytes about to be
+        allocated): free the MLX buffer cache, then drop prefix snapshots (LRU, by halves), then stop one request (`victim`, else the live session holding the
+        most KV) with reason "memory". The server stays up. True when a request was stopped."""
+        g = self.memguard
+        if not g.over(extra):
+            return False
+        g.clear_cache()
+        self.stats["mem_clear"] += 1
+        while g.over(extra) and self.prefix.entries:
+            self.prefix.shrink(self.prefix.bytes // 2 if self.prefix.bytes > 1 else -1)
+            self.stats["mem_prefix_shrink"] += 1
+            g.clear_cache()                                             # freed snapshots sit in the MLX cache until it is cleared
+        if not g.over(extra):
+            self.log(f"memory guard: back under the {g.budget / GIB:.0f} GiB budget (cache cleared, prefix snapshots now {self.prefix.bytes / GIB:.2f} GiB)")
+            return False
+        live = [x for x in (*self.prefilling, *self.ready, *self.members) if not x.mem_abort]
+        if victim is None or victim.mem_abort:
+            victim = max(live, key=lambda x: (x.kv_bytes, x.n_prompt + x.n_gen), default=None)
+        if victim is None:
+            return False
+        victim.mem_abort = True
+        victim.handle.cancel()                                          # ends through the cancel path of its stage: _finish(reason "memory"), cache and draft released
+        self.stats["mem_aborts"] += 1
+        self.log(f"memory guard: {g.used() / GIB:.0f} GiB used (+{extra / GIB:.1f} GiB next) over the {g.budget / GIB:.0f} GiB budget after cache clear and "
+                 f"prefix drop: request {victim.sid} ({victim.n_prompt} prompt tokens) stopped")
+        return True
+
     def _need_bytes(self, s: Session) -> float:
         """Flag kv_admit: the cache s may grow to before it yields its slot or ends: bytes per token (measured) x (prompt + reply tokens it may produce in one stretch)."""
         reply = s.max_new if s.yield_after is None else min(s.max_new, s.yield_after)
@@ -1585,6 +1619,8 @@ class Engine:
                 self._finish(s, "cancelled")
 
     def _finish(self, s: Session, reason: str) -> None:
+        if s.mem_abort and reason == "cancelled":
+            reason = "memory"
         ad = getattr(self.backend, "adopt_drop", None)
         if ad is not None and s.sid is not None:
             ad(s.sid)                                                # flag engram_adopt: a session that never reached its first chunk frees its row jobs
@@ -2124,6 +2160,8 @@ class Engine:
             self._replay_step(s)
             return
         end = self._chunk_end(s, s.pos, L)
+        if self.memguard is not None and self._mem_relieve((end - s.pos) * self.memguard.slope, s):
+            return                                                  # the memory guard stopped this request before its next chunk
         merge = end < L and self._cut_merge(s, end, L)
         cut_pos = end
         if merge:
