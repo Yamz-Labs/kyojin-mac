@@ -102,7 +102,7 @@ class MtpHead(nn.Module):
 def head_logits(model, y):
     """The trunk's own output head on the head's state (Model.__call__ tail)."""
     sp = model.args
-    out = model.model.embed_tokens.as_linear(y) if sp.tie_word_embeddings else (HQ.project(model.lm_head, y) if HQ.BITS else None)       # flag head_q: the packed head
+    out = model.model.embed_tokens.as_linear(y) if sp.tie_word_embeddings else (HQ.project(model.lm_head, y) if (HQ.BITS or HQ.FMM8) else None)       # flag head_q: the packed head
     if out is None:
         out = model.lm_head(y)
     out = out * sp.logit_scale if sp.logit_scale != 1.0 else out

@@ -1169,6 +1169,13 @@ FLAGS: dict[str, Flag] = {
     "split_eval": Flag("KYOJIN_SPLIT", "0", "Plain and verify passes (1 .. 8 rows): mx.async_eval(h) after layers 1 and 8, so the GPU runs the first layers while the host builds the rest of the graph. n10 Mac Studio, Hy4: with one eval at the end the GPU idled for the whole host build (2.6 ms at 1 row, 7.2 ms at 6 rows); plain p4 40.4 -> 43.9 tok/s (ids equal), verify T=6 50.3 -> 44.2 ms. "
                        "Explicit KYOJIN_SPLIT_EVAL / _ROWS / _ROWS_MIN env wins. Read per call",
                        attrs=(("foreign_skeleton", "SPLIT_ON", _on),)),
+    "foreign_fmm8": Flag("KYOJIN_FOREIGN_FMM8", "0", "First row count served by the few-row simdgroup-matrix product on a stored Q8_0 linear (fmm8, ForeignLinear.apply before the NAX wide product / gemv8): "
+                         "0 = off, 2 = verify rows from 2. One launch reads each weight once for 8 x NT weight rows and up to 16 rows, the simdgroups of a threadgroup split K (llama.cpp mul_mv_mma, Q8_0 from 2 rows on "
+                         "M3 Ultra). fp16 x, exact int8 weights, fp32 sums (same products as gemv8, other sum order). Metal only. Read per call", kind="int", attrs=(("fmm8", "MIN_ROWS", int),)),
+    "foreign_fmm8_max": Flag("KYOJIN_FOREIGN_FMM8_MAX", "8", "Last row count of the foreign_fmm8 product (1 .. 16; above it the wide NAX product / matmul route). Read per call", kind="int", attrs=(("fmm8", "MAX_ROWS", int),)),
+    "head_fmm8": Flag("KYOJIN_HEAD_FMM8", "0", "Output head of a 1 .. 16 row pass (decode, verify rows) through a Q8_0 copy of the dense head matrix (symmetric int8 + fp16 scale per 32, 1.06 bytes per weight) read by the few-row "
+                      "simdgroup-matrix kernel (fmm8, float32 logits) instead of the dense float32 matmul. Takes precedence over head_q. One copy shared with the MTP draft's trunk-side head. Logits differ at the "
+                      "8-bit rounding: gate with the model's noise band. Metal only. Read per call", kind="int", attrs=(("headq", "FMM8", int),)),
     "foreign_nbr_small": Flag("KYOJIN_FOREIGN_NBR_SMALL", "0", "Output rows per simdgroup (NBR) of the 8-bit stored GEMV (gemv8, 1 .. 8 rows) on matrices under 8M weights: 0 = the global NBR (2), 1 = one row per "
                               "simdgroup = twice the threadgroups (the 96-threadgroup 3072 x 1536 / 1536 x 3072 / 1024-wide projections run at 0.5-0.6 TB/s against 1.0-1.2 for the big ones). "
                               "Same sums per output row (the row order inside a simdgroup does not change a dot product). Read per call", kind="int", attrs=(("foreign_linear", "NBR_SMALL", int),)),

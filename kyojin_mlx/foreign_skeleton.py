@@ -928,7 +928,7 @@ class Model(nn.Module):
         from . import headlast
         if headlast.active() and h.shape[1] > headlast.LAST_ROW_MIN:       # a caller that reads the last row only (serve prefill): [B, 1, vocab], not [B, rows, vocab]
             h = h[:, -1:]
-        out = m.embed_tokens.as_linear(h) if sp.tie_word_embeddings else (HQ.project(self.lm_head, h) if HQ.BITS else None)
+        out = m.embed_tokens.as_linear(h) if sp.tie_word_embeddings else (HQ.project(self.lm_head, h) if (HQ.BITS or HQ.FMM8) else None)
         if out is None:
             out = self.lm_head(h)
         out = out * sp.logit_scale if sp.logit_scale != 1.0 else out

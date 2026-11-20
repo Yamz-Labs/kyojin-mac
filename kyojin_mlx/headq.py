@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import os
 
+import numpy as np
 import mlx.core as mx
 
 BITS = int(os.environ.get("KYOJIN_HEAD_Q", "0") or 0)           # flag head_q: 0 off, 8 or 4
+FMM8 = int(os.environ.get("KYOJIN_HEAD_FMM8", "0") or 0)       # flag head_fmm8 (flags.py rewrites it at runtime): the Q8_0 copy read by the few-row MMA kernel (fmm8), float32 logits
 MAX_ROWS = 16
 GROUP = 64
 _PACKS: dict = {}                                               # (id(weight), bits) -> (wq, scales, biases, bits, weight): the weight reference keeps the id valid
@@ -31,6 +33,14 @@ def packed(w, bits: int):
 def project(lm, h):
     """Output head `lm` (nn.Linear) on h [B, L, D] through the packed copy, or None when the flag is off / the shape is not eligible (the caller runs the dense head)."""
     bits = BITS
+    if FMM8:
+        w = getattr(lm, "weight", None)
+        rows = int(np.prod(h.shape[:-1]))
+        if 1 <= rows <= MAX_ROWS:
+            from . import fmm8
+            pk = fmm8.head_pack(w)
+            if pk is not None and pk.k == h.shape[-1]:
+                return pk.apply(h.reshape(rows, -1), mx.float32).reshape(*h.shape[:-1], pk.n)
     if not bits or h.shape[-2] > MAX_ROWS:
         return None
     pk = packed(getattr(lm, "weight", None), bits)

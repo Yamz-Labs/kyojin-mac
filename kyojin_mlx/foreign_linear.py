@@ -33,6 +33,7 @@ from . import moe_union as MU
 from . import moe_scale_compact as MC
 from . import glm_dense6 as G6
 from . import foreign_pfi8 as PI8
+from . import fmm8 as F8
 
 GEMV_ROWS = int(os.environ.get("KYOJIN_FOREIGN_GEMV_ROWS", "4"))
 MMA_MAX = min(16, int(os.environ.get("KYOJIN_FOREIGN_MMA_MAX", "16")))
@@ -680,6 +681,8 @@ class DevPack:
                 return y
         if KQ.dense_ok(self, R):                                                        # flag kqdense (KYOJIN_KQ_DENSE, default off): big-row Q8_0 linear through the grouped kernel (decode shared by KYOJIN_KQ_RT row tiles)
             return KQ.dense(self, x2)
+        if self.fmm8_ok(R):                                                             # flag foreign_fmm8 (default off, read per call): few-row simdgroup-matrix product on the stored Q8_0 bytes
+            return self._fmm8(x2)
         if self.wide_ok(R):
             return self._wide(x2)
         if self.fmt in FM.FORMATSK:
@@ -775,7 +778,7 @@ class DevPack:
 
     def wide_stored(self, R):
         """Above DENSE_ROWS: the rows the stored bytes still serve in one product (MLX quantized matmul, two few-row MMA launches)."""
-        return bool(self.wide_ok(R) or self._zq_route(R) or self._f2_ok(R) or self._zq8_ok(R) or (self.fmt in FM.FORMATS8 and R <= DENSE8_ROWS))
+        return bool(self.wide_ok(R) or self.fmm8_ok(R) or self._zq_route(R) or self._f2_ok(R) or self._zq8_ok(R) or (self.fmt in FM.FORMATS8 and R <= DENSE8_ROWS))
 
     def _zq_view(self):
         """(codes, scales) in MLX's own layout, views of the stored arrays (the byte order is the same: element 2b in the low nibble, one UE4M3 / E8M0 byte per block)."""
@@ -873,11 +876,13 @@ class DevPack:
             return False
         if DENSE_GEMV and self.g3_ok(R):
             return False
-        return not self.wide_ok(R) and self.gemv_ok()
+        return self.fmm8_ok(R) or (not self.wide_ok(R) and self.gemv_ok())
 
     def gemv8_cf(self, x2, out_dtype):
         """_gemv8 with x2 half / float32 / bfloat16 read as stored and y in out_dtype (float16 / float32): the values of
         x2.astype(float16) -> _gemv8 -> .astype(out_dtype), bit for bit, in one launch (flag foreign_castfree)."""
+        if self.fmm8_ok(x2.shape[0]):                                                   # flag foreign_fmm8: the same cast-free contract (x read as stored, y in out_dtype)
+            return F8.run(x2, self.qs, self.meta, self.gs, self.n, self.k, out_dtype)
         R, NBR = x2.shape[0], self._nbr8()
         xin, yout = _CF_X[x2.dtype], _CF_Y[out_dtype]
         ins = [x2, self.qs, self.gs] if self.meta is None else [x2, self.qs, self.meta, self.gs]
@@ -931,7 +936,7 @@ class DevPack:
 
     def glu_dense_ok(self, R) -> bool:
         """apply(gate|up) -> silu * mul -> apply(self) can run as ONE launch for self: the one-row GEMV class of this format takes R rows (same kernel family as apply())."""
-        if not DENSE_GLU or self.E or self.fmt == "dense" or self.wide_ok(R):
+        if not DENSE_GLU or self.E or self.fmt == "dense" or self.wide_ok(R) or self.fmm8_ok(R):
             return False
         if self.fmt in FM.FORMATSK:
             lim = (GEMVK_COPY_ROWS if self.k * self.n >= GEMVK_COPY_SMALL else 0) if self.w16 is not None else GEMVK_ROWS     # the same test as apply()
@@ -966,6 +971,14 @@ class DevPack:
         ins = [mx.take(x2, _xperm8_idx(self.k), axis=1), self.qs, self.gs] if self.meta is None else [mx.take(x2, _xperm8_idx(self.k), axis=1), self.qs, self.meta, self.gs]
         return _mma8_kern(self.fmt, ntn)(inputs=ins, template=[("R", R), ("KIN", self.k), ("N", self.n), ("NTN", ntn)], grid=(-(-self.n // (32 * ntn)) * 128, 1, 1),
                                          threadgroup=(128, 1, 1), output_shapes=[(R, self.n)], output_dtypes=[mx.float16])[0]
+
+    def fmm8_ok(self, R):
+        return (bool(F8.MIN_ROWS) and F8.MIN_ROWS <= R <= min(F8.MAX_ROWS, F8.ROWS_CAP) and self.fmt == "q8_0" and not self.E and self.meta is not None
+                and self.w16 is None and F8.eligible(R, self.n, self.k))
+
+    def _fmm8(self, x2):
+        """x2 [R, k] -> [R, n] fp16 on the stored Q8_0 bytes (fmm8.run: one weight read, K split over the simdgroups of a threadgroup)."""
+        return F8.run(x2, self.qs, self.meta, self.gs, self.n, self.k, mx.float16)
 
     def wide_ok(self, R):
         hi = int(WIDE_MAX_ENV) if WIDE_MAX_ENV else WIDE_MAX_FMT.get(self.fmt, 32)
