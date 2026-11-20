@@ -83,20 +83,20 @@ DeepSeek V4.1 uses 176-178 GB at 8K context and 187 GB at 983K.
 
 ### Hy4-flash Q3_K (GGUF) against llama.cpp
 
-Decode speed in tokens per second, Mac Studio M5 Ultra 256 GB, same Q3_K GGUF, same fixed text, speculative decode with the model's own head on both sides (ours: `--mtp-depth 3`; llama.cpp: `draft-mtp`). Served through the real server, real text, median of repeated runs. `TBD-FROM-CELL` marks a cell that is still being measured.
+Decode speed in tokens per second, Mac Studio M5 Ultra 256 GB, same Q3_K GGUF, same fixed text, speculative decode with the model's own head on both sides (ours: `--mtp-depth 3`; llama.cpp: `draft-mtp`). Served through the real server, real text, median of repeated runs. "next" marks a cell that is measured next and added to this table.
 
 | context | ours, speculative (depth 3) | ours, plain | llama.cpp, speculative | llama.cpp, plain |
 |---|---|---|---|---|
 | 4K | 64.20 | 44.38 | 50.92 | 48.66 |
 | 16K | 56.88 | 42.42 | 57.17 | 48.85 |
 | 24K | 55.58 | 41.14 | 52.78 | 48.92 |
-| 32K | 46.08 | TBD-FROM-CELL | 50.4 | 48.7 |
-| 64K | TBD-FROM-CELL | TBD-FROM-CELL | 52.69 | 48.72 |
-| 128K | TBD-FROM-CELL | TBD-FROM-CELL | TBD-FROM-CELL | TBD-FROM-CELL |
+| 32K | 46.08 | not measured | 50.4 | 48.7 |
+| 64K | next | next | 52.69 | 48.72 |
+| 128K | next | next | next | next |
 
 Where llama.cpp leads:
 
-- Speculative decode: ours is ahead at 4K (+26 %) and 24K (+5 %), level at 16K (57.17 against 56.88, llama.cpp is 0.5 % ahead), and behind at 32K (46.08 against 50.4). The 64K cell is not measured yet: llama.cpp holds 52.69 there.
+- Speculative decode: ours is ahead at 4K (+26 %) and 24K (+5 %), level at 16K (57.17 against 56.88, llama.cpp is 0.5 % ahead), and behind at 32K (46.08 against 50.4). The 64K cell is measured next: llama.cpp holds 52.69 there.
 - Plain decode (no draft): llama.cpp is faster at every context we measured (4K: 48.66 against 44.38; 16K: 48.85 against 42.42; 24K: 48.92 against 41.14). Our advantage comes from speculation, not from the plain step.
 - The speculative cells use the shipped serve line. Passkey retrieval passed 3 of 3 at 4K, 16K and 24K in both modes. The peak footprint is 150-151 GiB for a 144 GiB file (one resident copy of the weights).
 
@@ -110,7 +110,7 @@ What is new against 1.9.x:
 - `attn_vec`: the MLA decode attention runs in one launch per layer (about 20 small launches before).
 - Engram rows are read from disk by parallel pread, with a background prefetch during decode. The 59 GiB table is never loaded or pinned.
 - Four kernels for the verify rows and the output head: `fmm8` (few-row Q8_0 matrix product), `head_q` (shared packed 8-bit output head), `nbr_small` (small 8-bit GEMVs), `moe_route_sel` (fused router selection).
-- Context: 256K tokens are configured. Decode speed at 128K context: TBD-FROM-CELL tok/s (speculative), TBD-FROM-CELL tok/s (plain).
+- Context: 256K tokens are configured. Decode speed at 64K and 128K context is measured next and will be added to the table.
 
 Run it (copy and paste; needs the install steps above and about 150 GiB of free memory):
 
