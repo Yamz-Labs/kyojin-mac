@@ -2,8 +2,8 @@
 
 Budget: KYOJIN_MEM_BUDGET_GIB (default 0.88 x the physical RAM, i.e. about 225 GiB on a 256 GB Mac; 0 switches the guard off).
 Used memory: the larger of MLX active + buffer cache and the process physical footprint (the footprint also sees what MLX does not count).
-Slope: KYOJIN_MEM_GIB_PER_1K (default 0.36), GiB of active memory per 1000 prompt tokens, the upper end of the served memlog cells
-(0.31-0.36 GiB per 1K at 24K-145K tokens; 158 GiB at 145K). It is a constant on purpose: the engine's own bytes-per-token (`Engine.bpt`) bills the
+Slope: KYOJIN_MEM_GIB_PER_1K (default 0.12), GiB of active memory per 1000 prompt tokens: the leak-free footprint of 1.10.2 (KV ~0.11 GiB per 1K
+plus cache, 106 -> 126 GiB from 4.7K to 134K tokens; 1.10.0 / 1.10.1 grew 0.36 per 1K through the step-compile leak). It is a constant on purpose: the engine's own bytes-per-token (`Engine.bpt`) bills the
 cache ledger, which does not see the private copy a prefix hit makes, so it under-estimates what the process really holds.
 
 The class is pure (readers are injected), so the projection and the escalation are tested on CPU without Metal."""
@@ -15,7 +15,7 @@ import sys
 
 GIB = 2 ** 30
 DEFAULT_FRACTION = 0.88
-DEFAULT_GIB_PER_1K = 0.36
+DEFAULT_GIB_PER_1K = 0.12
 DEFAULT_CHECK_TICKS = 16                         # decode ticks between two in-flight checks (prefill chunks are checked every chunk)
 
 

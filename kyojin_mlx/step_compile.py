@@ -32,6 +32,7 @@ PREP = os.environ.get("KYOJIN_STEP_COMPILE_PREP", "0") not in ("0", "")    # lay
 SPLIT = os.environ.get("KYOJIN_STEP_COMPILE_SPLIT", "0") not in ("0", "")  # KV layers: program before the attention call + program after it, the attention call itself eager
 ATTN = os.environ.get("KYOJIN_STEP_COMPILE_ATTN", "0") not in ("0", "")    # KV layers: program 1 = the part before the attention call (returns the attention inputs + every value the rest needs), eager attention, program 2 = the rest only (no recompute)
 MAX_KEYS = 64
+LEAK_ENV = "KYOJIN_STEP_COMPILE_LEAK"                              # escape hatch: 1 restores the old per-cache-object program key (keeps every request's KV alive)
 _INLINE = [0]                                                       # > 0 while a split program is traced: the wrapped mlp runs inline (it becomes part of that program)
 STATS = {"compiled": 0, "eager_warm": 0, "bad": 0, "stock": 0, "bad_reasons": []}
 MAX_REASONS = 32
@@ -79,6 +80,19 @@ def _sk(v):
     if isinstance(v, (list, tuple)):
         return (type(v).__name__,) + tuple(_sk(i) for i in v)
     return (type(v).__name__, id(v))
+
+
+def _leak() -> bool:
+    """A fixed-state layer cache is one object per request. Its identity must not enter the program key and the program template must hold no array: else every request
+    is a new key (retrace) and the program closure keeps that request's whole KV buffers alive until MAX_KEYS. Default: no leak. KYOJIN_STEP_COMPILE_LEAK=1 restores the old key."""
+    return os.environ.get(LEAK_ENV, "0") not in ("0", "")
+
+
+def _bare(cache):
+    """Program template of a fixed cache: the same object without its arrays (`_shell` copies it and sets the arrays of each call)."""
+    t = copy.copy(cache)
+    t.cache = [None] * len(cache.cache)
+    return t
 
 
 def _key(args: dict, cache):
@@ -555,7 +569,8 @@ def _wrap_layer(layer):
             STATS["stock"] += 1
             return stock(self, *a, **kw)
         capS = VC.SINK.S if VC.SINK is not None and cache is not None else None
-        key = _key(args, cache) + (capS,)
+        leak = _leak()
+        key = _key(args if leak else {n: v for n, v in args.items() if n != "cache"}, cache) + (capS,)
         s = st.get(key)
         if s is None and len(st) > MAX_KEYS:                        # shapes keep changing (growing mask): not worth a program per step
             STATS["stock"] += 1
@@ -582,7 +597,7 @@ def _wrap_layer(layer):
                 return stock(self, *a, **kw)
         if s == "warm":
             try:
-                fn, box = build(names, statics, cache, counts, capS)
+                fn, box = build(names, statics, cache if leak or cache is None else _bare(cache), counts, capS)
                 out, new, caps = fn([args[n] for n in names], carr, extra)
             except Exception as e:                                  # a host sync / data-dependent python in the layer: this shape stays stock
                 st[key] = "bad"
@@ -600,7 +615,7 @@ def _wrap_layer(layer):
                     VC.SINK.put(cache, i, v)
         return out
 
-    layer.__class__ = type("Stc" + cls.__name__, (cls,), {"__call__": call, "_step_compiled": True})
+    layer.__class__ = type("Stc" + cls.__name__, (cls,), {"__call__": call, "_step_compiled": True, "_step_programs": st})
 
 
 def _shell(cache, arrs):

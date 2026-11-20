@@ -49,7 +49,7 @@ Tested on a Mac Studio with 256 GB of unified memory.
 
 `tools/hy4_mac.env` holds the kernel flags of the measured line. The prefill speed depends on the MLX buffer cache limit: `--cache-limit-mb 16384` is the value of the measured line (without the flag the limit is derived from the weights and the free memory). Speculative decoding uses the model's own multi-token-prediction head (`--mtp-depth 3`).
 
-Memory guard: `KYOJIN_MEM_BUDGET_GIB` (default 0.88 x physical RAM, 0 = off) caps the process; a prompt whose projected memory (`KYOJIN_MEM_GIB_PER_1K`, default 0.36 GiB per 1K tokens) is over it gets HTTP 413, and a request that reaches it while running is stopped after the MLX cache and the prefix snapshots are dropped, so the server stays up.
+Memory guard: `KYOJIN_MEM_BUDGET_GIB` (default 0.88 x physical RAM, 0 = off) caps the process; a prompt whose projected memory (`KYOJIN_MEM_GIB_PER_1K`, default 0.12 GiB per 1K tokens) is over it gets HTTP 413, and a request that reaches it while running is stopped after the MLX cache and the prefix snapshots are dropped, so the server stays up.
 Speed numbers: see the benchmark table.
 
 - Context: 256K tokens (`--ctx 262144`). 1M tokens is not part of this release.
@@ -118,6 +118,12 @@ Where llama.cpp leads:
 - Speculative decode: ours is ahead at 4K (+26 %) and 24K (+5 %), level at 16K (57.17 against 56.88, llama.cpp is 0.5 % ahead), and behind at 32K (46.08 against 50.4). The 64K cell is measured next: llama.cpp holds 52.69 there.
 - Plain decode (no draft): llama.cpp is faster at every context we measured (4K: 48.66 against 44.38; 16K: 48.85 against 42.42; 24K: 48.92 against 41.14). Our advantage comes from speculation, not from the plain step.
 - The speculative cells use the shipped serve line. Passkey retrieval passed 3 of 3 at 4K, 16K and 24K in both modes. The peak footprint is 150-151 GiB for a 144 GiB file (one resident copy of the weights).
+
+## New in 1.10.2
+
+Memory fix for long-running Hy4 servers (step compile of the fixed KV cache).
+
+- Memory: the footprint no longer grows with earlier requests. The compiled layer programs were keyed on the per-request cache object and kept every finished request's KV buffers alive (about 0.11 GiB per 1K tokens of each earlier request); they are now keyed on shapes only and reused by every request. `KYOJIN_STEP_COMPILE_LEAK=1` restores the old key.
 
 ## New in 1.10.0
 
