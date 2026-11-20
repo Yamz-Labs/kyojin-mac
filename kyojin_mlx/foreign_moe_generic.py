@@ -299,6 +299,7 @@ def _describe_spec(spec: MoeSpec) -> dict:
 
 
 ROUTE_RS = os.environ.get("KYOJIN_MOE_ROUTE_RS", "0") not in ("0", "")      # flag moe_route_rs (flags.py rewrites it at runtime)
+ROUTE_SEL = os.environ.get("KYOJIN_MOE_ROUTE_SEL", "0") not in ("0", "")      # flag moe_route_sel (flags.py rewrites it at runtime)
 _ZB: dict = {}
 
 
@@ -368,6 +369,10 @@ class GenericMoE(nn.Module):
             _, inds, w = _RS.rowsel(x2, self.router_w, bias, T, E, K, s.norm_weights, s.weight_scale if s.weight_scale not in (0.0, 1.0) else 1.0)
             return inds.reshape(T, K), w.reshape(T, K)
         lg = skinny_mm(x2.astype(mx.float32), self.router_w)                         # flag skinny_rows: few rows = one rowdot launch
+        if ROUTE_SEL and lg.ndim == 2 and lg.dtype == mx.float32:                    # flag moe_route_sel: gating, bias, groups, top-k, norm, scale in ONE launch on these (stock) logits
+            from . import moe_route_sel as _SL
+            if _SL.eligible(lg.shape[0], E, K, s.n_group, s.group_used, s.gating):
+                return _SL.select(lg, self.router_b, self.sel_b, K, s.gating, s.norm_weights, s.norm_eps, s.weight_scale, s.n_group, s.group_used, s.temperature)
         if self.router_b is not None:
             lg = lg + self.router_b
         if s.temperature != 1.0:

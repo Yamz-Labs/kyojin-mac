@@ -1180,6 +1180,11 @@ FLAGS: dict[str, Flag] = {
                          "as ONE launch (glm_moe_rs.rowsel: rowdot + the last-arriving threadgroup selects) instead of the stock matmul + bias + sigmoid + argsort + take + sum + divide (~6 launches). "
                          "Logits = rowdot (row-invariant, so a plain step and a verify row agree); one group, no logit bias; others take the stock path. Metal only. Read per call",
                          attrs=(("foreign_moe_generic", "ROUTE_RS", _on),)),
+    "moe_route_sel": Flag("KYOJIN_MOE_ROUTE_SEL", "0", "Decode / verify (1 .. 16 rows) router selection of a generic MoE block (GenericMoE.route), any gating (softmax, sigmoid, sqrt_softplus, none, softmax_weight): "
+                          "gating, selection bias, group limit, top-k, weight normalisation and scale as ONE launch (moe_route_sel.select, llama.cpp topk_moe layout) on the stock router logits, instead of "
+                          "~6 launches (sigmoid, + bias, argsort, take, sum, divide, scale). Logits unchanged (bit-identical indices vs stock; weights within fp32 ulps; ties: lowest index). "
+                          "moe_route_rs (gate GEMV fused in too, rowdot logits) takes precedence where eligible. Metal only. Read per call",
+                          attrs=(("foreign_moe_generic", "ROUTE_SEL", _on),)),
     "kpool_fuse": Flag("KYOJIN_KPOOL_FUSE", "0", "Decode (1 .. 8 query rows) pool selection of a kpool layer as ONE launch (kpool_fuse.select): indexer scores over the pooled keys + exact top-k (ties: lowest pool index, as the stable argsort) "
                        "+ the [B, 1, L, S] slot mask with the forced tail group, instead of ~50 elementwise launches. Generic by shape. Selection equal to the stock path (scores to ~1e-6 relative: plain d-loop dot). Metal only; prefill unchanged. Read per call",
                        attrs=(("kpool_fuse", "ON", _on),)),
