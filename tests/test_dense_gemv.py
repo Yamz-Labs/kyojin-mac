@@ -1,7 +1,7 @@
 """KYOJIN_DENSE_DEC: the dense (non-routed) trellis decode cut (metal_src.dense_cb). 0 = today's dec_mul1, 1 = dec_mul1r1 (lane sum by one imad,
 the same fp16 value bit for bit), 2 = dec_mul1fd (bare byte sum with the affine folded out: NOT bit-identical, checked against the f32 reference).
 The flag must be a normal int lever, arm through the module attribute, and the outputs of the single linear, the same-input group and the grouped
-wo_a must keep today's bits at 1-4 rows (decode 1) or stay within kernel numerics of the f32 reference (decode 2). The abliteration projection
+wo_a must keep today's bits at 1-4 rows (decode 1) or stay within kernel numerics of the f32 reference (decode 2). The direction projection
 is a post-output linear map: it must still apply and commute with the decode choice the same way.
 """
 import numpy as np
@@ -153,7 +153,7 @@ def test_fd_rows4_never_uses_the_half_stage():
     assert np.isfinite(np.array(y, dtype=np.float32)).all()
 
 
-# ------------------------------------------------------------------ abliteration hook
+# ------------------------------------------------------------------ direction projection hook
 def test_ablit_projection_still_applies_and_commutes():
     m, *_ = lin(256, 256)
     x = cond(m, 1, 256)

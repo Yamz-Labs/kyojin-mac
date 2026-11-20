@@ -33,7 +33,7 @@ class MoeFused:
         m = gather
         self.m = m
         self._u = M.MoeGather(m.g, m.u, m.d, m.topk, limit=m.limit, wpre=m.wpre, fq=m.fq,
-                              tgk_gu=m.tgk_gu, tgk_dn=m.tgk_dn, alpha=m.alpha, beta=m.beta,
+                              tgk_gu=m.tgk_gu, tgk_dn=m.tgk_dn, alpha=m.alpha, beta=m.beta, act=m.act,
                               union=True, grouped=False, pin_rows=m.pin_rows)
         self._u._is_fused_inner = True  # the inner gather never re-enters the flag branch
 

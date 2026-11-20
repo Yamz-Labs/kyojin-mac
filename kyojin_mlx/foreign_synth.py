@@ -12,7 +12,7 @@ import numpy as np
 from . import foreign_gguf as GF
 
 # byte offsets of the fp16 fields of a block (random bytes there would be inf / nan)
-_FP16_AT = {"Q4_0": (0,), "Q4_1": (0, 2), "Q5_0": (0,), "Q5_1": (0, 2), "Q8_0": (0,), "Q4_K": (0, 2), "Q5_K": (0, 2), "Q6_K": (208,), "Q3_K": (108,), "IQ3_XXS": (0,),
+_FP16_AT = {"Q2_0": (0,), "Q4_0": (0,), "Q4_1": (0, 2), "Q5_0": (0,), "Q5_1": (0, 2), "Q8_0": (0,), "Q4_K": (0, 2), "Q5_K": (0, 2), "Q6_K": (208,), "Q3_K": (108,), "IQ3_XXS": (0,),
             "IQ3_S": (0,), "IQ4_NL": (0,), "IQ4_XS": (0,), "Q2_K": (80, 82), "IQ2_XXS": (0,), "IQ2_XS": (0,), "IQ2_S": (0,), "IQ1_S": (0,)}
 
 

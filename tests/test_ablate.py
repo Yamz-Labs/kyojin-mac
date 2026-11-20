@@ -3,7 +3,7 @@
 Pins (1) the flag parses / validates / round-trips through flags.set and is off by default, (2) with the flag off the batched step and the verify rows are bit
 identical to the base (before any use and after a set / reset), (3) each class runs end to end on a tiny DS4.1 model (batched core, `rows.enable`: plain step and verify
 rows) and its stand-in site is reached (HITS) where the mini model carries that site, (4) the sites the mini model does not carry (MoeGather stages, the sumoe
-routed call, the shared-expert impl, the fused mHC functions, the decensor projection, the fused-attention solo core) return the shapes / dtypes their consumers read."""
+routed call, the shared-expert impl, the fused mHC functions, the direction projection, the fused-attention solo core) return the shapes / dtypes their consumers read."""
 import os
 import sys
 from types import SimpleNamespace
@@ -70,7 +70,7 @@ def test_flag_is_off_by_default_and_validated():
         AZ.parse("norm,nope")
     with pytest.raises(ValueError):
         FL.set("ablate", "nope")                                                      # refused before anything is applied
-    assert set(AZ.CLASSES) == {"moe_routed", "moe_shared", "router", "moe_glue", "mhc", "norm", "attn", "idx", "ablit"}
+    assert set(AZ.CLASSES) >= {"moe_routed", "moe_shared", "router", "moe_glue", "mhc", "norm", "attn", "idx", "ablit"}
 
 
 def test_flag_set_writes_env_active_and_bumps_gen():

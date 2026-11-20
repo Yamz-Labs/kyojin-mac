@@ -135,8 +135,20 @@ def _select(lg, T, E, K, norm):
              output_shapes=[(T * K,), (T * K,), (T,)], output_dtypes=[mx.uint32, mx.float32, mx.float32])
 
 
-def _silu_mul(a, b):
-    k = KN._kern(("mf_silu",), name="kyojin_moe_silu_mul", input_names=["a", "b"], output_names=["h"], header="", source=_SILU)
+_SILU_OLD = "h[i] = half(av * (1.0f / (1.0f + metal::precise::exp(-av))) * float(b[i]));"
+
+
+def _act_src(act):
+    """Source of the elementwise activation kernel: act None = silu(a) * b (_SILU, unchanged); ("situ", scale_gate, scale_lin) = ((sg tanh(a / sg)) * sigmoid(a)) * (sl tanh(b / sl))."""
+    if act is None:
+        return _SILU
+    kind, sg, sl = act
+    assert kind == "situ" and sg > 0.0 and sl > 0.0 and _SILU.count(_SILU_OLD) == 1, act
+    return _SILU.replace(_SILU_OLD, f"h[i] = half((({float(sg)!r}f * metal::precise::tanh(av / {float(sg)!r}f)) * (1.0f / (1.0f + metal::precise::exp(-av)))) * ({float(sl)!r}f * metal::precise::tanh(float(b[i]) / {float(sl)!r}f)));")
+
+
+def _silu_mul(a, b, act=None):
+    k = KN._kern(("mf_silu",) + ((act,) if act else ()), name="kyojin_moe_silu_mul" + ("_situ" if act else ""), input_names=["a", "b"], output_names=["h"], header="", source=_act_src(act))
     return k(inputs=[a, b], grid=(a.size, 1, 1), threadgroup=(256, 1, 1), output_shapes=[a.shape], output_dtypes=[mx.float16])[0]
 
 
@@ -239,16 +251,96 @@ def _fused_call(self, x, defer=False):
     inds, scs, sgs = _select(lg, T, E, K, self.norm_topk_prob)
     x16 = x2 if x2.dtype == mx.float16 else x2.astype(mx.float16)
     tok, ar = _slot_rows(T * K, K)
-    a, b = sm.g.gather_pair(sm.u, x16, tok, inds) if sm.g.pair_ok(sm.u) else (sm.g.gather(x16, tok, inds), sm.u.gather(x16, tok, inds))
-    if GLU and sm.d.glu_ok():
-        y = sm.d.gather_glu(a, b, ar, inds)                 # silu(a) * b folded into the down projection's input staging
+    if sm.tile_ok():                                        # flag glmtile: gate | up | glu in one launch, then the down launch (tile-layout experts)
+        y = sm.d.gather(sm.tile_h(x16, tok, inds), ar, inds)
     else:
-        y = sm.d.gather(_silu_mul(a, b), ar, inds)
+        a, b = sm.g.gather_pair(sm.u, x16, tok, inds) if sm.g.pair_ok(sm.u) else (sm.g.gather(x16, tok, inds), sm.u.gather(x16, tok, inds))
+        if GLU and sm.d.glu_ok():
+            y = sm.d.gather_glu(a, b, ar, inds, getattr(sm, "act_kind", None))                 # silu(a) * b (or the SiTU kind) folded into the down projection's input staging
+        else:
+            y = sm.d.gather(_silu_mul(a, b, getattr(sm, "act_kind", None)), ar, inds)
     sh = self.shared_expert(x).reshape(T, H) if has_s else y
     ot = mx.float16 if MODE == "2" and x.dtype == mx.float16 else mx.float32
     if defer and has_s and ot == mx.float16 and sh.dtype == mx.float16 and y.dtype == mx.float16:
         return Pending(y, scs, sgs, sh, T, K, H, lead)
     return _combine(y, scs, sgs, sh, T, K, H, has_s, ot).reshape(*lead, H)
+
+
+class _SlotProbe(nn.Module):
+    """Stands in for switch_mlp while a block's router is read: records the expert ids and returns, for slot k, the k-th unit vector, so the block's own combine hands back its slot weights."""
+
+    def __init__(self, K, H):
+        super().__init__()
+        self.K, self.H, self.inds = K, H, None
+
+    def __call__(self, x, inds, *a, **k):
+        self.inds = inds
+        return mx.broadcast_to(mx.eye(self.K, self.H, dtype=x.dtype), (*inds.shape, self.H))
+
+
+class _ZeroShared(nn.Module):
+    def __call__(self, x, *a, **k):
+        return mx.zeros_like(x)
+
+
+_SEL_BIAS = ("expert_bias", "e_score_correction_bias", "router_bias", "correction_bias")      # attribute names a block uses for a selection / logit bias
+_SCORE_FN = ("scoring_func", "score_function", "gating_func", "gating", "router_act")         # attribute names a block uses for its score function
+
+
+def route_why(blk) -> str | None:
+    """None when the softmax routed kernel (router_select: softmax f32, top-k by value, optional renormalise) computes exactly what this block's own router computes; else the reason.
+    Generic: no model name. (1) What the block declares: `moe_gating` (dict: kind, bias, renorm; spec-driven blocks) or, for a stock block, a selection / logit bias, a score function other
+    than softmax, a routing scale, groups. (2) Positive proof for what it does not declare: the block's own __call__ runs on a fixed random input with its experts replaced by a slot probe,
+    and the expert ids and weights it produces must equal softmax -> top-k -> (renormalise iff blk.norm_topk_prob) of the same logits. A router that is sigmoid, biased or scaled fails there."""
+    d = getattr(blk, "moe_gating", None)
+    if isinstance(d, dict):
+        if d.get("kind") != "softmax":
+            return f"gating_{d.get('kind')}"
+        if d.get("bias"):
+            return "selection_bias"
+    for n in _SEL_BIAS:
+        if getattr(blk, n, None) is not None or getattr(getattr(blk, "gate", None), n, None) is not None:
+            return "selection_bias"
+    if getattr(blk, "use_expert_bias", False) or getattr(getattr(blk, "gate", None), "bias", None) is not None:
+        return "selection_bias"
+    for n in _SCORE_FN:
+        v = getattr(blk, n, None)
+        if isinstance(v, str) and v != "softmax":
+            return f"gating_{v}"
+    if getattr(blk, "n_group", 1) not in (None, 1) or getattr(blk, "routed_scaling_factor", 1.0) not in (None, 1.0):
+        return "grouped_or_scaled"
+    if not hasattr(blk, "norm_topk_prob"):
+        return "no_norm_topk_prob"
+    try:
+        K, E, w = blk.top_k, blk.num_experts, blk.gate.weight
+        H = w.shape[-1]
+        if H < K or w.shape != (E, H):
+            return "gate_shape"
+        saved = {n: getattr(blk, n) for n in ("switch_mlp", "shared_expert") if hasattr(blk, n)}
+        rec = _SlotProbe(K, H)
+        try:
+            blk.switch_mlp = rec
+            if "shared_expert" in saved:                                         # also a None shared expert: the stock call needs something callable there
+                blk.shared_expert = _ZeroShared()
+            x = mx.random.normal((1, 5, H), key=mx.random.key(7)).astype(mx.float32)
+            out = blk(x)
+            mx.eval(out, rec.inds)
+        finally:
+            for n, v in saved.items():
+                setattr(blk, n, v)
+        z = x.astype(mx.float32) @ w.astype(mx.float32).T
+        pr = mx.softmax(z, axis=-1)
+        inds = rec.inds
+        ref = mx.take_along_axis(pr, inds, axis=-1)
+        if blk.norm_topk_prob:
+            ref = ref / mx.sum(ref, axis=-1, keepdims=True)                      # the block's own flag, exactly what _select does
+        kth = mx.sort(pr, axis=-1)[..., -K:][..., :1]
+        got = out[..., :K].astype(mx.float32)
+        ok = mx.all(mx.take_along_axis(pr, inds, axis=-1) >= kth - 1e-6) & mx.all(mx.abs(got - ref) <= 2e-3 * mx.abs(ref) + 1e-6)
+        mx.eval(ok)
+        return None if bool(ok.item()) else "router_not_softmax"
+    except Exception as e:  # noqa: BLE001   (a block that cannot be read stays on its stock path)
+        return f"probe_failed:{type(e).__name__}"
 
 
 def install(model, log=print) -> int:
@@ -257,10 +349,21 @@ def install(model, log=print) -> int:
         return 0
     from . import foreign_linear as FL
     n = 0
+    refused: dict = {}
     for _, mod in model.named_modules():
         if isinstance(getattr(mod, "switch_mlp", None), FL.ForeignSwitchGLU) and hasattr(mod, "gate") and hasattr(mod, "top_k"):
             cls = mod.__class__
             if getattr(cls, "_foreign_moe", False):
+                continue
+            for g in (mod.gate, getattr(mod, "shared_expert_gate", None)):       # (the cast below, repeated here: the probe reads the router as the kernels will)
+                w = getattr(g, "weight", None)
+                if w is not None and w.dtype in (mx.bfloat16, mx.float16):
+                    g.weight = w.astype(mx.float32)
+            why = route_why(mod)
+            if why is not None:                                                  # a router the softmax kernel cannot compute exactly: the block keeps its own call
+                from . import fired as FD
+                FD.fb("foreign_moe", "router:" + why)
+                refused[why] = refused.get(why, 0) + 1
                 continue
             for g in (mod.gate, getattr(mod, "shared_expert_gate", None)):       # safetensors releases store the router in bf16 (GGUF: f32); the fused kernels read an f32 router
                 w = getattr(g, "weight", None)                                    # (E x H floats, ~1 MB a layer), else every block falls back to the stock call
@@ -268,6 +371,8 @@ def install(model, log=print) -> int:
                     g.weight = w.astype(mx.float32)
             mod.__class__ = type("Fused" + cls.__name__, (cls,), {"__call__": _fused_call, "_deferred_call": _deferred_call, "_stock_call": cls.__call__, "_foreign_moe": True})
             n += 1
+    if refused:
+        log(f"[foreign] foreign_moe: {sum(refused.values())} MoE blocks left on their own call, router the softmax kernel cannot compute exactly: {refused}")
     if n:
         log(f"[foreign] foreign_moe: {n} MoE blocks run router / experts / combine in fused launches")
     return n

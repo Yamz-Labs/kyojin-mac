@@ -169,7 +169,7 @@ def _armed_blk(wa, wm, R):
 
 
 def test_ablit_hook_sits_before_the_one_launch_expand(monkeypatch):
-    """The refusal-direction projection (commit 18ad409) is applied to the sub-layer output BEFORE hc_expand, whichever expand runs: the stage's
+    """The direction projection (commit 18ad409) is applied to the sub-layer output BEFORE hc_expand, whichever expand runs: the stage's
     expand receives the projected y, for the attention tail (stage_out) and for the FFN tail (stage_ffn)."""
     D = 128
     rng = np.random.default_rng(5)

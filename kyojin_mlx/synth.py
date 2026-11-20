@@ -31,6 +31,16 @@ DS_CFG = dict(
 
 DS_PLAIN = dict(DS_CFG, num_hidden_layers=7, compress_ratios=[0, 0, 2, 2, 1, 1, 1])        # odd split: ced.explain refuses
 
+# GLM-5.3 (glm5_next): one KDA layer, then four sparse-attention layers of which two carry no indexer (indexer_types "shared": they reuse the top-k of the
+# nearest earlier "full" layer). index_topk 8 / kpool 2 = 4 pools, so a prompt of 30 tokens (15 pools) makes the selection a real cut.
+GLM_CFG = dict(
+    model_type="glm5_next_text", vocab_size=96, hidden_size=64, intermediate_size=96, moe_intermediate_size=32, num_hidden_layers=5, num_nextn_predict_layers=0,
+    num_attention_heads=4, num_key_value_heads=4, n_shared_experts=1, n_routed_experts=8, num_experts_per_tok=2, kv_lora_rank=32, q_lora_rank=32,
+    qk_rope_head_dim=0, v_head_dim=16, qk_nope_head_dim=16, index_topk=8, index_head_dim=16, index_n_heads=4, index_kpool=2, first_k_dense_replace=1,
+    hc_mult=2, hc_sinkhorn_iters=4, max_position_embeddings=4096,
+    layer_types=["linear_attention"] + ["deepseek_sparse_attention"] * 4, indexer_types=["full", "full", "shared", "full", "shared"],
+    linear_attn_config=dict(head_dim=16, num_heads=4, short_conv_kernel_size=4, kda_layers=[1], full_attn_layers=[2, 3, 4, 5]))
+
 Q_CFG = dict(
     model_type="qwen3_5_text", hidden_size=64, num_hidden_layers=4, intermediate_size=96, num_attention_heads=4, num_key_value_heads=2, head_dim=16,
     linear_num_value_heads=4, linear_num_key_heads=2, linear_key_head_dim=16, linear_value_head_dim=16, linear_conv_kernel_dim=4, vocab_size=64,
@@ -59,6 +69,8 @@ SHAPES = {
                         ("<｜end▁of▁sentence｜>",)),
     "ds_moe_plain": Shape("ds_moe_plain", "ds", True, False, {"model_type": "deepseek_v41", "architectures": ["DeepseekV41ForCausalLM"], "text_config": DS_PLAIN},
                           ("<｜end▁of▁sentence｜>",)),
+    "glm_shared": Shape("glm_shared", "ds", True, False, {"model_type": "glm5_next", "architectures": ["Glm5NextForConditionalGeneration"], "text_config": GLM_CFG},
+                        ("<|endoftext|>", "<|user|>", "<|observation|>")),
     "q35_dense": Shape("q35_dense", "q35", False, False, {"model_type": "qwen3_5", "architectures": ["Qwen3_5ForCausalLM"], "text_config": Q_CFG},
                        ("<|im_end|>", "<|endoftext|>")),
     "q35_moe": Shape("q35_moe", "q35", True, False, {"model_type": "qwen3_5_moe", "architectures": ["Qwen3_5MoeForCausalLM"], "text_config": Q_MOE},
@@ -117,12 +129,25 @@ def _tokenizer_files(path: str, shape: Shape) -> None:
     json.dump({"chat_template": "{% for m in messages %}{{ m['content'] }}{% endfor %}"}, open(os.path.join(path, "tokenizer_config.json"), "w"))
 
 
+def _pack_name(shape: Shape, k: str) -> str:
+    """Tensor name in the pack: the model's own name under `language_model.` (DS4.1), or the checkpoint's `model.language_model.` / `lm_head` layout (GLM-5.3)."""
+    if shape.family != "ds":
+        return k
+    if shape.config["model_type"] == "glm5_next":
+        k = "model.language_model." + k[len("model."):] if k.startswith("model.") else k
+        for site in ("attn", "ffn"):                                                   # the checkpoint stores `.hc_attn_fn`, the model keeps `.attn_hc.fn`
+            for n in ("fn", "base", "scale"):
+                k = k.replace(f".{site}_hc.{n}", f".hc_{site}_{n}")
+        return k
+    return "language_model." + k
+
+
 def write_pack(shape: Shape, path: str, seed: int = 0):
     """Write `shape` as a pack directory (config.json, model.safetensors with the model's own tensor names, tokenizer files). Returns the reference
     (model, lm, make_cache) the pack was written from."""
     os.makedirs(path, exist_ok=True)
     model, lm, mk = build_reference(shape, seed)
-    flat = {("language_model." + k if shape.family == "ds" else k): v for k, v in tree_flatten((model.language_model if shape.family == "ds" else model).parameters())}
+    flat = {_pack_name(shape, k): v for k, v in tree_flatten((model.language_model if shape.family == "ds" else model).parameters())}
     mx.save_safetensors(os.path.join(path, "model.safetensors"), flat, {"format": "mlx"})
     json.dump(shape.config, open(os.path.join(path, "config.json"), "w"))
     _tokenizer_files(path, shape)

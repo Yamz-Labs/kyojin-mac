@@ -22,7 +22,8 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .chat import ChatError, FAMILIES, family_of, render_resume, token_cuts
+from .chat import ChatError, FAMILIES, GGUF_ARCH_FAMILIES, family_of, render_resume, think_tags, think_token_ids, token_cuts
+from .engine import SessionRefused
 from .sampling import Sampling
 from .tokinc import IncTok
 from . import autoconfig
@@ -283,6 +284,8 @@ def make_handler(app: App):
                     self._send(200, {"tokens": ids, "count": len(ids)})
                 else:
                     self._error(404, f"no such endpoint: {path}")
+            except SessionRefused as exc:                          # a one-session backend (Hy4 delivery A) with its session live
+                self._error(503, str(exc))
             except (ChatError, ValueError) as exc:
                 self._error(400, str(exc))
             except (BrokenPipeError, ConnectionResetError):
@@ -478,7 +481,7 @@ def make_handler(app: App):
                 the text so far. Once per reply; False = the caller ends the reply."""
                 nonlocal handle, n_carry
                 limit = app.max_tokens(body)
-                close = app.encode(LG.THINK_CLOSE)
+                close = app.encode(think_tags(app.family)[1])          # the family's close tag (</think>, Hy4 </think:6124c78e>)
                 if limit is not None and len(lg.gen) + len(close) >= limit:
                     return False
                 if not lg.closes():
@@ -789,28 +792,43 @@ def build_app(args, log=print):
         from .. import ablit as AB
         src, out = os.environ["KYOJIN_ABLIT_MU_JOB"].split(":")
         AB.mu_job(backend, src, out, log=log)
+    if getattr(backend, "one_session", None):                      # Hy4 delivery A: one live session, no prefix snapshots (the Engram history is the model's, not the cache's)
+        if args.sessions not in (None, 1) or args.prefix_cache_mb:
+            log(f"{backend.kind}: one session, no prefix cache (--sessions {args.sessions} / --prefix-cache-mb {args.prefix_cache_mb} ignored)")
+        args.sessions, args.prefix_cache_mb = 1, 0
     if args.sessions is None:
         args.sessions = _auto_sessions(backend, kv_budget, log)
+    if args.sessions > backend.max_rows:                             # a backend that decodes fewer rows at once (Hy4: 1): the extra requests queue for the slot
+        log(f"{backend.kind}: --sessions {args.sessions} -> {backend.max_rows} (rows decoded at once); further requests queue")
+        args.sessions = backend.max_rows
     engine = Engine(backend, sessions=args.sessions, ctx=args.ctx, chunk=args.prefill_chunk, block=args.prefix_block,
                     prefix_bytes=int(args.prefix_cache_mb * 2 ** 20), decode_per_chunk=args.decode_per_chunk, log=log,
                     mtp_depth=args.mtp_depth, kv_budget=kv_budget, row_cost=args.row_cost, draft_cost=args.draft_cost, disk=disk,
-                    spec_costs=spec_costs, depth_override=int(os.environ["KYOJIN_MTP_FIXED"]) if os.environ.get("KYOJIN_MTP_FIXED") else None)
+                    spec_costs=spec_costs, depth_override=int(os.environ["KYOJIN_MTP_FIXED"]) if os.environ.get("KYOJIN_MTP_FIXED") else getattr(backend, "default_fixed_depth", None))
     model_id = args.model_id or Path(args.model.rstrip("/")).name
-    stops = stop_token_ids(args.model, cfg, tok, fam_name)
+    stops = stop_token_ids(args.model, cfg, tok, fam_name) | set(getattr(backend, "stop_ids", ()))     # Hy4: the GGUF eos (120025)
     bos = cfg.get("bos_token_id", cfg.get("text_config", {}).get("bos_token_id"))
     engine.bad_ids = frozenset({bos} - stops) if isinstance(bos, int) else frozenset()
-    tg = [tok.convert_tokens_to_ids(x) for x in ("<think>", "</think>")]   # flag spec_typical_phase: the think tags, when the tokenizer has them as single tokens
-    if all(isinstance(i, int) and i >= 0 and i != tok.unk_token_id for i in tg):
-        engine.think_ids = (tg[0], tg[1])
+    wire_think_ids(engine, tok, family)
     engine.detok = lambda ids: tok.decode(ids, skip_special_tokens=False)   # flag spec_typical_cooldown: the line signal reads the session's text
     app = App(engine, tok, family, model_id, defaults, stops, log)
     return app
 
 
+def wire_think_ids(engine, tok, family) -> None:
+    """Flag spec_typical_phase: engine.think_ids = the token ids of the family's think tags (<think> / </think>; Hy4 <think:6124c78e> 120029 /
+    </think:6124c78e> 120030) when the tokenizer has each as one token; untouched (None: no thinking phase) otherwise."""
+    tg = think_token_ids(tok, family)
+    if tg is not None:
+        engine.think_ids = tg
+
+
 def _family_name(model: str, cfg: dict) -> str:
     """Chat family of the pack. A bare GGUF of a mapped architecture without a modeldesc row gets the generic family (the file's own chat template and stop ids)."""
     from .. import modeldesc
-    mt = cfg.get("model_type", "")
+    if cfg.get("gguf_architecture") in GGUF_ARCH_FAMILIES:            # a skeleton serve dir (gguf_serve_dir) of an architecture with its own chat family (hy_v4_flash), rows on or off
+        return GGUF_ARCH_FAMILIES[cfg["gguf_architecture"]]
+    mt = modeldesc.model_key(cfg)                                     # rows on: the hy_v4_flash row (server "hy4") gives the same family
     if modeldesc.backend_desc(mt) is None:
         from .. import foreign_linear as FL
         if FL.is_foreign(model) == "gguf":
@@ -889,8 +907,7 @@ def _row_kv(model: str) -> str | None:
     """kv field of the modeldesc row of a pack directory (None: no config.json / no row)."""
     try:
         from .. import modeldesc
-        mt = json.load(open(os.path.join(model, "config.json"))).get("model_type", "")
-        row = modeldesc.backend_desc(mt)
+        row = modeldesc.backend_desc(modeldesc.model_key(json.load(open(os.path.join(model, "config.json")))))
         return row.kv if row is not None else None
     except (OSError, ValueError):
         return None
@@ -943,6 +960,8 @@ def main(argv=None):
         sys.stdout.write("\n")
         return
     log = lambda *a: print(time.strftime("%H:%M:%S"), *a, file=sys.stderr, flush=True)   # noqa: E731
+    from .. import fired as FD
+    FD.start_reporter(log)                                          # flag audit: fire / fallback counters, one line per minute of activity in this log (and in /v1/stats engage)
     app = build_app(args, log)                                     # the model is loaded on this thread, so the engine loop runs on it too
     srv = Server((args.host, args.port), make_handler(app))        # (MLX streams are per thread: a lazy array cannot cross threads)
     threading.Thread(target=srv.serve_forever, name="http", daemon=True).start()

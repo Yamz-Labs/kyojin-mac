@@ -9,8 +9,8 @@ report are copied unchanged (plan.py differs only by per-scale estimates and the
 Output `<repo>/qualify_out/<pack>/mlx/{REPORT.md,qualify.json,<stage>.json,qualify.log,srv_*.log}`. `--scale` defaults by installed memory (< 64 GB = air).
 Every GPU job (parity, kv, maxctx, serve+smoke) takes `~/kyojin-mlx/.gpu.lock` (flock = the same lock as `lockf -k`; ONE heavy job at a time), checks free
 memory (`memory_pressure`) before it starts, keeps the Mac awake with `caffeinate -ims -w <server pid>` (never -d / -u), samples the server footprint with
-`top` (never ps RSS), and fails a probe that exceeds `--mem-cap-gib` (13 on the Air = the macguard rule). Servers are started and killed by PID only;
-readiness = `GET /health` == 200; a probe the guard TERMed is reported as "killed by macguard", not as a model failure.
+`top` (never ps RSS), and fails a probe that exceeds `--mem-cap-gib` (13 on the Air = the memory guard rule). Servers are started and killed by PID only;
+readiness = `GET /health` == 200; a probe the guard TERMed is reported as "killed by memory guard", not as a model failure.
 
 ## Stages and which MLX tool each one reuses
 | stage | what | MLX implementation (reused tool) | generic / per-arch |

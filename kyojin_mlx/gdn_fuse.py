@@ -16,6 +16,7 @@ NSG = int(os.environ.get("KYOJIN_GDN_FUSE_NSG", "16"))      # simdgroups per thr
 _SRC = r"""
     constexpr int LB = 32;
     uint hv = threadgroup_position_in_grid.y;
+    uint bi = threadgroup_position_in_grid.z;      // batch row (B > 1: one launch for all rows; per-row arithmetic unchanged)
     uint sg = thread_position_in_threadgroup.y;
     uint l = thread_index_in_simdgroup;
     uint hk = hv / (HV / HK);
@@ -38,7 +39,7 @@ _SRC = r"""
         for (int i = 0; i < 4; i++) {
             uint c = c0 + i;
             float x[4];
-            for (int j = 0; j < 4; j++) { uint r = t + j; x[j] = (r < 3) ? (float)cs[r * C + c] : (float)qkv[(r - 3) * qkv_strides[1] + c]; }
+            for (int j = 0; j < 4; j++) { uint r = t + j; x[j] = (r < 3) ? (float)cs[bi * cs_strides[0] + r * C + c] : (float)qkv[bi * qkv_strides[0] + (r - 3) * qkv_strides[1] + c]; }
             float acc = (float)w[c * 4] * x[0];
             acc += (float)w[c * 4 + 1] * x[1]; acc += (float)w[c * 4 + 2] * x[2]; acc += (float)w[c * 4 + 3] * x[3];
             float cv = (float)(T)acc;
@@ -46,27 +47,40 @@ _SRC = r"""
             float sgm = (float)(T)((cv < 0.0f) ? se : 1.0f - se);
             y[i] = (float)(T)(cv * sgm);
             if (t == 0 && (part == 2 || own_qk)) {
-                for (uint r = 0; r < 3; r++) cn[r * C + c] = (r + S < 3) ? cs[(r + S) * C + c] : qkv[(r + S - 3) * qkv_strides[1] + c];
+                for (uint r = 0; r < 3; r++) cn[bi * 3 * C + r * C + c] = (r + S < 3) ? cs[bi * cs_strides[0] + (r + S) * C + c] : qkv[bi * qkv_strides[0] + (r + S - 3) * qkv_strides[1] + c];
             }
         }
         if (part < 2) {
             float ss = 0.0f;
             for (int i = 0; i < 4; i++) ss += y[i] * y[i];
             ss = simd_sum(ss);
+            if (QW4) {      // Qwen4 stock: q * rsqrt(sum(q^2) + 1e-6) (each step rounded to T), then q * 128^-0.5 (k unscaled)
+                float s2 = 0.0f;
+                for (int i = 0; i < 4; i++) s2 += (float)(T)(y[i] * y[i]);
+                s2 = (float)(T)simd_sum(s2);
+                float rs = (float)(T)metal::precise::rsqrt((float)(T)(s2 + 1e-6f));
+                for (int i = 0; i < 4; i++) {
+                    y[i] = (float)(T)(y[i] * rs);
+                    if (part == 0) y[i] = (float)(T)(y[i] * (float)(T)0.08838834764831845f);
+                }
+            } else {
             float r = metal::precise::rsqrt(ss / 128.0f + eps[0]);
             float sc = (float)(T)(part == 0 ? 0.0078125f : 0.08838834764831845f);
             for (int i = 0; i < 4; i++) y[i] = (float)(T)(sc * (float)(T)(y[i] * r));
+            }
         }
         threadgroup T* dst = part == 0 ? sh_q : (part == 1 ? sh_k : sh_v);
         for (int i = 0; i < 4; i++) dst[t * 128 + 4 * l + i] = (T)y[i];
     }
     if (sg == NSG - 1 && l == 0) {
         for (uint t = 0; t < S; t++) {
-            float bb = (float)bv[t * bv_strides[1] + hv];
+            float bb = (float)bv[bi * bv_strides[0] + t * bv_strides[1] + hv];
             float be = 1.0f / (1.0f + metal::precise::exp(metal::abs(bb)));
             sh_b[t] = (T)((bb < 0.0f) ? be : 1.0f - be);
-            float xs = (float)(T)((float)av[t * av_strides[1] + hv] + (float)dtb[hv]);
-            float sp = (float)(T)(max(xs, 0.0f) + metal::precise::log(1.0f + metal::precise::exp(-metal::abs(xs))));
+            float xs = (float)av[bi * av_strides[0] + t * av_strides[1] + hv] + (float)dtb[hv];         // DTF32: dt_bias stored f32 -> a + dt_bias and softplus stay f32 (stock promotion)
+            if (!DTF32) xs = (float)(T)xs;
+            float sp = max(xs, 0.0f) + metal::precise::log(1.0f + metal::precise::exp(-metal::abs(xs)));
+            if (!DTF32) sp = (float)(T)sp;
             sh_g[t] = metal::precise::exp(-metal::precise::exp(Al[hv]) * sp);
         }
     }
@@ -81,7 +95,7 @@ _SRC = r"""
         uint row_in = l / LPR;
         uint lir = l & (LPR - 1);
         uint dv = sg * RPS + row_in;
-        uint n = hv;
+        uint n = bi * HV + hv;
         const device float* i_state = state_in + (n * 128 + dv) * 128 + lir * EPL;
         device float* o_state = state_out + (n * 128 + dv) * 128 + lir * EPL;
         float state[EPL];
@@ -111,6 +125,7 @@ _SRC = r"""
             o += simd_shuffle_xor(o, 2);
             if (LPR == 8) o += simd_shuffle_xor(o, 4);
             if (lir == 0) sh_y[t * 128 + dv] = (T)o;
+            STEPSTORE
         }
         for (int i = 0; i < EPL; ++i) o_state[i] = state[i];
     }
@@ -119,7 +134,7 @@ _SRC = r"""
     // phase C: gated RMS norm, one simdgroup per row
     for (uint t = sg; t < S; t += NSG) {
         const threadgroup T* hp = sh_y + t * 128 + 4 * l;
-        const device T* zp = z + t * z_strides[1] + hv * 128 + 4 * l;
+        const device T* zp = z + bi * z_strides[0] + t * z_strides[1] + hv * 128 + 4 * l;
         float xs[4];
         float acc = 0.0f;
         for (int i = 0; i < 4; i++) { xs[i] = (float)hp[i]; acc += xs[i] * xs[i]; }
@@ -129,7 +144,8 @@ _SRC = r"""
             float o = (float)(T)((float)w2[4 * l + i] * (xs[i] * nrm));
             float gt = (float)zp[i];
             float e = 1.0f / (1.0f + metal::precise::exp(metal::abs(gt)));
-            float s = (float)(T)(gt * ((gt < 0.0f) ? e : 1.0f - e));
+            float sg0 = (gt < 0.0f) ? e : 1.0f - e;
+            float s = QW4 ? sg0 : (float)(T)(gt * sg0);      // Qwen4: sigmoid gate in fp32, product in fp32 then one cast; stock Qwen3.5: silu rounded to T
             float res = s * o;
             if (FP16) res = metal::clamp(res, -65504.0f, 65504.0f);
             OUTSTORE
@@ -145,19 +161,20 @@ _CAP = """
     }
     if (sg == 0 && l < S) { g[l * HV + hv] = sh_g[l]; beta[l * HV + hv] = sh_b[l]; }
 """
+_STEP = """if (t + 1 < S) { device float* ss_ = ss + (((t * HV + hv) * 128 + dv) * 128 + lir * EPL); for (int i = 0; i < EPL; ++i) ss_[i] = state[i]; }"""      # the state after row t (B == 1): what a partial accept keeps
 _TREE = "(NP == 8 ? ((part[0] + part[1]) + (part[2] + part[3])) + ((part[4] + part[5]) + (part[6] + part[7])) : ((part[0] + part[1]) + (part[2] + part[3])))"
 _k = {}
 _eps = {}
 
 
-def _kernel(perm, capture):
-    key = (perm, capture)
+def _kernel(perm, capture, steps=False):
+    key = (perm, capture, steps)
     if key not in _k:
-        store = ("out[t * (HV * 128) + inv[hv * 128 + 4 * l + i]] = (T)res;" if perm else "out[t * (HV * 128) + hv * 128 + 4 * l + i] = (T)res;")
-        src = _SRC.replace("OUTSTORE", store).replace("CAPTURE", _CAP if capture else "").replace("TREE", _TREE)
+        store = ("out[(bi * S + t) * (HV * 128) + inv[hv * 128 + 4 * l + i]] = (T)res;" if perm else "out[(bi * S + t) * (HV * 128) + hv * 128 + 4 * l + i] = (T)res;")
+        src = _SRC.replace("STEPSTORE", _STEP if steps else "").replace("OUTSTORE", store).replace("CAPTURE", _CAP if capture else "").replace("TREE", _TREE)
         names = ["qkv", "cs", "w", "av", "bv", "Al", "dtb", "eps", "state_in", "z", "w2", "nw"] + (["inv"] if perm else [])
-        outs = ["out", "cn", "state_out"] + (["q", "k", "v", "g", "beta"] if capture else [])
-        _k[key] = mx.fast.metal_kernel(name="kyojin_gdn_fuse" + ("_p" if perm else "") + ("_c" if capture else ""), input_names=names, output_names=outs,
+        outs = ["out", "cn", "state_out"] + (["q", "k", "v", "g", "beta"] if capture else []) + (["ss"] if steps else [])
+        _k[key] = mx.fast.metal_kernel(name="kyojin_gdn_fuse" + ("_p" if perm else "") + ("_c" if capture else "") + ("_s" if steps else ""), input_names=names, output_names=outs,
                                        source=src, header="#pragma METAL fp contract(off)\n", ensure_row_contiguous=False)
     return _k[key]
 
@@ -169,18 +186,22 @@ def _e(x):
     return r
 
 
-def fused_step(qkv, z, a, b, cs, state, conv_w, A_log, dt_bias, norm_w, norm_eps, hk, hv, inv=None, capture=False):
+def fused_step(qkv, z, a, b, cs, state, conv_w, A_log, dt_bias, norm_w, norm_eps, hk, hv, inv=None, capture=False, qw4=False, steps=False):
     """qkv [1,S,C], z [1,S,hv,128], a / b [1,S,hv], cs [1,3,C], state [1,hv,128,128] f32 -> (out [1,S,hv*128], conv state [1,3,C], state[, q, k, v, g, beta]).
     out is written permuted through inv (uint32 [hv * 128]) when given (the V-tiled out_proj input)."""
-    S, C = qkv.shape[1], qkv.shape[-1]
+    B, S, C = qkv.shape[0], qkv.shape[1], qkv.shape[-1]
+    assert B == 1 or not (capture or steps)
     T = qkv.dtype
-    outs = [(1, S, hv * 128), (1, 3, C), state.shape]
+    outs = [(B, S, hv * 128), (B, 3, C), state.shape]
     dts = [T, T, mx.float32]
     if capture:
         outs += [(1, S, hk, 128), (1, S, hk, 128), (1, S, hv, 128), (1, S, hv), (1, S, hv)]
         dts += [T, T, T, mx.float32, T]
+    if steps:
+        outs += [(S - 1, hv, 128, 128)]
+        dts += [mx.float32]
     ins = [qkv, cs, conv_w, a, b, A_log, dt_bias, _e(1e-6 / 128.0), state, z, norm_w, _e(norm_eps)]
     if inv is not None:
         ins.append(inv)
-    return _kernel(inv is not None, capture)(inputs=ins, template=[("T", T), ("C", C), ("S", S), ("HK", hk), ("HV", hv), ("FP16", 1 if T == mx.float16 else 0), ("NSG", NSG)],
-                                             grid=(32, NSG * hv, 1), threadgroup=(32, NSG, 1), output_shapes=outs, output_dtypes=dts)
+    return _kernel(inv is not None, capture, steps)(inputs=ins, template=[("T", T), ("C", C), ("S", S), ("HK", hk), ("HV", hv), ("FP16", 1 if T == mx.float16 else 0), ("NSG", NSG), ("QW4", 1 if qw4 else 0), ("DTF32", 1 if dt_bias.dtype == mx.float32 else 0)],
+                                             grid=(32, NSG * hv, B), threadgroup=(32, NSG, 1), output_shapes=outs, output_dtypes=dts)

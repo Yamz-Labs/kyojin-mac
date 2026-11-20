@@ -11,6 +11,7 @@ A type outside DEQUANT raises GgufTypeError naming it: nothing is guessed."""
 from __future__ import annotations
 
 import mmap
+import re
 import os
 import struct
 
@@ -30,12 +31,39 @@ TYPES = {
     19: ("IQ1_S", 256, 50), 20: ("IQ4_NL", 32, 18), 21: ("IQ3_S", 256, 110), 22: ("IQ2_S", 256, 82), 23: ("IQ4_XS", 256, 136),
     24: ("I8", 1, 1), 25: ("I16", 1, 2), 26: ("I32", 1, 4), 27: ("I64", 1, 8), 28: ("F64", 1, 8), 29: ("IQ1_M", 256, 56), 30: ("BF16", 1, 2),
     34: ("TQ1_0", 256, 54), 35: ("TQ2_0", 256, 66), 39: ("MXFP4", 32, 17), 40: ("NVFP4", 64, 36),
+    43: ("F8_E4M3", 1, 1),          # one e4m3fn byte per element, no block scale (gguf-py GGML_QUANT_SIZES (1, 1)); decoded by row (F8_E4M3_TAB)
 }
 NAME_TO_ID = {v[0]: k for k, v in TYPES.items()}
-DEQUANT = ("F32", "F16", "BF16", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "Q4_K", "Q5_K", "Q6_K", "IQ3_XXS", "IQ3_S", "IQ4_NL", "IQ4_XS", "MXFP4", "NVFP4",
-           "Q8_1", "Q2_K", "Q3_K", "Q8_K", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ1_S", "IQ1_M", "TQ1_0", "TQ2_0")
+# The second layout written under id 43 (unsloth DS4.1 UD GGUFs: per_layer_token_embd [256 x 768022850], 264 bytes a row, shard 8 = 192 + 264 rows bytes):
+# blocks of 32 values, each one e8m0 scale byte then 32 e4m3fn bytes (value = e4m3 * 2^(s - 127)), the same bytes as the safetensors table
+# (.engram.embed.weight + .scale) interleaved. Hy4-flash keeps the plain (1, 1) layout (shard 2 = 192 + 96 rows bytes). Which one a file uses is read
+# from the tensor's byte span in its file (GgufFile._f8_layout), never from a name.
+F8_E4M3_B32 = ("F8_E4M3_B32", 32, 33)
+# ids that upstream ggml.h / gguf-py constants.py define (llama.cpp master of 16/11) and this reader has no decoder or kernel for: only the block size is known, so the
+# tensor can be sized and counted; reading it fails with its id and name (TensorInfo.known False). id: (name, block elements, block bytes)
+UPSTREAM_ONLY = {41: ("Q1_0", 128, 18), 42: ("Q2_0", 64, 18)}
+DEQUANT = ("F32", "F16", "BF16", "Q2_0", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "Q4_K", "Q5_K", "Q6_K", "IQ3_XXS", "IQ3_S", "IQ4_NL", "IQ4_XS", "MXFP4", "NVFP4",
+           "Q8_1", "Q2_K", "Q3_K", "Q8_K", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ1_S", "IQ1_M", "TQ1_0", "TQ2_0", "F8_E4M3", "F8_E4M3_B32")
+ROW_ONLY = ("F8_E4M3", "F8_E4M3_B32")          # decoded by row only (MappedRows, dequant on raw rows): a whole tensor of them is refused by tensor_f32 and the dense load path
+                                # (no scale is read with it, so a weight or norm of this type would load silently unscaled: refusing keeps it loud)
 KERNEL_TYPES8 = ("Q8_0",)                                               # read as stored only with flag fp8stored (foreign_linear.fp8stored)
 KERNEL_TYPESK = ("Q5_K", "Q6_K", "IQ4_XS", "Q3_K", "IQ3_S", "IQ3_XXS", "Q2_K", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ1_S", "IQ1_M")                              # read as stored only with flag kstored (foreign_linear.kstored)
+def legacy5_stored() -> bool:
+    """Flag KYOJIN_LEGACY5_STORED (default 0, read at load): Q4_1 / Q5_0 / Q5_1 matrices with k % 256 == 0 stay as stored (KERNEL_TYPES5, foreign_metal q4_1 / q5_0 / q5_1).
+    Off until tests/test_legacy5_metal.py has passed on the GPU (gpu_archkit/q5_types_metal.sh)."""
+    return os.environ.get("KYOJIN_LEGACY5_STORED", "0") not in ("0", "")
+
+
+def q2_0_stored() -> bool:
+    """Flag KYOJIN_Q2_0_STORED (default 0, read at load): GGML type id 42 (Q2_0: 64 weights = fp16 d + 16 bytes of 2-bit codes, w = (q - 1) d) is a known weight type
+    (reader, exact dequant) and its matrices with k % 64 == 0 stay as stored (KERNEL_TYPES2, foreign_metal q2_0). Off: id 42 is an unknown type id, as before."""
+    return os.environ.get("KYOJIN_Q2_0_STORED", "0") not in ("0", "")
+
+
+TYPES_OPT = {42: ("Q2_0", 64, 18)}                                        # ids known only while flag q2_0_stored is set (UPSTREAM_ONLY says the same numbers)
+NAME_TO_ID["Q2_0"] = 42                                                   # the name -> id map of writers (foreign_synth); readers go through TensorInfo, which keeps id 42 unknown while the flag is off
+KERNEL_TYPES2 = ("Q2_0",)                                                 # 2-bit 64-blocks with a stored kernel behind flag q2_0_stored (default off)
+KERNEL_TYPES5 = ("Q4_1", "Q5_0", "Q5_1")                                  # legacy 32-blocks with a stored kernel behind flag legacy5_stored (foreign_linear.legacy5_stored), default off
 KERNEL_TYPES = ("Q4_0", "Q4_K", "IQ4_NL", "MXFP4", "NVFP4")           # types the Metal kernels read as stored (after a bit re-ordering)
 KVALUES_IQ4NL = np.array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113], np.float32)
 KVALUES_FP4 = np.array([0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12], np.float32)       # doubled E2M1 (ggml-common.h kvalues_fp4)
@@ -97,13 +125,24 @@ class _Cur:
 
 
 class TensorInfo:
-    __slots__ = ("name", "ne", "type", "offset", "nbytes", "tname")
+    __slots__ = ("name", "ne", "type", "offset", "nbytes", "tname", "known")
 
     def __init__(self, name, ne, type_, offset):
         self.name, self.ne, self.type, self.offset = name, tuple(ne), type_, offset
-        if type_ not in TYPES:
-            raise GgufTypeError(f"tensor {name}: ggml type id {type_} is not in the type table of this reader")
-        self.tname, be, bb = TYPES[type_]
+        self.known = type_ in TYPES or (type_ in TYPES_OPT and q2_0_stored())
+        if not self.known:                      # not an error of the file: reading THIS tensor fails (type_error), the other tensors and the header stay readable
+            self.tname = f"ID{type_}"
+            up = UPSTREAM_ONLY.get(type_)
+            if up is None:
+                self.nbytes = 0                  # size unknown
+                return
+            _, be, bb = up
+            n = int(np.prod(self.ne, dtype=np.int64))
+            if n % be or self.ne[0] % be:
+                raise GgufError(f"tensor {name}: row length {self.ne[0]} is not a multiple of the block of {be} of type id {type_} ({up[0]} upstream)")
+            self.nbytes = n // be * bb
+            return
+        self.tname, be, bb = TYPES[type_] if type_ in TYPES else TYPES_OPT[type_]
         n = int(np.prod(self.ne, dtype=np.int64))
         if n % be:
             raise GgufError(f"tensor {name}: {n} elements is not a multiple of the {self.tname} block of {be}")
@@ -111,15 +150,46 @@ class TensorInfo:
             raise GgufError(f"tensor {name}: row length {self.ne[0]} is not a multiple of the {self.tname} block of {be}")
         self.nbytes = n // be * bb
 
+    def type_error(self) -> "GgufTypeError":
+        up = UPSTREAM_ONLY.get(self.type)
+        return GgufTypeError(f"tensor {self.name}: ggml type id {self.type} is not in the type table of this reader" + (
+            f" (upstream ggml names it {up[0]}: {up[1]} weights in {up[2]} bytes; no decoder and no kernel here)" if up else " (not in upstream ggml.h either as far as this reader knows)"))
+
     @property
     def shape(self):
         """numpy order (slowest first): [.., n, k]."""
         return tuple(reversed(self.ne))
 
 
+def kv_counts(v):
+    """An expert count key (expert_count / expert_used_count) is a scalar or, in a per-layer file, an array. -> (min, max, per_layer list or None); None -> (0, 0, None)."""
+    if v is None:
+        return 0, 0, None
+    if isinstance(v, (list, tuple)) or (isinstance(v, np.ndarray) and v.ndim >= 1):         # a 1-D array (before: int() raised TypeError on it)
+        vals = [int(x or 0) for x in (v.tolist() if isinstance(v, np.ndarray) else v)]
+        return (min(vals), max(vals), vals) if vals else (0, 0, None)
+    return int(v or 0), int(v or 0), None
+
+
+def kv_count_uniform(v, key="expert count"):
+    """Scalar form of an expert count key for the engine tables that map ONE value per model: a scalar, or an array whose values are all equal. Differing per-layer values are
+    refused with a clear error (never an int() crash, never one layer's value taken for all)."""
+    lo, hi, vals = kv_counts(v)
+    if vals is not None and lo != hi:
+        raise GgufError(f"GGUF {key} is per-layer ({lo}..{hi} over {len(vals)} layers): the mapped classes take one value for every layer")
+    return hi
+
+
+_SHARD_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$")
+
+
 class GgufFile:
-    def __init__(self, path):
+    """One GGUF file, or a complete split shard set (llama.cpp gguf-split) seen as ONE logical file: kv from shard 1, `tensors` of every shard,
+    `raw()` maps the bytes from the shard that holds the tensor (same zero-copy mmap view as a single file). `_shard=True` is internal (a member of a set)."""
+
+    def __init__(self, path, _shard=False):
         self.path = str(path)
+        self._owner = {}        # tensor name -> member GgufFile; empty for a single file
         self._f = open(self.path, "rb")
         size = os.fstat(self._f.fileno()).st_size
         self._mm = mmap.mmap(self._f.fileno(), 0, access=mmap.ACCESS_READ) if size else None
@@ -152,35 +222,107 @@ class GgufFile:
         if al <= 0 or al & (al - 1):
             raise GgufError(f"general.alignment {al}")
         self.data_start = (c.p + al - 1) // al * al
+        self._f8_layout(size, al)
         for ti in self.tensors.values():
             if self.data_start + ti.offset + ti.nbytes > size:
                 raise GgufError(f"tensor {ti.name}: data past the end of the file")
+        self._members = []
+        if not _shard and int(self.kv.get("split.count", 1) or 1) > 1:
+            self._attach_shards()
+
+    def _f8_layout(self, size, al):
+        """Type id 43 has two layouts in the wild (F8_E4M3 plain, F8_E4M3_B32 with an e8m0 scale a 32-block): the span the tensor owns in its file
+        (up to the next tensor or the end of the file, less alignment) picks one; a span that fits neither keeps the plain size (the end check reports it)."""
+        ends = sorted(ti.offset for ti in self.tensors.values()) + [size - self.data_start]
+        for ti in self.tensors.values():
+            if ti.type != 43 or not ti.known:
+                continue
+            nxt = min(e for e in ends if e > ti.offset) if any(e > ti.offset for e in ends) else ti.offset
+            span = nxt - ti.offset
+            n = int(np.prod(ti.ne, dtype=np.int64))
+            b32 = n // 32 * 33 if ti.ne[0] % 32 == 0 else -1
+            if b32 > 0 and b32 <= span < b32 + al and not (n <= span < n + al):
+                ti.tname, ti.nbytes = F8_E4M3_B32[0], b32
+
+    def _attach_shards(self):
+        """This file is shard 1 of a split set: open and validate the others (count, numbering, no duplicate tensor, tensor total); any gap is an error, never a partial load."""
+        n = int(self.kv["split.count"])
+        no = int(self.kv.get("split.no", 0))
+        m = _SHARD_RE.match(os.path.basename(self.path))
+        if no != 0:
+            raise GgufError(f"{self.path}: shard split.no={no} of {n}: open the FIRST shard (-00001-of-{n:05d}.gguf)")
+        if not m or int(m.group(2)) != 1 or int(m.group(3)) != n:
+            raise GgufError(f"{self.path}: split.count={n} but the file name is not <name>-00001-of-{n:05d}.gguf")
+        d = os.path.dirname(os.path.realpath(self.path))        # realpath: the serve cache links only the first shard
+        base = m.group(1)
+        extra = sorted(f for f in os.listdir(d) if (mm := _SHARD_RE.match(f)) and mm.group(1) == base and (int(mm.group(3)) != n or not 1 <= int(mm.group(2)) <= n))
+        if extra:
+            raise GgufError(f"{self.path}: extra shard file(s) of the same name outside the {n}-shard set: {extra[:3]}")
+        members = [self]
+        try:
+            for i in range(2, n + 1):
+                f = os.path.join(d, f"{base}-{i:05d}-of-{n:05d}.gguf")
+                if not os.path.isfile(f):
+                    raise GgufError(f"{self.path}: shard {i} of {n} is missing ({os.path.basename(f)})")
+                s = GgufFile(f, _shard=True)
+                members.append(s)
+                if int(s.kv.get("split.count", 0) or 0) != n or int(s.kv.get("split.no", -1)) != i - 1:
+                    raise GgufError(f"{f}: split.no={s.kv.get('split.no')} split.count={s.kv.get('split.count')}, expected {i - 1} / {n}")
+            for s in members:
+                for name, ti in s.tensors.items():
+                    if s is not self:
+                        if name in self.tensors:
+                            raise GgufError(f"duplicate tensor {name} across shards ({os.path.basename(s.path)})")
+                        self.tensors[name] = ti
+                    self._owner[name] = s
+            want = self.kv.get("split.tensors.count")
+            if want is not None and int(want) != len(self.tensors):
+                raise GgufError(f"{self.path}: shard set holds {len(self.tensors)} tensors, split.tensors.count says {want}")
+        except BaseException:
+            for s in members[1:]:
+                s.close()
+            raise
+        self._members = members[1:]
 
     def close(self):
+        for s in self._members:
+            s.close()
+        self._members = []
         self._mm = None
         self._f.close()
 
     def raw(self, name) -> np.ndarray:
         """uint8 view of the tensor's bytes, shape [rows.., row_bytes] (zero copy)."""
         ti = self.tensors[name]
-        _, be, bb = TYPES[ti.type]
-        a = np.frombuffer(self._mm, dtype=np.uint8, count=ti.nbytes, offset=self.data_start + ti.offset)
+        if not ti.known:
+            raise ti.type_error()
+        _, be, bb = TYPES_BY_NAME[ti.tname]
+        src = self._owner.get(name, self)
+        a = np.frombuffer(src._mm, dtype=np.uint8, count=ti.nbytes, offset=src.data_start + ti.offset)
         return a.reshape(ti.shape[:-1] + (ti.ne[0] // be * bb,))
 
     def tensor_f32(self, name) -> np.ndarray:
         ti = self.tensors[name]
+        if ti.tname in ROW_ONLY:
+            raise GgufTypeError(f"tensor {name}: GGUF type {ti.tname} is read by row only (foreign_gguf.ROW_ONLY), not as a whole tensor")
         return dequant(ti.tname, self.raw(name), ti.ne[0]).reshape(ti.shape)
 
 
 def find_gguf(path):
-    """The single .gguf of a directory (or the file itself). Split shards (-0000x-of-0000y) are refused: one file per model here."""
+    """The .gguf to open: the file itself, the single .gguf of a directory, or the FIRST shard of a complete split set (GgufFile validates and joins the rest)."""
     p = str(path)
     if os.path.isfile(p) and p.endswith(".gguf"):
         return p
     fs = sorted(f for f in os.listdir(p) if f.endswith(".gguf")) if os.path.isdir(p) else []
     fs = [f for f in fs if not f.startswith("mmproj")]
     if len(fs) > 1:
-        raise GgufError(f"{p}: {len(fs)} .gguf files ({fs[:3]}...): split / multi-file GGUF is not read; point at one file")
+        ms = [_SHARD_RE.match(f) for f in fs]
+        if all(ms) and len({m.group(1) for m in ms}) == 1:
+            first = [f for f, m in zip(fs, ms) if int(m.group(2)) == 1]
+            if not first:
+                raise GgufError(f"{p}: split shards {fs[:3]}... but the first shard (-00001-of-...) is missing")
+            return os.path.join(p, first[0])
+        raise GgufError(f"{p}: {len(fs)} .gguf files ({fs[:3]}...) that are not one split shard set; point at one file")
     return os.path.join(p, fs[0]) if fs else ""
 
 
@@ -210,6 +352,18 @@ def ue4m3(b):
     e, m = ((b >> 3) & 15).astype(np.int32), (b & 7).astype(np.float32)
     v = np.where(e == 0, np.ldexp(m, -9), np.ldexp(1.0 + m / 8.0, e - 7)).astype(np.float32)
     return np.where((b == 0) | (b == 0x7F), 0.0, v).astype(np.float32)
+
+
+def _f8_e4m3_tab() -> np.ndarray:
+    """the 256 float8 e4m3fn codes -> float32: sign, 4 exponent bits (bias 7), 3 mantissa bits; exponent 0 is subnormal (m * 2^-9); no inf; 0x7F / 0xFF are NaN."""
+    b = np.arange(256)
+    e, m = (b >> 3) & 15, (b & 7).astype(np.float64)
+    v = np.where(e == 0, np.ldexp(m, -9), np.ldexp(1.0 + m / 8.0, e - 7))
+    v = np.where((b & 127) == 127, np.nan, v)
+    return np.where(b & 128, -v, v).astype(np.float32)
+
+
+F8_E4M3_TAB = _f8_e4m3_tab()          # GGUF type id 43 (F8_E4M3): value = F8_E4M3_TAB[byte], no scale in the tensor itself
 
 
 def e8m0(b):
@@ -258,6 +412,11 @@ def _dequant_rows(tname: str, raw, k: int) -> np.ndarray:
         if tname == "F16":
             return r.view("<f2").reshape(lead + (k,)).astype(np.float32)
         return (r.view("<u2").astype(np.uint32) << 16).view(np.float32).reshape(lead + (k,))
+    if tname == "F8_E4M3":
+        return F8_E4M3_TAB[np.asarray(raw)].reshape(lead + (k,))
+    if tname == "F8_E4M3_B32":
+        B = _blocks(raw, 32, 33, k)
+        return (F8_E4M3_TAB[B[..., 1:]] * e8m0(B[..., 0])[..., None]).reshape(lead + (k,))
     B = _blocks(raw, be, bb, k)
     nr, nb = B.shape[:2]
     d = None if tname in _NO_FRONT_D else _f16(B[..., 0:2])[..., None]     # these types keep other bytes there (Q6_K: ql), read as fp16 they gave NaN warnings
@@ -282,6 +441,10 @@ def _dequant_rows(tname: str, raw, k: int) -> np.ndarray:
         if tname == "Q5_0":
             x0, x1 = x0 - 16, x1 - 16
         y = np.concatenate([x0 * d + m, x1 * d + m], -1) if tname == "Q5_1" else np.concatenate([x0 * d, x1 * d], -1)    # Q5_0: no `+ 0.0`, it would turn -0.0 into +0.0
+    elif tname == "Q2_0":      # dequantize_row_q2_0: code j = bits 2 (j % 4) of byte j / 4, w = ((int) q - 1) * d (float product, as the C loop)
+        q = B[..., 2:18]
+        c = ((q[..., :, None] >> (2 * np.arange(4, dtype=np.uint8))) & 3).reshape(q.shape[:-1] + (64,)).astype(np.int32)
+        y = (c - 1).astype(np.float32) * d
     elif tname == "Q8_0":
         y = B[..., 2:34].view(np.int8).astype(np.float32) * d
     elif tname == "IQ4_NL":
@@ -457,7 +620,7 @@ def _dequant_rows(tname: str, raw, k: int) -> np.ndarray:
     return np.ascontiguousarray(y.reshape(lead + (k,)), dtype=np.float32)
 
 
-TYPES_BY_NAME = {v[0]: v for v in TYPES.values()}
+TYPES_BY_NAME = {v[0]: v for v in list(TYPES.values()) + list(TYPES_OPT.values()) + [F8_E4M3_B32]}
 
 
 def _grid_bytes(tab):
@@ -495,7 +658,7 @@ def to_pack(tname: str, raw, k: int):
 
 def _to_pack_whole(tname: str, raw, k: int):
     from . import foreign_pack as FP
-    if tname not in KERNEL_TYPES + KERNEL_TYPES8 + KERNEL_TYPESK:
+    if tname not in KERNEL_TYPES + KERNEL_TYPES8 + KERNEL_TYPESK + KERNEL_TYPES5 + KERNEL_TYPES2:
         raise GgufTypeError(f"GGUF type {tname} has no Metal kernel (kernel types: {', '.join(KERNEL_TYPES)})")
     _, be, bb = TYPES_BY_NAME[tname]
     n = np.asarray(raw).shape[0]
@@ -514,6 +677,10 @@ def _to_pack_whole(tname: str, raw, k: int):
         return FP.Pack("q4_k", n, k, np.ascontiguousarray(B[..., 16:144]).reshape(n, k // 2), meta)
     if tname in KERNEL_TYPESK:
         return _to_pack_k(tname, B, n, k)
+    if tname in KERNEL_TYPES5:
+        return _to_pack_l5(tname, B, n, k)
+    if tname in KERNEL_TYPES2:
+        return _to_pack_q20(B, n, k)
     if tname == "MXFP4":
         q = B[..., 1:17]                                                               # byte j: element j (low) and j + 16 (high)
         codes = np.concatenate([q & 15, q >> 4], -1).reshape(n, k)                      # element order
@@ -524,6 +691,35 @@ def _to_pack_whole(tname: str, raw, k: int):
         sc = np.ascontiguousarray(B[..., 0:4]).reshape(n, k // 16)                      # UE4M3 per 16 (ggml halves it and doubles kvalues: net a plain E4M3)
         return FP.Pack("nvfp4", n, k, FP.pack_native(codes), np.ascontiguousarray(sc).view("<u2").reshape(n, k // 32), 1.0)
     raise AssertionError(tname)
+
+
+def _to_pack_l5(tname, B, n, k):
+    """Q4_1 / Q5_0 / Q5_1 blocks [n, k/32, bb] -> Pack of the same bytes, no re-quantisation. qs = the 16 nibble bytes of each block (byte j = element j | element j + 16 << 4,
+    as stored), hi = the stored 32-bit high-bit word of a Q5 block (bit e = high bit of element e), meta = the block scales as uint32 words: Q4_1 / Q5_1 one word
+    per block (fp16 d | fp16 m << 16, the first 4 bytes of the block), Q5_0 one word per two blocks (fp16 d of block 2i | fp16 d of block 2i + 1 << 16, a last odd block padded with 0; any k % 32 == 0, no super-block)."""
+    from . import foreign_pack as FP
+    u4 = lambda a: np.ascontiguousarray(a).view("<u4")[..., 0]
+    nb = k // 32
+    if tname == "Q5_0":
+        d16 = np.ascontiguousarray(B[..., 0:2]).view("<u2").reshape(n, nb)
+        meta = np.concatenate([d16, np.zeros((n, nb % 2), np.uint16)], 1).view("<u4").reshape(n, (nb + 1) // 2)
+        hi, qs = u4(B[..., 2:6]), B[..., 6:22]
+    elif tname == "Q5_1":
+        meta, hi, qs = u4(B[..., 0:4]), u4(B[..., 4:8]), B[..., 8:24]
+    else:
+        meta, hi, qs = u4(B[..., 0:4]), None, B[..., 4:20]
+    return FP.Pack(tname.lower(), n, k, np.ascontiguousarray(qs).reshape(n, k // 2), np.ascontiguousarray(meta).astype(np.uint32),
+                   extra={} if hi is None else {"hi": np.ascontiguousarray(hi).astype(np.uint32)})
+
+
+def _to_pack_q20(B, n, k):
+    """Q2_0 blocks [n, k/64, 18] -> Pack of the same bytes, no re-quantisation. qs = the 16 code bytes of each block as stored (a 32-unit = 8 bytes = two little-endian words,
+    code e of the unit = bits 2 e of the unit's 64-bit value), meta = the block scales fp16 d, two per uint32 (block 2i low, 2i + 1 high; a last odd block padded with 0). k % 64 == 0."""
+    from . import foreign_pack as FP
+    nb = k // 64
+    d16 = np.ascontiguousarray(B[..., 0:2]).view("<u2").reshape(n, nb)
+    meta = np.concatenate([d16, np.zeros((n, nb % 2), np.uint16)], 1).view("<u4").reshape(n, (nb + 1) // 2)
+    return FP.Pack("q2_0", n, k, np.ascontiguousarray(B[..., 2:18]).reshape(n, k // 4), np.ascontiguousarray(meta).astype(np.uint32))
 
 
 def _to_pack_k(tname, B, n, k):

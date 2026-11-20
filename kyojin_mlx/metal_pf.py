@@ -105,10 +105,10 @@ def rot_pf_source(nproj: int, in_half: bool, out_half: bool, perm: bool = False,
 
 @functools.lru_cache(maxsize=None)
 def mid_pf_source(limit: float, wpre: bool, fq: bool, alpha: float, beta: float, part_half: bool, out_half: bool, perm: bool = False,
-                  bounded: bool = False) -> str:
+                  bounded: bool = False, act: str = "swiglu") -> str:
     """Inputs: part [2 * NP, N] (gate rows then up rows), ids i32 [NP], wts f32 [NP], svh0, svh1, suhd half [E, N], params u32 [NP, N]
     (+ rows u32 [2] when bounded: the slot range this launch owns; the other rows return at once). Output xh2 [NP, N]."""
-    s = S.mid_source(limit, wpre, fq, alpha, beta)
+    s = S.mid_source(limit, wpre, fq, alpha, beta, act)
     s = _sub(s, "const uint TGK = params[0], N = params[1];", "const uint NP = params[0], N = params[1];")
     if bounded:                     # pf_moe_nosync: the class's row range is a device value (the sort's offsets never reach the host)
         s = _sub(s, "const uint p = threadgroup_position_in_grid.y;",

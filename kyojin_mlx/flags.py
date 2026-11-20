@@ -273,6 +273,10 @@ FLAGS: dict[str, Flag] = {
                          kind="int", runtime=False, reason="read when the model load finishes"),
     "cache_fit_mb": Flag("KYOJIN_CACHE_FIT_MB", "2048", "cache_fit: MiB kept free under the 0.95 gc line for transients and KV growth", kind="int", runtime=False,
                          reason="read when the model load finishes"),
+    "attn_fp16": Flag("KYOJIN_ATTN_FP16", "0", "Absorbed-MLA attention of the skeleton (any model whose activations are fp32, Hy4): fp16 KV buffer in a NEW fixed-state cache (rows saturated to +-65504), attention projections written as fp16, "
+                      "q / latent / k_pe / k_b and v_b absorbs / scores (fp32 accumulate) / P @ latent / pooled-key reads on fp16 data, softmax fp32; the hidden stream stays fp32. Half the KV and absorb bytes; "
+                      "values differ at fp16 rounding (gate with the model's noise band). Prefill (stock KV cache): the same fp16 path from the first call. Needs a fresh cache after switching. Metal. Read per cache creation / call",
+                      attrs=(("attn_fp16", "ON", _on),)),
     "moe_views": Flag("KYOJIN_MOE_VIEWS", "1", "routed MoE kernels bind a prefix view of each expert bank: fewer command-buffer commits, bit-identical (moe)",
                       attrs=(("moe", "VIEWS", lambda v: v == "1"),)),
     "moeroof": Flag("KYOJIN_MOEROOF", "1", "routed MoE decode GEMVs: cheaper integer decode + next-tile prefetch, bit-identical to the stock/FASTDEC decode (moeroof)",
@@ -298,6 +302,9 @@ FLAGS: dict[str, Flag] = {
                        attrs=(("moe", "FINPAR", lambda v: v == "1"),)),
     "dense_fast": Flag("KYOJIN_DENSE_FAST", "1", "fused dense tail reads one float4 per k-split",
                        attrs=(("kernels", "TAIL_READS", _tail_reads),)),
+    "skinny_rows": Flag("KYOJIN_SKINNY_ROWS", "0", "skinny products of a few-row pass (hyper-connection mixes, MoE router logits of the generic foreign skeleton; the chained verify rows of a speculation round): "
+                        "2 <= rows <= this value = ONE rowinv.rowdot launch (fp32 accumulate, row-invariant) instead of mx.matmul, which switches from the gemv kernel (1 row) to the steel GEMM + split-K accumulate pair (2+ rows). 0 = off, one row and prompt chunks keep mx.matmul",
+                        kind="int", attrs=(("rowinv", "SKINNY_ROWS", int),)),
     "dense_dec": Flag("KYOJIN_DENSE_DEC", "0", "dense (non-routed) trellis GEMV decode cut, read per kernel build: 1 = lane sum by one imad (dec_mul1r1, "
                       "the same fp16 value bit for bit), 2 = dec_mul1fd bare byte sum with the affine folded out (fast, NOT bit-identical; KL gate)",
                       kind="int", attrs=(("metal_src", "DENSE_DEC", int),)),
@@ -336,6 +343,34 @@ FLAGS: dict[str, Flag] = {
     "pf_route": Flag("KYOJIN_PF_ROUTE", "0", "prompt-path router (rows.py): the gate matmul then ONE selection launch (fuse.router_select) instead of "
                     "the stock sqrt / softplus / bias / neg / argpartition / take / sum / div chain, about 8 launches per layer fewer; same ids, "
                     "same weights bit for bit", attrs=(("rows", "PF_ROUTE", _on),)),
+    "glm_dsa_pf": Flag("KYOJIN_GLM_DSA_PF", "0", "GLM-5.x prompt chunks (> 64 rows, batch 1): the DSA attention runs in latent space on the DS4.1 NAX gathered-key kernels (attn_prefill, one shared "
+                       "K = V table of 512, q_lat = embed_q(q), unembed_out after the sum) instead of projecting K / V for all 64 heads and a SIMT kernel (stock: re-projected from the whole latent above 32768 tokens). "
+                       "Same top-k ids and scale; fp16 probabilities, fp32 accumulate (rel ~1e-3). Needs a NAX GPU (KYOJIN_ATTN_PF). Read at install (load time)", runtime=False, reason="class-level install at load"),
+    "glm_dsa_fused": Flag("KYOJIN_GLM_DSA_FUSED", "1", "GLM-5.x DSA prompt attention (with glm_dsa_pf on): ONE fused flash-style NAX kernel (adapted from mlx-serve, MIT, itself from oMLX, Apache-2.0: scores, online exp2 softmax and P x V in one "
+                        "launch, key rows read through the ids, whole dead tiles skipped) instead of the two attn_prefill kernels with a [rows x heads, keys] fp16 P matrix in between. 0 = the two-kernel path. Read at import", runtime=False, reason="module constant"),
+    "glm_pf_hc": Flag("KYOJIN_GLM_PF_HC", "0", "GLM-5.x prompt chunks (> 8 rows, batch 1) mHC glue: the collapse mix (fp32 copy + rms_norm + 32 tiled fp32 matmuls of 24 columns) is ONE simdgroup-MMA kernel reading x in fp16 "
+                      "(weights split hi / lo half, fp32 accumulate, ~1e-6 relative), the expand is the DS4.1 prompt kernel (pf_glue.expand, saturates at the fp16 range). KYOJIN_GLM_PF_HC_MIX=0 / _EXPAND=0 switch one seam off. Read at install (load time)",
+                      runtime=False, reason="class-level install at load"),
+    "glm_pf_idx": Flag("KYOJIN_GLM_PF_IDX", "0", "GLM-5.x prompt chunks (> 64 rows, batch 1, fp16): the indexer's pool selection (`_exact_pool_select`) runs the DS4.1 fused NAX score kernel (32 heads x 128, product kept fp32, fp32 head "
+                      "weights) and the exact multi-threadgroup radix top-k (idxfast.topk_mt) instead of [512, 32, pools] fp32 temporaries + argpartition. Same selected pools up to ties within fp32 accumulation order. Read at install (load time)",
+                      runtime=False, reason="module-level install at load"),
+    "glm_pf_untile": Flag("KYOJIN_GLM_PF_UNTILE", "0", "GLM-5.x prompt chunks (> 256 rows, batch 1): mlx_vlm's `tiled_linear` (256-row slices, one tiny GEMM each, for a fixed reduction geometry) is one call for the five projections that use it "
+                          "(MoE router fp32 [4096 -> 288], indexer wk / pool gate [4096 -> 128], wq_b, weights_proj): 32 GEMMs of 256 rows at 1-13 TFLOPS become one (G5g, bench 8192 rows: router 2.0 -> 0.5 ms, wk 2.2 -> 0.24, "
+                          "pool gate 1.9 -> 0.3). Same K order per row; outputs within fp32 / fp16 rounding (cut greedy check: argmax identical). Read at install (load time)", runtime=False, reason="class-level install at load"),
+    "glm_pf_moe": Flag("KYOJIN_GLM_PF_MOE", "0", "GLM-5.x MoE blocks on prompt chunks (> 16 rows): the router select (sigmoid + bias + top-k + normalise, stock = argpartition + take_along_axis + sum + divide) "
+                       "is one launch and the combine (stock = multiply pass writing [T, K, H] fp16, sum pass reading it back, + shared) is one launch (glm_moe.combine, the decode kernel). Same "
+                       "fp16 roundings as the stock `_combine`; read per call."),
+    "glm_pf_q8": Flag("KYOJIN_GLM_PF_Q8", "0", "GLM-5.3 MoE prompt chunks (>= KYOJIN_GLM_PF_Q8_MIN slots, default 16384; needs KYOJIN_KQ_GMM + KYOJIN_KQ_GMM_GLM): the routed-expert GEMMs (gate, up, down) run int8 x int8 -> int32 on the "
+                      "NAX (matmul2d): activations quantized per row and per 128-wide K block (fp32 partial sums scaled per block), the NVFP4 weight decoded to int8 per K step in threadgroup memory (one scale per "
+                      "output row, round half even). Stock = the fp16 kqgmm path. Falls back (fired.fb \"pf_q8\": flag_off / no_swiglu_limit / kq_gmm_glm_off / <proj>:not_experts, fmt=, rowgs, k%256, n%64 / "
+                      "E>1024 / slots<min) to it. NOT validated by a full-model PPL / KL gate; read per call."),
+    "pf_gemm_i8": Flag("KYOJIN_PF_GEMM_I8", "0", "Prefill GEMM numerics, routed experts (op name of KYOJIN_GLM_PF_Q8, which stays an alias: either one on = on): GLM-5.3 MoE prompt chunks run the expert GEMMs int8 x int8 -> int32 (foreign_pfq8). Read per call: off needs no reload. Costs ~0.04-0.1 % wiki PPL."),
+    "pf_gemm_i8_dense": Flag("KYOJIN_PF_GEMM_I8_DENSE", "0", "Prefill GEMM numerics, dense linears (attention / KDA projections, shared expert, dense MLP; any stored format): prompt chunks of >= KYOJIN_PF_GEMM_I8_MIN rows (default 2048) run int8 x int8 -> int32; the weight is quantized to int8 ON THE FLY per call (transient, no resident copy: foreign_pfi8). Read per call: off needs no reload. Quality cost: see STATUS_PFQ8V3.md."),
+    "pf_gemm_i8_row": Flag("KYOJIN_PF_GEMM_I8_ROW", "0", "Prefill GEMM numerics, sub-flag of pf_gemm_i8: ONE activation scale per row (v1 scheme) instead of one per 128-wide K block in the routed-expert GEMMs: ~12 % faster MoE layer (30.9 vs 35.1 ms), 2-5x the error on rows with an activation outlier. Read per call."),
+    "glm_kda_pf": Flag("KYOJIN_GLM_KDA_PF", "0", "GLM-5.3 prompt chunks (> 64 rows, batch 1, plain cache) of the 34 KDA linear-attention layers (G5d): the conv + silu + L2 norm of q / k prework is ONE kernel (stock: concatenate, conv1d, "
+                      "silu, rms_norm x2, cache slice), the delta-rule scan is kyojin_mlx.kda_nax (chunks of 16 tokens on the matrix units, the per-channel gate evaluated in the kernel, fp32 state; stock: sequential kernel + an fp32 "
+                      "[T, 64, 128] gate tensor) and o_norm * sigmoid(gate) is ONE kernel. Output within bf16 / fp16 rounding of the stock path (G5e: the matrix unit truncates fp32 operands to 10 mantissa bits, so every state-dependent MMA of the scan runs as a 3-term hi/lo product, "
+                      "KYOJIN_GLM_KDA_SPLIT=127: state error vs float64 4e-6 relative instead of 1e-3). KYOJIN_GLM_KDA_PF_REC=stock keeps the stock scan, _PRE=0 the stock conv chain. Read at install (load time)", runtime=False, reason="class-level install at load"),
     "router_w16": Flag("KYOJIN_ROUTER_W16", "0", "decode router (rows.py): the fp32 gate is read through an exact bf16 / fp16 copy (lowp.exact_lowp: kept only when every value "
                        "round-trips), half the gate bytes per MoE layer, same logits bit for bit (rowdot upcasts each element to fp32 before the first fma); fp32 stays for a gate that is not exact",
                        attrs=(("rows", "ROUTER_W16", _on),)),
@@ -343,6 +378,10 @@ FLAGS: dict[str, Flag] = {
                        "advisory per run of rows within 16 of each other, skipped when a request scatters into more than 4096 runs; same bytes"),
     "gguf_fp16": Flag("KYOJIN_GGUF_FP16", "1", "foreign formats (foreign_linear.load_foreign, GGUF): 1-D F32 tensors (norm weights, biases; ggml always writes them F32) load in the model dtype, "
                       "so Q and K stay fp16: prefill attention 1.4x faster, decode reaches the fp16 flash kernel. gdn_norm's fp32 weight stays. 0 = kept F32, as before",
+                      runtime=False, reason="read once, at load"),
+    "act_dtype": Flag("KYOJIN_FOREIGN_ACT_DTYPE", "", "foreign formats (load_foreign, GGUF): the F32 non-quantised parameters left after the 1-D rule (conv1d weights of the gated-delta and PLE blocks, "
+                      "2-D norms / projections kept dense) load in the model compute dtype (bf16 | fp16 | auto = the load dtype, fp16): one F32 weight multiplied into a half hidden state promotes it, "
+                      "and every later op ran fp32. A_log / dt_bias stay F32 (the class computes the gate in fp32). Unset = off; PPL differs slightly, never bit-identical",
                       runtime=False, reason="read once, at load"),
     "gguf_generic": Flag("KYOJIN_GGUF_GENERIC", "0", "RETIRED, no effect: a bare GGUF of a mapped architecture without a modeldesc row (qwen2, qwen2_moe, llama, glm4, glm4_moe, gemma3, mistral3, deepseek_v3) is "
                          "served through the generic mlx-lm loader + Q35Backend whatever this says (only files that were refused before are affected; every pack that served is unchanged)",
@@ -518,6 +557,17 @@ FLAGS: dict[str, Flag] = {
                              "reads and its warm job on one worker (rounds of 2.9 to 4.2 s against 0.1 s, slicetrace 01/11), and its passes wipe the chunk's job table, so the chunk "
                              "reads the later layers again. Same rows, same bytes; only the order of the host reads changes; read per pass",
                              attrs=(("engram_rows", "DEC_QUEUE", _on),)),
+    "hy4_engram_pread": Flag("KYOJIN_HY4_ENGRAM_PREAD", "0", "Hy4-flash Engram rows (63 GB GGUF table, 4 layers x 16 columns): read by DEDUPED parallel preads (native rowread) instead of the memory-map gather `raw[rows]` "
+                             "(one serial 16 KB page-in per cold row: cold prefill 126-435 tok/s against ~2000 warm, coldbase 19/11). The table stays on disk (no warm-up, no pinning). Same rows, same "
+                             "bytes, same floats: exact; 0 = the map; read per load", attrs=(("engram_gguf", "PREAD", _on),)),
+    "hy4_engram_lazy": Flag("KYOJIN_HY4_ENGRAM_LAZY", "0", "Hy4-flash Engram, prompt chunks (>= 256 positions): the layers' rows are read one layer after the other in the background and the forward waits for a "
+                            "layer's rows at that layer (the layers before it run on the GPU: mx.async_eval). Same rows: exact", attrs=(("engram_gguf", "LAZY", _on),)),
+    "hy4_engram_decpf": Flag("KYOJIN_HY4_ENGRAM_DECPF", "0", "Hy4-flash Engram, speculative decode rounds (needs hy4_engram_pread): the rows of the pending token are read in the background when the draft chain "
+                             "starts, the rows of each draft as soon as the id is known (the draft head reads no Engram row), by parallel preads of only the page-cache-cold rows; the verify "
+                             "pass takes them by row id (a miss is read at once) and waits per layer, so the layers before the first Engram layer run on the GPU meanwhile. "
+                             "Rows stay on disk (no warm-up, no pinning). Same rows: exact; read per load", attrs=(("engram_gguf", "DECPF", _on),)),
+    "hy4_engram_ahead": Flag("KYOJIN_HY4_ENGRAM_AHEAD", "0", "Hy4-flash Engram: the engine's next-chunk hint (Hy4Backend.warm_prompt) reads the NEXT prompt chunk's rows in the background while this one "
+                             "runs (content-addressed pieces: a stale hint only misses). Same rows: exact", attrs=(("engram_gguf", "AHEAD", _on),)),
     "engram_one_batch": Flag("KYOJIN_ENGRAM_ONE_BATCH", "1", "Engram rows of a decode / verify pass (under 2048 rows): the value rows and the scale rows of a layer in ONE parallel batch of preads "
                              "(interleaved over a 32-thread pool, hot rows read on the calling thread) instead of two batches one after the other. The cold NVMe read of a layer "
                              "was 1.3-3.5 ms on the critical path of the verify pass (GPU idle at the Engram layers, decgap 04/11); now 0.2-0.4 ms. Same rows, same bytes; read per call",
@@ -703,7 +753,7 @@ FLAGS: dict[str, Flag] = {
                      "(sum of all buffer spans) / gpu_kb1_r<rows> (buffers with exactly one dispatch, exact) / gpu_kmix_r<rows> (split evenly). "
                      "MLX_MAX_OPS_PER_BUFFER=1 makes every buffer single-dispatch",
                      attrs=(("gpuspan", "KERN", _on),)),
-    "ablit_fused": Flag("KYOJIN_ABLIT_FUSED", "1", "decensor projection (ablit.project): clamp, the K dot products and the update of a row in ONE launch instead of ~7 "
+    "ablit_fused": Flag("KYOJIN_ABLIT_FUSED", "1", "direction projection (ablit.project): clamp, the K dot products and the update of a row in ONE launch instead of ~7 "
                         "(fp16 clip pair, fp32 cast, two small fp32 matmuls, fused update); fp32 inside like the stock path, only the dot product's "
                         "summation order differs", attrs=(("ablit", "FUSED", _on),)),
     "attn_core_fuse": Flag("KYOJIN_ATTN_CORE_FUSE", "0", "DS4.1 plain decode attention core: the kv chain also writes the stacked window buffer the commit keeps, so the commit's slot scatter launch is gone "
@@ -713,7 +763,8 @@ FLAGS: dict[str, Flag] = {
                    "each replaced by the cheapest stand-in that keeps shapes and dtypes, to read its exposed cost as a round-time difference. Classes: moe_routed (routed experts -> zeros), "
                    "moe_shared (shared expert -> zeros), router (logits + top-k -> fixed ids / weights), moe_glue (routed GEMVs kept, rot / mid / final -> zero buffers), "
                    "mhc (mixes + sinkhorn -> constants, pre -> stream mean, expand -> add; block runs the stock chain), norm (RMSNorm -> identity; block runs the stock chain), "
-                   "attn (attention core -> zeros, cache untouched), idx (indexer -> fixed first-k), ablit (decensor projection -> identity). \"\" = off, bit-identical",
+                   "attn (attention core -> zeros, cache untouched), idx (indexer -> fixed first-k), ablit (direction projection -> identity); on the generic decoder skeleton (Hy4, GLM, kit models) "
+                   "also attn_proj / attn_core / attn_out / mlp / hc / engram / head (kyojin_mlx/ablate_struct.py, structure only; the first ablated call of a shape runs real). \"\" = off, bit-identical",
                    kind="str", attrs=(("ablate", "ACTIVE", _ablate),)),
     "host_sample": Flag("KYOJIN_HOST_SAMPLE", "0", "serve probe: sample the engine thread's own Python stack every N microseconds (0 = off, read per loop "
                       "iteration) and dump the wall attribution per file:line to KYOJIN_HOST_SAMPLE_OUT (default ./pysample.txt) when the lever goes back to 0; "
@@ -740,6 +791,10 @@ FLAGS: dict[str, Flag] = {
                         attrs=(("attn_prefill", "ONLINE", _on),)),
     "dspark_conf_pct": Flag("KYOJIN_DSPARK_CONF_PCT", "0", "DSpark confidence gate threshold in percent (0 = the drafter's own KYOJIN_DSPARK_CONF; read per draft)", kind="int",
                             attrs=(("dspark", "CONF_OVERRIDE", lambda v: int(v) / 100 if int(v) > 0 else None),)),
+    "glm_block_arm": Flag("KYOJIN_GLM_BLOCK_ARM", "", "GLM-5.3 external block drafter in use when KYOJIN_GLM_BLOCK loaded several (dflash2:DIR,dspark:DIR): '' = the first one. Switch only while idle (a session's drafter state belongs to one drafter)",
+                          kind="mode", choices=("", "dflash2", "dspark")),
+    "glm_block_conf": Flag("KYOJIN_GLM_BLOCK_CONF", "0", "GLM-5.3 DSpark block drafter: draft-length gate in percent on the cumulative confidence of the drafted prefix (0 = off; read per draft)", kind="int"),
+    "glm_block_cand": Flag("KYOJIN_GLM_BLOCK_CAND", "0", "GLM-5.3 DSpark block drafter: Markov bias only on the top-N base-logit tokens of each position (0 = the whole vocabulary; read per draft)", kind="int"),
     "dec_topk_blocks_rows": Flag("KYOJIN_DEC_TOPK_BLOCKS_ROWS", "0", "dec_topk_blocks: only for score tiles of at most this many rows (0 = any); a prefill tile has 64-512 rows and the candidate path adds ~20 launches per tile, so 16 keeps decode / verify on it and prefill on the radix select", kind="int", attrs=(("idxblk", "MAX_ROWS", int),)),
     "dec_topk_blocks": Flag("KYOJIN_DEC_TOPK_BLOCKS", "0", "indexer top-k (decode, verify, prefill: every idxfast.topk_mt call with N*Tm >= 2^20 and >= 4k blocks): exact candidate-block select, one block-max read, top-k of the block maxima, top-k of the k picked blocks, instead of 4 full reads of the scores (idxblk, same indices)", attrs=(("idxfast", "DEC_TOPK_BLOCKS", _on),)),
     "topk_tree": Flag("KYOJIN_TOPK_TREE", "0", "indexer top-k of decode / verify rows (idxfast.topk_mt and select_fused, <= 16 rows, fp16 / bf16, from KYOJIN_TOPK_TREE_MIN keys): exact chunk-tree select in ONE launch "
@@ -898,6 +953,12 @@ FLAGS: dict[str, Flag] = {
                       "above, each member keeps its own matmul on the same decoded rows). Members of different formats, dense (FP8 / Q8_0 / Q6_K decoded to fp16) members and "
                       "ForeignSwitchGLU are left alone. Not measured on Metal (tests/test_cfmtspeed.py needs a Mac for the kernel half). 0 = today", runtime=False,
                       reason="the matrices are concatenated once at load and the member arrays freed"),
+    "foreign_g2a": Flag("KYOJIN_FOREIGN_G2A", "1", "foreign formats, NVFP4 routed experts decoded one row per slot (GLM-5.3, Qwen-style NVFP4 MoE; k % 1024 == 0, k <= 12288, n % 16 == 0): the gather GEMV "
+                        "is the register-fed kernel of foreign_metal.gemv_g2_source (1 output row per simdgroup, 16 simdgroups per threadgroup, every weight load of a row issued before the x barrier, "
+                        "E2M1 pair decode in 5 integer ops, block scale applied to the 16-weight dot product). ForeignSwitchGLU (GLM: the mlx-vlm MoE calls it as switch_mlp) runs gate | up in one "
+                        "launch, silu * up with the swiglu limit in one launch (instead of ~8 elementwise ops) and the down gather. Same products, float sum order differs (fp16 outputs within 1 ulp-ish, "
+                        "tests/test_foreign_g2a.py). Micro-bench at the GLM shapes (E 288, gate / up 2048 x 4096, down 4096 x 2048, R rows x top-8, tools/g2a_gather_bench.py): ForeignSwitchGLU per layer R1 160 -> 118 us, R2 265 -> 218, R4 491 -> 418. "
+                        "0 = the previous kernels (read per call)"),
     "fp8stored": Flag("KYOJIN_FP8STORED", "1", "foreign formats (foreign_linear, Qwen3-family models): FP8 E4M3 safetensors linears (per-tensor / per-channel scale; block scales, E5M2 and "
                       "experts stay decoded) and GGUF Q8_0 matrices (not stacked experts) are read as stored, one byte per weight: a GEMV kernel up to KYOJIN_FOREIGN_GEMV8_ROWS (8) rows, "
                       "a simdgroup-matrix kernel (32-row slices) up to KYOJIN_FOREIGN_DENSE8_ROWS (16), above it a dequant kernel to a transient fp16 matrix and one MLX matmul. "
@@ -938,7 +999,249 @@ FLAGS: dict[str, Flag] = {
                     "instead of the 2 of the fp16 decode): a GEMV kernel (foreign_metal.gemvk_source) up to KYOJIN_FOREIGN_GEMVK_ROWS (8) rows, above it one MLX matmul on a transient decode "
                     "(dequantk_source). Value 2 also keeps a resident fp16 copy for those rows while it fits under 60 % of the working set. Row sums in float, saturated to the fp16 range. "
                     "0 = decoded to fp16 at load, as before", runtime=False, reason="the weights are laid out once at load", kind="int"),
+    "legacy5_stored": Flag("KYOJIN_LEGACY5_STORED", "0", "foreign formats (foreign_linear, GGUF files): Q4_1, Q5_0 and Q5_1 2D / 3D weights (any width) are read as stored (0.625-0.75 byte per weight) "
+                            "by the K-class kernels (foreign_metal q4_1 / q5_0 / q5_1: GEMV, gather, few-row MMA, transient decode above the rows) instead of the resident fp16 decode "
+                            "(2 bytes per weight). Off until tests/test_legacy5_metal.py passes on the GPU. 0 = decoded to fp16 at load, as before", runtime=False,
+                            reason="the weights are laid out once at load", kind="int"),
+    "q2_0_stored": Flag("KYOJIN_Q2_0_STORED", "0", "foreign formats (foreign_linear, GGUF files): GGML type id 42 (Q2_0: 64 weights = fp16 d + 16 bytes of 2-bit codes, w = (q - 1) d) becomes a known weight type "
+                         "(reader, exact dequant) and its 2D / 3D weights are read as stored (0.28 byte per weight) by the K-class kernels (foreign_metal q2_0: GEMV, gather, few-row MMA, transient decode above the rows). "
+                         "Off until the Metal test of gpu_archkit/types2_metal.sh passes on the GPU. 0 = id 42 is an unknown type id (per-tensor failure, day0_inspect TYPE NEEDED), as before", runtime=False,
+                         reason="the weights are laid out once at load"),
+    "gemvk_partial": Flag("KYOJIN_GEMVK_PARTIAL", "0", "foreign formats, K-class stored kernels (foreign_metal.gemvk_source: GEMV, routed gather, glu): a stored matrix whose width k is not a multiple of the 512-weight chunk "
+                          "(k % 32 == 0: Q4_1 / Q5_0 / Q5_1 / Q2_0 experts of 640 / 704, K and IQ types of 768 / 1280) takes the GEMV / gather kernel with a partial last chunk (zeros staged past k, unit index clamped to the row) "
+                          "instead of the transient decode + matmul. The source of widths % 512 == 0 is unchanged. Off until the Metal tests of gpu_archkit/types2_metal.sh pass", runtime=False,
+                          reason="set before the engine starts: the kernel route of a loaded layer must not change under it"),
+    "moe_partialk": Flag("KYOJIN_MOE_PARTIALK", "0", "foreign formats, routed-expert stacks only: Q4_1 / Q5_0 / Q5_1 / IQ4_NL experts whose width k is not a multiple of 512 (k % 32 == 0, e.g. 640) take the partial-chunk "
+                          "gather / pair GEMV (as gemvk_partial but for experts) and the grouped prefill (foreign_kqgmm kinds q4_1 / q5_0 / q5_1 / iq4_nl, k % 128 == 0). Dense matrices unchanged; the q4_1 / q5 files are kept stored "
+                          "only with KYOJIN_LEGACY5_STORED (load time). Off until the GPU micro-gates (tools/moe_partialk_gate.py) are reviewed", runtime=False,
+                          reason="set before the engine starts: the kernel route of a loaded layer must not change under it"),
+    "moe_partialk_fp4": Flag("KYOJIN_MOE_PARTIALK_FP4", "0", "NVFP4 routed-expert stacks with k % 32 == 0, k % 1024 != 0 (Qwen3.8-Flash-Next down k = 640): the g2a gather / pair kernels in their partial-unit "
+                              "text instead of the per-expert dequant loop (decode); glm_moe / glm_moe_rows keep their k % 1024 gate. Off until the GPU micro-gate (tools/moe_partialk_fp4_gate.py) is reviewed", runtime=False,
+                          reason="set before the engine starts: the kernel route of a loaded layer must not change under it"),
+    "arch_skeleton": Flag("KYOJIN_SKELETON", "0", "foreign formats, arch kit (foreign_archkit_cpu.load_cpu, foreign_archkit_serve.register): a GGUF architecture with no mlx-lm model class is served by the config-driven "
+                          "decoder skeleton (foreign_skeleton; rows in foreign_skeleton_rows), and an architecture that has both a class and a skeleton row takes the skeleton (checks). Off until the Metal runs of "
+                          "gpu_archkit/skeleton_identity.sh are reviewed. 0 = KitError for an architecture with no model class, as before", runtime=False,
+                          reason="read when the file is loaded"),
+    "kit_unproven_rows": Flag("KYOJIN_KIT_UNPROVEN_ROWS", "0", "foreign formats, arch kit: the rows that have no Metal identity proof yet are in force. A row marked proven=False in its table (foreign_cfgrows.ROWS / foreign_archkit.VETTED) or listed in "
+                          "foreign_unproven (the model_type aliases of minimax-m3 and nemotron_h_moe, the glm5-next GGUF rows of foreign_glm_gguf) does not exist while this is 0: every load path and tools/day0_inspect.py "
+                          "give the verdict they gave without it (plus one line saying the rows exist). Today: gemma4, lfm2moe, glm5-next, the two aliases. Off until the Metal runs of gpu_archkit/ identity scripts pass",
+                          runtime=False, reason="read when the file is loaded / the module is imported"),
+    "kit_vlm_classes": Flag("KYOJIN_KIT_VLM_CLASSES", "0", "foreign formats, arch kit (foreign_vlm_classes): an architecture for which mlx-lm has no model class takes the text model class of mlx-vlm of the same model_type "
+                            "(cohere2_moe, flint); the vision tower of a wrapper is dropped when the file has no vision tensors. mlx-lm is always asked first, so no architecture that resolves today changes class. "
+                            "0 = KitError as before. The rows of those architectures are also unproven (kit_unproven_rows)", runtime=False, reason="read when the file is loaded"),
+    "mapped_row_table": Flag("KYOJIN_MAPPED_ROW_TABLE", "0", "foreign formats (foreign_mapped_rows): a GGUF table the model class reads by row id (qwen4exp's per-layer n-gram table, 28.8 GB) stays in the mapped file and only the "
+                              "rows of the step are decoded (fp16, on the host). Off: the tensor stays in Arch.unserved and the loader raises, as before. Read at load.", runtime=False, reason="read when the model loads"),
+    "mapped_row_batch": Flag("KYOJIN_MAPPED_ROW_BATCH", "0", "foreign formats (foreign_mapped_rows.RowBatch): with mapped_row_table, the n-gram rows of ALL layers of a decode step are ids-evaluated, read and decoded in ONE host call "
+                              "(one GPU sync per step instead of one per PLE layer); identical rows by construction. Steps over 64 tokens keep the per-layer path. Off: per layer, as before. Read at load.", runtime=False, reason="read when the model loads"),
+    "mapped_row_prefetch": Flag("KYOJIN_MAPPED_ROW_PREFETCH", "0", "foreign formats (foreign_mapped_rows.pretouch): with mapped_row_table, a background thread reads one byte of every 16 KiB page of the mapped row table so the decode steps'"
+        " row gathers do not pay a first-touch page fault per row (page-cache hits that still fault, ~12 per token measured). 1 = whole table, N>1 = first N GiB (a table larger than the page cache). Read only: no value changes; clean file-backed pages. Off: first touch in the step, as before. Read at load.", runtime=False, reason="read when the model loads"),
+    "mapped_row_nvfp4": Flag("KYOJIN_MAPPED_ROW_NVFP4", "0", "foreign formats (foreign_mapped_rows.MappedNvfp4Rows, foreign_qwen4exp_st): the NVFP4 n-gram table of a Qwen3.8-Flash-Next safetensors pack (128 shards, 28.8 GB) stays in the mapped files and only the "
+                               "rows of the step are decoded (fp16, on the host); nothing else of the pack changes. Needs the class lookup of the unproven qwen4_exp row (KYOJIN_KIT_UNPROVEN_ROWS). Off: the shards load as 4-bit Packs, as for any pack. Read at load.", runtime=False, reason="read when the model loads"),
+    "gemma4_rows": Flag("KYOJIN_GEMMA4_ROWS", "0", "foreign formats, arch kit (alias of kit_unproven_rows for gemma4 alone): the gemma4 rows (foreign_cfgrows config row, foreign_archkit VETTED line) are in force: load_cpu and the serve register build the mlx-lm gemma4_text class from the GGUF, "
+                        "and tools/day0_inspect.py reads the vetted line. Off until the Metal run of gpu_archkit/gemma4_identity.sh passes. 0 = gemma4 has no config row and no vetted line, as before "
+                        "(day0_inspect: the same verdict as without the rows)", runtime=False, reason="read when the file is loaded"),
+    "glm_dense_rows": Flag("KYOJIN_GLM_DENSE_ROWS", "0", "GLM-5.3 verify rows (G3e2): a dense FP8 projection (qkv_proj, o_proj, f_b / g_b, q_a / kv_a, q_b, shared experts, lm_head) of 2..4 rows of one session is ONE G3 GEMV "
+                        "launch that reads its weights once (needs KYOJIN_GLM_DENSE_GEMV); stock = mlx_vlm's `tokenwise` fallback, one launch and one full weight read PER ROW (cut ladder lm_head 0.56 / 1.16 / 1.59 / 2.14 ms "
+                        "at R = 1..4). Row r of the result equals the R = 1 result bit for bit. Read per call",
+                        attrs=(("glm_dense_rows", "ENABLED", _on),)),
+    "glm_vrows": Flag("KYOJIN_GLM_VROWS", "0", "GLM-5.3 verify rows, N1-VROWS (needs KYOJIN_GLM_DENSE_GEMV; supersedes glm_dense_rows): every dense ForeignLinear (KDA in-proj / o_proj, DSA q_a / q_b / o, lm_head) of a verify block [B, L, H] "
+                      "with B * L <= KYOJIN_GLM_VROWS_MAX (8) rows is ONE G3 / 6-bit (KYOJIN_GLM_DENSE_Q, fg_g6_r<R>) GEMV launch that reads its weights once. Stock = mlx_vlm's `tokenwise`: L launches of B rows "
+                      "(MTP d1, 1 session = two fg_g6_r1 reads, 4 sessions = two fg_g6_r4 reads; G2h: ~3 ms of a 31.5 ms round). Row r of the result equals the per-row result bit for bit; more rows than the cap, "
+                      "or the flag off = stock. Read per call",
+                      attrs=(("glm_dense_rows", "VROWS", _on),)),
+    "glm_compile": Flag("KYOJIN_GLM_COMPILE", "0", "GLM-5.3 decode: every linear-attention decoder layer (34 of 45) runs as one mx.compile region (conv / recurrent state in and out): the python graph build is paid once per (layer, rows) and replayed, "
+                        "MLX fuses the elementwise chains. Plain decode steps only (one token per row, no mask, no speculative cache); anything else runs the stock layer (kyojin_mlx.glm_compile). Read per call",
+                        attrs=(("glm_compile", "ENABLED", _on),)),
+    "glm_mtpfeed": Flag("KYOJIN_GLM_MTPFEED", "0", "GLM-5.3 MTP head, PROMPT feed (P2-MTPFEED): the head's pairs of a prompt chunk are fed without the stock per-head projected K / V cache (64 x T x 256, grown by a full "
+                        "copy per 512-row piece below 32768 tokens: 0.2-1.2 s of GPU idle per 8K chunk at offsets 0-24K). The head is one layer and its prompt-feed output is discarded, so its three caches "
+                        "(latent, indexer keys, pool keys) are bit-identical; only the draft's own attention takes the latent path (as it does above 32768 tokens). Draft tokens verified, outputs exact "
+                        "(kyojin_mlx.glm_nextn). Read per call",
+                        attrs=(("glm_nextn", "MTPFEED", _on),)),
+    "glm_hostgap": Flag("KYOJIN_GLM_HOSTGAP", "0", "GLM-5.3 decode (N3-HOSTGAP): mx.async_eval the layer output after the first KYOJIN_GLM_HOSTGAP_FIRST layers and then every KYOJIN_GLM_HOSTGAP_EVERY layers of a "
+                        "decode step (<= KYOJIN_GLM_HOSTGAP_ROWS rows per session), so the GPU starts the step while the host is still building it instead of idling the ~3 ms the python graph build "
+                        "takes after the previous step ends. Same ops, same order: only where the graph is committed moves (kyojin_mlx.glm_hostgap). Read per call",
+                        attrs=(("glm_hostgap", "ENABLED", _on),)),
+    "glm_hostgap_first": Flag("KYOJIN_GLM_HOSTGAP_FIRST", "1", "glm_hostgap: layers built before the first submit", kind="int", attrs=(("glm_hostgap", "FIRST", int),)),
+    "glm_hostgap_every": Flag("KYOJIN_GLM_HOSTGAP_EVERY", "4", "glm_hostgap: layers between two submits", kind="int", attrs=(("glm_hostgap", "EVERY", int),)),
+    "glm_hostgap_rows": Flag("KYOJIN_GLM_HOSTGAP_ROWS", "1", "glm_hostgap: most rows per session of a pass that submits early (1 = plain decode steps)", kind="int",
+                             attrs=(("glm_hostgap", "ROWS", int),)),
+    "glm_lag1": Flag("KYOJIN_GLM_LAG1", "0", "GLM-5.3 served MTP (G13, V1-VERIFY): the draft head's proposals stay on the device (async_eval, no host read) and the verify rows are built from them (GlmBackend.spec_verify_lazy), so the host builds the verify graph "
+                     "while the GPU drafts instead of waiting for the draft first. Same graphs in the same order on one stream: the same tokens. Needs KYOJIN_GLM_CHAIN=0 (a chained / skip round reads the drafts first). Read per round"),
+    "verify_poolsel": Flag("KYOJIN_VERIFY_POOLSEL", "0", "V1-VERIFY: PoolingCache.commit_speculation (any arch with pooled caches: GLM DSA layers, DS4.1 x 2 buffers) selects the remainder window with static slices + one pad instead of ~22 small mx ops "
+                               "(arange / mod / clip / take_along_axis / where) on python ints. Pure data movement: bit-identical (kyojin_mlx.verify_glue). Read per call",
+                               attrs=(("verify_glue", "POOLSEL", _on),)),
+    "draft_head_f16": Flag("KYOJIN_DRAFT_HEAD_F16", "0", "V1-VERIFY: the MTP draft head (GLM-5.3 nextn) gets the target's float32 hidden and runs fully in float32 (weights cast f16 -> f32 on every call, 3.7 ms per round); with this the normed hidden is rounded to the "
+                              "model dtype so the head runs in f16. Draft only (the verify pass is untouched, so every emitted token is the same as with any other draft; only the proposals / acceptance can move). Read per call",
+                              attrs=(("verify_glue", "HEAD16", _on),)),
+    "moe_rows2_unroll": Flag("KYOJIN_MOE_ROWS2_UNROLL", "0", "V2-VERIFY: the g2m routed-expert kernels (pair_glu / down, GLM-5.x MoE_E path) at T > 1 rows (MTP verify, 2-4 rows): the loops over the rows that picked an expert "
+                            "(dynamic count, indexed accumulators) are unrolled over the row count so the accumulators live in registers instead of private memory. The same operations in the same order: bit-identical (tests/test_glm_moe_e.py). Read per call",
+                            attrs=(("glm_moe_e", "ROWS2_UNROLL", _on),)),
+    "dsa_attend_rows": Flag("KYOJIN_DSA_ATTEND_ROWS", "0", "V2-VERIFY: the DSA attend of the fused path (plain step and MTP verify rows, 1..16 (session, row) pairs; needs KYOJIN_GLM_FUSE_DSA) as scores / softmax / PV / sum launches "
+                            "with thousands of independent simdgroups instead of the stock SDPA fallback (~8 launches per row, split-K P @ V ~90 us) (kyojin_mlx.dsa_attend_rows). Same rounding points as the stock path, fp32 sums in another order: 1-ulp-class "
+                            "logits; every row is reduced on its own, so verify row i == plain row i with the flag on for both. Read per call",
+                            attrs=(("dsa_attend_rows", "ENABLED", _on),)),
+    "dsa_attend_cps": Flag("KYOJIN_DSA_ATTEND_CPS", "5", "dsa_attend_rows: 32-key chunks per P @ V split (more splits = more simdgroups, a longer fp32 sum pass)", kind="int", attrs=(("dsa_attend_rows", "CPS", int),)),
+    "glm_fuse_dsa": Flag("KYOJIN_GLM_FUSE_DSA", "0", "GLM-5.3 DSA fused verify-row / batch indexer + attend kernels (kyojin_mlx.glm_fuse_dsa; with the variable unset the module follows KYOJIN_GLM_DSA_FAST at import, so this registry default is NOT applied). "
+                         "The class hooks are installed at load only when the load started with it on; on such a load this switches the kernels off / on per call (a bisect on a live server); on a load started with 0 it is a no-op",
+                         kind="mode", choices=("0", "1"), attrs=(("glm_fuse_dsa", "ENABLED", _on),)),
+    "glm_fuse_dsa_eval": Flag("KYOJIN_GLM_FUSE_DSA_EVAL", "0", "GLM-5.3 FUSE_DSA verify rows (L > 1): async_eval the attention output of every Nth DSA layer of the pass (0 = off, 1 = every layer like the stock `_attend`, 11 = the first only). The stock path "
+                              "evaluates every row output asynchronously, so the GPU starts while the host builds the rest of the pass; the fused path builds the pass ~4x faster but without this the build is serial in front of the GPU work (DSA2). Same arrays, only the host wait moves; read per call",
+                              kind="int", attrs=(("glm_fuse_dsa", "EVAL", int),)),
+    "glm_fuse_small": Flag("KYOJIN_GLM_FUSE_SMALL", "0", "GLM-5.3 decode: the linear-attention (KDA) body of a layer (conv + silu, f_b / g_b, q / k norms, g / beta, vector-gated delta rule, o_norm * sigmoid(gate)) runs as ONE launch "
+                           "after the stock projections (kyojin_mlx.glm_small, G10b; oMLX kda_decode_step port), B >= 1, up to 8 rows; stock path for masks, prefill rows, non-plain linears. Read per call",
+                           attrs=(("glm_small", "ENABLED", _on),)),
+    "glm_fuse_small_spec": Flag("KYOJIN_GLM_FUSE_SMALL_SPEC", "1", "glm_fuse_small also serves the verify rows of a speculating cache (G8d): the kernel writes the post-token states of rows 0..T-2 and the conv window is "
+                                "recorded through the cache's record API, so a partial accept keeps the stock states; 0 = the stock body there (G10b as shipped: every MTP verify round ran the 26 / 35 / 51-launch stock "
+                                "body of the 34 layers). Only read when glm_fuse_small is on; read per call",
+                                attrs=(("glm_small", "SPEC", _on),)),
+    "glm_rowfold": Flag("KYOJIN_GLM_ROWFOLD", "0", "GLM-5.3 decode (N2-ROWDOT, needs glm_fuse_small + dense_q): the KDA fbg_a projection (fp16 [4096 -> 320], one rowdot2 launch per layer that G2h measured at 138 us per layer "
+                        "paired with the 115 us qkv GEMV) runs as extra threadgroups of the 6-bit qkv GEMV launch (kyojin_mlx.glm_rowfold): same arithmetic as rowinv.rowdot (bit-identical), one launch less per KDA layer "
+                        "(34 per decode step). Decode rows 1..4 of fp16 x only; verify rows and other types keep the two launches. Read per call",
+                        attrs=(("glm_rowfold", "ENABLED", _on),)),
+    "glm_plan": Flag("KYOJIN_GLM_PLAN", "0", "GLM-5.3 served MTP: the drafts of every session come from ONE per-round plan that maximises expected tokens per ms of the pass (kyojin_mlx.glm_cost: measured "
+                     "verify / draft / commit ms by rows, each session's own per-position acceptance), instead of the cap (solo) or the fixed depth (several sessions); the n-gram gate prices its "
+                     "rounds from the same table. A row costs ~12 ms here (a plain step 31), so depth 1 at one session, plain from ~3 sessions unless acceptance is near 1. Read per round"),
+    "glm_chain": Flag("KYOJIN_GLM_CHAIN", "0", "GLM-5.3 served MTP: when the head's draft token equals the first token of the session's n-gram continuation (two independent drafters agree, even on a "
+                      "4..7-token match the lookup gate refuses alone), the rest of that continuation is appended as free draft rows (no head step), as many as pay at the pass's rate. Read per round"),
+    "glm_adaptive": Flag("KYOJIN_GLM_ADAPTIVE", "0", "GLM-5.3 served MTP: the drafts of every session come from an online controller (kyojin_mlx.glm_adaptive, adapted from oMLX's Lightning MTP depth controller): "
+                         "per pass, the vector of depths that maximises expected tokens / measured ms, where the ms of a pass of n sessions and R rows is the live EMA of the served rounds (the glm_cost table only "
+                         "fills the keys nobody measured, scaled by the measured / table ratio) and acceptance is a per-position EMA per session and text class. Rivals within 15 % are probed 4 rounds at a "
+                         "duty-bounded cadence (cooldown doubles when they lose); drafts that do not beat the plain pass by 3 % park the pass. Takes precedence over glm_plan; a fixed depth (mtp_fixed) wins "
+                         "over it. KYOJIN_GLM_ADAPTIVE_CLASS=0 keeps one class. Read per round"),
+    "glm_multi_plain": Flag("KYOJIN_GLM_MULTI_PLAIN", "0", "Session-count depth policy of a served MTP backend (name kept from DEPTH-B, GLM-5.3 first): keep --mtp-depth 1 but run the TRUE plain step (the decode tick: lookahead, "
+                            "no verify pass, no tuner) every round in which more than one session is decoding (sessions prefilling or waiting do not count); one decoding session drafts as the policy says. Measured on the HOSTGAP lane: the plain "
+                            "step is 17 ms, a d1 round 31 ms, so d1 loses 5-7 % aggregate at 2-4 sessions and wins ~2 % at 1. Crowd rounds are the depth-0 step (byte-identical to plain); solo d1 rounds keep the known d1 near-tie divergence. Not default-on outside GLM-5.3 before the 2nd-arch gate (DS4.1 pack, Qwen3.5-2B vs multi_auto)."
+                            " A fixed depth (mtp_fixed) wins over it. Any MTP backend (needs the plain decode tick, which every backend has); opt-in, a backend whose verify pass is shared is to be A/B-ed first. Read per round"),
+    "spec_depth_auto": Flag("KYOJIN_SPEC_DEPTH_AUTO", "0", "Speculation depth that follows the recent acceptance (kyojin_mlx.spec_depth, SPEC-DEEP; any MTP backend, GLM-5.3 first): per session an EMA of the acceptance of every draft "
+                            "position (only the positions a round reached), the depth = argmax over 0..mtp_depth of expected tokens / round ms (E[T] = 1 + p1 + p1 p2 + ...; ms = the measured warm round of that depth, else a prior shape "
+                            "scaled by the nearest measured depth); one more row per round at most, back down at once, the plain step when the best drafted rate is below 0.9 x plain's (a d1 probe every 16 plain rounds). "
+                            "Predictable text (code continuation, edits, tool output) drafts 2-4 deep, prose stays at d1. mtp_depth is the CEILING (load with --mtp-depth 4 and KYOJIN_GLM_SPEC_ROWS >= 5; flag off = the fixed depth as before). "
+                            "Solo only: with 2+ sessions the engine's own rule runs capped at depth 1 and 4 verify rows (KYOJIN_GLM_MULTI_PLAIN still governs crowds). Lossless: the verify decides every token. A fixed depth (mtp_fixed) wins. "
+                            "KYOJIN_SPEC_DEPTH_COST = comma list, the prior round cost per depth in plain steps. Read per round"),
+
+
+    "spec_plain_min_sessions": Flag("KYOJIN_SPEC_PLAIN_MIN_SESSIONS", "0", "Session-count threshold N of the MTP depth policy (0 = off, read per round, live via /admin/flags): with N or more sessions decoding (sessions prefilling or waiting "
+                                    "do not count) the round is the TRUE plain step (the decode tick: HOSTGAP, lookahead, no verify pass, no head feed, tuner not consulted); with fewer the backend drafts as its policy says. "
+                                    "KYOJIN_GLM_MULTI_PLAIN=1 stays the alias for N = 2 when this flag is 0. Measured on GLM-5.3 after dec10 (cheaper d1 round): d1 beats plain at 2 sessions, plain wins at 4, so N = 3 is the "
+                                    "candidate (A/B in STATUS_MPTHRESH.md). A fixed depth (mtp_fixed) wins over it. Any MTP backend; opt-in.", kind="int"),
+    "glm_lookup_only": Flag("KYOJIN_GLM_LOOKUP_ONLY", "0", "GLM-5.3 served spec with the nextn head loaded: n-gram drafts only (a session without a lookup draft takes the plain step, the head runs no draft step). "
+                            "The n-gram-only A/B arm without a second load. Read per round"),
+    "glm_head_prof": Flag("KYOJIN_GLM_HEAD_PROF", "0", "GLM-5.3 draft head: per-op wall ms of the draft step (embed, norms, eh_proj, attention + indexer, router, shared expert, 8 routed experts, "
+                          "combine, lm_head + argmax; one forced eval per op, so the sum is NOT the served step) into KYOJIN_GLM_HEAD_PROF_OUT (json). A probe. Read per draft call"),
+    "glm_head_q": Flag("KYOJIN_GLM_HEAD_Q", "0", "GLM-5.3 draft head: its dense linears (eh_proj, attention, indexer, shared expert; fp16 today) re-quantised for the DRAFT only (0 off, 4 / 8 affine g64, "
+                       "nvfp4, mxfp4); built on first use; the verify is untouched", kind="mode", choices=("0", "4", "8", "nvfp4", "mxfp4")),
+    "glm_draft_topk": Flag("KYOJIN_GLM_DRAFT_TOPK", "0", "GLM-5.3 draft head: route to K experts instead of 8 for the draft only (0 = the checkpoint's 8). A probe: the head reads 8 of 288 experts per step "
+                           "(0.11 GB of 1.1), so this moves few bytes", kind="int"),
     "idx_qblock": Flag("KYOJIN_IDX_QBLOCK", "512", "indexer query block rows in long prefill (0 = one block; read per call)", kind="int"),
+    "glm_dense4": Flag("KYOJIN_GLM_DENSE4", "0", "GLM-5.3 checkpoint converted by tools/glm_dense4_convert.py (dense FP8 linears rewritten as NVFP4, an overlay on the original): the trunk reads them in place "
+                       "with no flag; this one also keeps the MTP head's NVFP4 linears as stored 4-bit ForeignLinear modules in the draft head (0.12 GB read per draft step instead of the 0.37 GB fp16 decode)",
+                       runtime=False, reason="read when the checkpoint is loaded"),
+    "hc_compile": Flag("KYOJIN_HC_COMPILE", "0", "gated hyper-connection modules (hc_norm + input_mix_weight_down / up [+ block_inject_weight], e.g. qwen4_exp): the whole __call__ is one mx.compile'd function at decode rows (<= KYOJIN_HC_COMPILE_ROWS, 16), "
+                       "fewer host graph nodes per step. Same primitives / order: md5-proven on greedy tokens (cell c31b). Read at load.", runtime=False, reason="read when the model loads"),
+    "step_compile": Flag("KYOJIN_STEP_COMPILE", "0", "generic_foreign decode (any model of the kit): every decoder layer whose cache is a fixed-state ArraysCache (linear attention / SSM) is one mx.compile'd program at decode rows (<= KYOJIN_STEP_COMPILE_ROWS, 16), the cache arrays go in and out; KV layers compile only their cache-free mlp (KYOJIN_STEP_COMPILE_MLP=0 off). First call per shape stock, second traces; a shape key that cannot trace (host sync) stays stock for that key (per shape, not per layer). A flags.set retraces every program (GEN). Read at load.", runtime=False, reason="read when the model loads"),
+    "verify_capture": Flag("KYOJIN_VERIFY_CAPTURE", "0", "foreign MTP / lookup speculation (serve.fnmtp): the verify pass records the state of every fixed-state layer after each row (fused gated-delta kernel steps output, conv windows, PLE windows; compiled layer programs return them as extra outputs), so a partial accept selects the state after `keep` rows instead of restoring the snapshot and running the whole trunk again on the accepted rows. A cache with a slot nobody recorded replays as before. Same tokens as the replay path (the per-row recurrence is the kernel's own).", attrs=(("verify_capture", "ACTIVE", _on),)),
+    "verify_compile_draft": Flag("KYOJIN_VERIFY_COMPILE_DRAFT", "0", "foreign MTP (serve.fnmtp, needs KYOJIN_STEP_COMPILE): the draft head's decoder layer goes through step_compile like the trunk layers (its routed-expert mlp is one mx.compile'd program per row count; the chain of single-row head steps launches fewer kernels). Switchable at idle: the head layer's classes are swapped (programs retrace on a flags.set). Same tokens: the compiled mlp is the same arithmetic.", attrs=(("verify_capture", "DRAFT", _on),)),
+    "step_compile_prep": Flag("KYOJIN_STEP_COMPILE_PREP", "0", "needs KYOJIN_STEP_COMPILE: decoder layers that own a host-prep module (a mapped row table: the n-gram / per-layer embedding of qwen4_exp) compile too: the host part (ids -> rows gather -> upload; the shared RowBatch when on) runs eagerly before the program and the rows go in as an input. Modules declare `step_host_prep(args)` / `step_host_feed(arrs)`; found by duck typing. Read at load.", runtime=False, reason="read when the model loads"),
+    "step_compile_split": Flag("KYOJIN_STEP_COMPILE_SPLIT", "0", "needs KYOJIN_STEP_COMPILE: KV-cache (attention) layers as two compiled programs around the attention call: everything before it, and everything after it (the attention call, with its cache update and python offsets, stays eager; the pre part is recomputed inside the post program). Read at load.", runtime=False, reason="read when the model loads"),
+    "hc_fuse": Flag("KYOJIN_HC_FUSE", "0", "gated hyper-connection modules (qwen4_exp) at decode rows (<= KYOJIN_HC_FUSE_ROWS, 16): norm / act / mix as 3 fused Metal kernels around the module's own linears (6 launches per call instead of 14); supersedes KYOJIN_HC_COMPILE for qualifying calls. Read at load.", runtime=False, reason="read when the model loads"),
+    "hc_mix_view": Flag("KYOJIN_HC_MIX_VIEW", "0", "GLM-5.x prompt chunks: the mHC mix reads x as a reshape view ([1, S, 4, D] -> [S, 4 D]) instead of `x[0].reshape` (mlx `x[0]` is a Gather = a 268 MB copy per sub-block at 8K rows, "
+                        "90 per chunk). Same values (P3-PFREST, glm_pf_glue). Read per call", attrs=(("glm_pf_glue", "VIEW", _on),)),
+    "hc_mix_norm": Flag("KYOJIN_HC_MIX_NORM", "0", "GLM-5.x prompt chunks (needs glm_pf_hc): sinkhorn + collapse + the sub-block rms_norm in ONE kernel (hc_pf_fuse.collapse_norm; MLX's own single-row reduction tree: bit-identical to "
+                         "the stock cast + rms_norm launches). Read per call", attrs=(("hc_pf_fuse", "NORM", _on),)),
+    "hc_mix_twin": Flag("KYOJIN_HC_MIX_TWIN", "0", "with hc_mix_norm: the f32 ffn norm output also written as fp16 (= .astype(float16)) and handed to the shared / routed experts (glm_moe._pf_call), which skips two casts per MoE layer. "
+                         "Bit-identical; measured no gain on the 5-layer cut (P3-PFREST). Read per call", attrs=(("hc_pf_fuse", "TWIN", _on),)),
+    "hc_id_fuse": Flag("KYOJIN_HC_ID_FUSE", "0", "decode rows (<= 16 per step) of the identity-form hyper-connection (foreign_skeleton_hc, 2 hc mix rows, no comb; any stream dtype, "
+                       "any hc, D % 4 == 0): per sub-layer the mix (gluefuse.mixvec), split + collapse + the pre rms_norm (fuse.mhc_pre_identity) and the sandwich post "
+                       "rms_norm + expand (fuse.mhc_expand_identity) are 3 launches instead of ~19. The mix sums in another order than the stock f32 matmul (~1e-7 rel); "
+                       "the rest follows the stock op sequence. Read per call", attrs=(("foreign_skeleton_hc", "IDFUSE", _on),)),
+    "dsa_indexer_pf_view": Flag("KYOJIN_DSA_INDEXER_PF_VIEW", "0", "GLM-5.x prompt indexer (glm_pf_idx): q / pool keys / weights / candidate mask read as reshape views instead of `a[0]` Gathers (full copies per 512-row block: "
+                                "2 x 176 + 2 x 176 launches per chunk, 42 ms at 24K, 72 ms at 120K). Same values. Read per call", attrs=(("glm_pf_idx", "VIEW", _on),)),
+    "dsa_pf_view": Flag("KYOJIN_DSA_PF_VIEW", "0", "GLM-5.x prompt sparse attention (glm_dsa_fused): q_lat / latent / ids as reshape views instead of `a[0]` Gathers (q_lat is 536 MB at 8K rows, per DSA layer). Same values. Read per call",
+                        attrs=(("glm_dsa_fused", "VIEW", _on),)),
+    "engram_device": Flag("KYOJIN_ENGRAM_DEVICE", "0", "Hy4-form Engram (foreign_skeleton EngramParams): the kv / kv_b / gate / lookup_norm / pre_gamma / hc_scale projections stay f32 mx arrays on the device (cached per parameter object) "
+                          "instead of a GPU->host numpy copy + host->GPU copy per token and layer. Same ops, same order: output bit-equal. Generic (any Engram-form model). Read per call",
+                          attrs=(("engram_gguf", "DEVICE", _on),)),
+    "mla_attend_fuse": Flag("KYOJIN_MLA_ATTEND_FUSE", "0", "Decode (1 .. 16 rows) attention core of an absorbed-MLA layer on the fixed-state KV buffer as TWO launches (mla_attend_fused: split-key flash scores + causal / window / keep mask + "
+                            "sinks + softmax + P @ latent, then the split merge) instead of ~15 small ops; only the visible keys are read. After the stock k_b absorb, before the stock v_b absorb. Same maths, scores and P stay "
+                            "fp32 (the stock path rounds them to fp16). fp16 buffer, 576-wide key rows; others take the stock core. Metal only. Read per call",
+                            attrs=(("mla_attend_fused", "ON", _on),)),
+    "mla_prelude_fuse": Flag("KYOJIN_MLA_PRELUDE_FUSE", "0", "Decode (1 .. 16 rows) fixed-state call of an absorbed-MLA layer: the kv_a norm of the latent, both ropes, the q split / transpose, the concat of the cache row and the saturating clamp + dtype cast in ONE launch "
+                          "(mla_prelude) instead of ~8 small ones; the linears, q_a_norm, the slice_update write, the absorbs and the attend keep their own flags. Same maths in fp32 (the stock path rounds the norm output to the activation dtype first). Metal only. Read per call",
+                          attrs=(("mla_prelude", "ON", _on),)),
+    "attn_fp16": Flag("KYOJIN_ATTN_FP16", "0", "Absorbed-MLA attention of the skeleton (any model whose activations are fp32, Hy4): fp16 KV buffer in a NEW fixed-state cache (rows saturated to +-65504), attention projections written as fp16, "
+                      "q / latent / k_pe / k_b and v_b absorbs / scores (fp32 accumulate) / P @ latent / pooled-key reads on fp16 data, softmax fp32; the hidden stream stays fp32. Half the KV and absorb bytes; "
+                      "values differ at fp16 rounding (gate with the model's noise band). Needs a fresh cache after switching. Metal. Read per cache creation / call",
+                      attrs=(("attn_fp16", "ON", _on),)),
+    "attn_fp16_parts": Flag("KYOJIN_ATTN_FP16_PARTS", "7", "attn_fp16: which parts run in fp16 (bit mask): 1 = the KV buffer (read at cache creation), 2 = the attention projections (q_b, kv_a, index and gate linears written fp16), 4 = the k_b / v_b absorbs "
+                            "(fp16 copies, q cast). 7 = all; single bits isolate the source of a quality loss (n8: +3.65 % PPL at 4096 ctx with all three)", kind="int", attrs=(("attn_fp16", "PARTS", int),)),
+    "moe_union": Flag("KYOJIN_MOE_UNION", "0", "Routed-expert block (ForeignSwitchGLU, stored k-quant experts, flag expert_gateup_pair plan glu_down) of a 2 .. 8 row pass (MTP verify rows): each DISTINCT expert's bytes are read once for all "
+                      "the rows that chose it (moe_union: device-side distinct-expert tables, one threadgroup per expert group running the stored format's gather GEMV with R = rows) instead of once per (row, expert) slot. "
+                      "Same decoders, saturation and per-row sum order as the gather. Metal only. Read per call", attrs=(("moe_union", "UNION", _on),)),
+    "split_eval": Flag("KYOJIN_SPLIT", "0", "Plain and verify passes (1 .. 8 rows): mx.async_eval(h) after layers 1 and 8, so the GPU runs the first layers while the host builds the rest of the graph. n10 Mac Studio, Hy4: with one eval at the end the GPU idled for the whole host build (2.6 ms at 1 row, 7.2 ms at 6 rows); plain p4 40.4 -> 43.9 tok/s (ids equal), verify T=6 50.3 -> 44.2 ms. "
+                       "Explicit KYOJIN_SPLIT_EVAL / _ROWS / _ROWS_MIN env wins. Read per call",
+                       attrs=(("foreign_skeleton", "SPLIT_ON", _on),)),
+    "foreign_fmm8": Flag("KYOJIN_FOREIGN_FMM8", "0", "First row count served by the few-row simdgroup-matrix product on a stored Q8_0 linear (fmm8, ForeignLinear.apply before the NAX wide product / gemv8): "
+                         "0 = off, 2 = verify rows from 2. One launch reads each weight once for 8 x NT weight rows and up to 16 rows, the simdgroups of a threadgroup split K (llama.cpp mul_mv_mma, Q8_0 from 2 rows on "
+                         "M3 Ultra). fp16 x, exact int8 weights, fp32 sums (same products as gemv8, other sum order). Metal only. Read per call", kind="int", attrs=(("fmm8", "MIN_ROWS", int),)),
+    "foreign_fmm8_max": Flag("KYOJIN_FOREIGN_FMM8_MAX", "8", "Last row count of the foreign_fmm8 product (1 .. 16; above it the wide NAX product / matmul route). Read per call", kind="int", attrs=(("fmm8", "MAX_ROWS", int),)),
+    "head_fmm8": Flag("KYOJIN_HEAD_FMM8", "0", "Output head of a 1 .. 16 row pass (decode, verify rows) through a Q8_0 copy of the dense head matrix (symmetric int8 + fp16 scale per 32, 1.06 bytes per weight) read by the few-row "
+                      "simdgroup-matrix kernel (fmm8, float32 logits) instead of the dense float32 matmul. Takes precedence over head_q. One copy shared with the MTP draft's trunk-side head. Logits differ at the "
+                      "8-bit rounding: gate with the model's noise band. Metal only. Read per call", kind="int", attrs=(("headq", "FMM8", int),)),
+    "mla_decode_vec": Flag("KYOJIN_HY4_ATTN_VEC", "0", "Decode / verify (1 .. 8 rows) attention core of an absorbed-MLA layer on the fixed-state KV buffer as ONE launch (mla_decode_vec: flash-attention-vec shape of llama.cpp, one threadgroup of 4 simdgroups per "
+                        "head and row, online softmax + attention sink + P @ latent, V = the first 512 columns of the key row) instead of the stock chain of ~15-25 small launches, between the k_b and v_b absorb products. "
+                        "1 = windowed (SWA) layers: the window is read straight from the buffer with the device offset; 2 = also kpool layers (keep mask below the gather threshold, key ids above it). The buffer and queries keep their dtype "
+                        "(fp32 or fp16), scores / accumulation fp32. Metal only; rows or dtypes outside the contract run the stock core. Read per call",
+                        kind="int", attrs=(("mla_decode_vec", "MODE", int),)),
+    "mla_decode_vec_min_rows": Flag("KYOJIN_HY4_ATTN_VEC_MIN_ROWS", "2", "With mla_decode_vec: first row count served by the one-launch core. 2 (default) = plain decode (one row) keeps the stock core, "
+                                    "spec verify rounds (2 or more rows) use the one-launch core. 1 = every row count. Read per call",
+                                    kind="int", attrs=(("mla_decode_vec", "MIN_ROWS", int),)),
+    "foreign_nbr_small": Flag("KYOJIN_FOREIGN_NBR_SMALL", "0", "Output rows per simdgroup (NBR) of the 8-bit stored GEMV (gemv8, 1 .. 8 rows) on matrices under 8M weights: 0 = the global NBR (2), 1 = one row per "
+                              "simdgroup = twice the threadgroups (the 96-threadgroup 3072 x 1536 / 1536 x 3072 / 1024-wide projections run at 0.5-0.6 TB/s against 1.0-1.2 for the big ones). "
+                              "Same sums per output row (the row order inside a simdgroup does not change a dot product). Read per call", kind="int", attrs=(("foreign_linear", "NBR_SMALL", int),)),
+    "head_q": Flag("KYOJIN_HEAD_Q", "0", "Output head of a 1 .. 16 row pass (plain decode, verify rows; prompt chunks keep the dense head) through an 8- (or 4-) bit affine group-64 copy of the dense head matrix "
+                   "(mx.quantized_matmul) instead of the dense float32 matmul (Hy4: 1.6 GB, 1.3 ms of a 22.9 ms step at the bandwidth roof; Q8 reads a quarter). The packed copy is built once and "
+                   "shared with the MTP draft's output projection (one low-bit copy; the dense head stays resident for the prompt chunks). Logits differ at the 8-bit rounding: gate with the model's "
+                   "noise band. Read per call", kind="int", attrs=(("headq", "BITS", int),)),
+    "moe_route_rs": Flag("KYOJIN_MOE_ROUTE_RS", "0", "Decode / verify (1 .. 8 rows) router of a generic MoE block with sigmoid gating (GenericMoE.route): the gate GEMV, sigmoid, selection bias, top-k, weight normalisation and scale "
+                         "as ONE launch (glm_moe_rs.rowsel: rowdot + the last-arriving threadgroup selects) instead of the stock matmul + bias + sigmoid + argsort + take + sum + divide (~6 launches). "
+                         "Logits = rowdot (row-invariant, so a plain step and a verify row agree); one group, no logit bias; others take the stock path. Metal only. Read per call",
+                         attrs=(("foreign_moe_generic", "ROUTE_RS", _on),)),
+    "moe_route_sel": Flag("KYOJIN_MOE_ROUTE_SEL", "0", "Decode / verify (1 .. 16 rows) router selection of a generic MoE block (GenericMoE.route), any gating (softmax, sigmoid, sqrt_softplus, none, softmax_weight): "
+                          "gating, selection bias, group limit, top-k, weight normalisation and scale as ONE launch (moe_route_sel.select, llama.cpp topk_moe layout) on the stock router logits, instead of "
+                          "~6 launches (sigmoid, + bias, argsort, take, sum, divide, scale). Logits unchanged (bit-identical indices vs stock; weights within fp32 ulps; ties: lowest index). "
+                          "moe_route_rs (gate GEMV fused in too, rowdot logits) takes precedence where eligible. Metal only. Read per call",
+                          attrs=(("foreign_moe_generic", "ROUTE_SEL", _on),)),
+    "kpool_fuse": Flag("KYOJIN_KPOOL_FUSE", "0", "Decode (1 .. 8 query rows) pool selection of a kpool layer as ONE launch (kpool_fuse.select): indexer scores over the pooled keys + exact top-k (ties: lowest pool index, as the stable argsort) "
+                       "+ the [B, 1, L, S] slot mask with the forced tail group, instead of ~50 elementwise launches. Generic by shape. Selection equal to the stock path (scores to ~1e-6 relative: plain d-loop dot). Metal only; prefill unchanged. Read per call",
+                       attrs=(("kpool_fuse", "ON", _on),)),
+    "kpool_score": Flag("KYOJIN_KPOOL_SCORE", "0", "kpool (block-sparse indexer) layers: the indexer scores sum_h relu(iq_h . pk_j) * w_h in ONE multi-threadgroup launch on fp32 simdgroup 8x8 tiles (kpool_score.scores, any query rows) instead of the "
+                        "[B, H, L, J] fp32 temporaries (prompt chunks) or the one-threadgroup scalar loop of kpool_fuse (decode rows). Prompt chunks (batch 1, > 8 rows) then take the exact multi-threadgroup top-k (idxfast.topk_mt) instead of the full-row argsort; "
+                        "decode rows keep kpool_fuse's radix select + slot mask with the scores as input. Same selected set up to the order of the fp32 d-sum (~1e-6 relative). Generic by shape. Metal only. Read per call",
+                        attrs=(("kpool_score", "ON", _on),)),
+    "kpool_keycache": Flag("KYOJIN_KPOOL_KEYCACHE", "0", "kpool (block-sparse indexer) layers: the pooled keys are kept per cache across tokens (extended only by the groups a step completes, a rewound cache drops "
+                           "the pools past its offset) instead of recomputed from every cached value / gate row each token (gather + f32 cast + softmax + norm + rope, ~26 launches and a host sync per layer). "
+                           "Same ops per pool: bit-equal. Solo int-offset caches; others take the stock path. Generic by shape. Read per call", attrs=(("foreign_skeleton_kpool", "KEYCACHE", _on),)),
+    "moe_router_select_par": Flag("KYOJIN_MOE_ROUTER_SELECT_PAR", "0", "GLM-5.x prompt chunks: the MoE router's top-k select as `select_par` (one threadgroup per token, same outputs bit for bit) instead of the walking one-simdgroup kernel. "
+                                  "Measured NOT faster at 8192 rows (0.45 vs 0.23 ms min, P3-PFREST): off. Read per call", attrs=(("glm_moe", "PF_SELPAR", _on),)),
+    "kda_scan_nsg": Flag("KYOJIN_KDA_SCAN_NSG", "4", "KDA chunked scan (kda_nax main kernel): simdgroups per threadgroup, 4 = shipped (128 threads), 2 = 64 threads / 256 groups (bit-identical, -2 ms per KDA layer at 8K rows on the cut), "
+                         "1 = 2x slower; any other value (8 builds a kernel with no gate channels) falls back to 4 and the flag audit says why. Read per prompt call", kind="int", attrs=(("kda_nax", "NSG", int),)),
+    "foreign_castfree": Flag("KYOJIN_FOREIGN_CASTFREE", "0", "foreign formats (foreign_linear.ForeignLinear, any model): a one-byte stored linear (fp8 / q8_0 / fp8b) whose rows take the "
+                             "stored GEMV (gemv8, decode rows <= KYOJIN_FOREIGN_GEMV8_ROWS) reads a float32 / bfloat16 input and writes a float32 output inside the kernel "
+                             "(foreign_metal.gemv8_source xin / yout): the AsType launch before and after the GEMV go away (2 per call; f32-stream models). The input is "
+                             "rounded to half while it is staged and the output is the fp16-rounded value widened, as the casts did: bit-identical. Read per call",
+                             attrs=(("foreign_linear", "CASTFREE", _on),)),
+    "shared_input_gemv": Flag("KYOJIN_SHARED_INPUT_GEMV", "0", "skeleton stored load (foreign_skeleton_stored.load_stored, any model of that loader): (1) a BF16 / F16 GGUF linear stays 16-bit on the device "
+                              "(foreign_linear.DenseLinear) instead of being decoded to a float32 matrix (half the bytes: the lm_head of a 120k vocabulary is 0.74 GB, not 1.48), and decode rows "
+                              "(<= KYOJIN_SHARED_GEMV_ROWS, 8) read it in one GEMV (widened exactly, float32 accumulate: same products, the sum's order differs); (2) the linears that read ONE input "
+                              "object (found from the module graph by one traced 1-row forward) are one pass over x: stored-format groups (group_same_input: q8_0 / q4_k / fp8 ...) and the dense 16-bit "
+                              "groups. Read at load (the layout) and per call (a flag flip then runs the old float32 matmul / the member alone: the cell toggles it on one load). 0 = today",
+                              attrs=(("foreign_linear", "SHARED_GEMV", _on),)),
+    "expert_gateup_pair": Flag("KYOJIN_EXPERT_GATEUP_PAIR", "0", "routed experts on stored bytes (foreign_linear.ForeignSwitchGLU / foreign_moe_generic.GenericMoE, any stored gather-GEMV type, e.g. q3_k / q4_k), decode slots "
+                               "(<= KYOJIN_FOREIGN_GATHER_MAX): gate and up are read in ONE gather pass (DevPack.gather_pair_raw; same stored type and shape, decided once per block, not per call) and "
+                               "silu(gate) * up is folded into the down launch's input staging (2 launches per block instead of 3 + the stock activation ops; clamp / SiTU: one activation launch); "
+                               "the router-weighted sum over the K slots of GenericMoE is one kernel (moe_reduce: f32 products added in slot order, written in the stream dtype) instead of 4 stock ops. "
+                               "The activation is computed in f32 inside the kernel (not rounded to half first): not bit-identical, greedy ids are the gate. Read per call",
+                               attrs=(("foreign_linear", "GATEUP_PAIR", _on), ("foreign_moe_generic", "GATEUP_PAIR", _on))),
 }
 _GLUE = ("glue_fuse", "glue_fuse_norm")
 
@@ -952,8 +1255,12 @@ def apply_defaults(environ=None) -> None:
     own fallback literal, so without this a default flipped here only changed get_all(). Runs from the package __init__, before any lever module is imported.
     Int levers are left alone: some read the variable's presence (multiuser checks KYOJIN_HALF_ROWS)."""
     env = os.environ if environ is None else environ
+    from . import opflags as OF
+    OF.sync_env(env)                                                    # op-named spelling <-> model-named alias, before the start values below fill the gaps
     for f in FLAGS.values():
         if f.kind == "bool" and f.default in ("0", "1"):
+            if f.env not in env and env is os.environ:
+                OF.note_filled(f.env, f.default)                        # a start value, not a choice of the user (arch defaults may still replace it)
             env.setdefault(f.env, f.default)
 
 
@@ -1010,6 +1317,11 @@ def _apply_glue() -> None:
         GF.install()                                             # wires the mix_vector cut once (it reads ENABLED per call after that)
 
 
+def _opflags():
+    from . import opflags
+    return opflags
+
+
 def set_many(values: dict) -> dict:
     """Validate every pair first (KeyError: unknown flag, PermissionError: not runtime, ValueError: bad value), then apply them all.
     Returns get_all()."""
@@ -1024,7 +1336,9 @@ def set_many(values: dict) -> dict:
         norm[n] = _norm(f, v)
     for n, s in norm.items():
         f = FLAGS[n]
-        os.environ[f.env] = s
+        for sp in _opflags().spellings(f.env):                          # op name and model-named aliases carry the same value
+            os.environ[sp] = s
+            _opflags()._FILLED.pop(sp, None)
         for mod, attr, fn in f.attrs:
             setattr(_mod(mod), attr, fn(s))
     if any(n in _GLUE for n in norm):

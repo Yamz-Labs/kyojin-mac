@@ -32,6 +32,7 @@ rounds at most once (the global scale of NVFP4, or an fp32 block scale of FP8).
 from __future__ import annotations
 
 import json
+import math
 import mmap
 import os
 import struct
@@ -138,7 +139,7 @@ class SafetensorsFile:
         self.header = hdr
         for k, m in hdr.items():
             b, e = m["data_offsets"]
-            if m["dtype"] in _NP and e - b != int(np.prod(m["shape"], dtype=np.int64)) * np.dtype(_NP[m["dtype"]]).itemsize:
+            if m["dtype"] in _NP and e - b != math.prod(m["shape"]) * np.dtype(_NP[m["dtype"]]).itemsize:
                 raise ValueError(f"{path}:{k}: {m['dtype']}{m['shape']} does not span {e - b} bytes")
             if self.base + e > size:
                 raise ValueError(f"{path}:{k}: data past end of file")

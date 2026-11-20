@@ -220,7 +220,7 @@ class Backend:
             chunk = MAX_PREFILL_CHUNK
         t0 = time.perf_counter()
         cache = self.make_cache()
-        self.prefill_chunk(cache, list(range(1000, 1000 + n)))
+        self.prefill_chunk(cache, list(range(1, 1 + n)))
         for k in (2, 4, 64, 256, 512):                                 # row-count bands with their own kernel variants: first prompts of these sizes paid +0.07-0.7 s
             self.prefill_chunk(cache, list(range(3000, 3000 + k)))
         lg = self.prefill_chunk(cache, [2000 + i % 100000 for i in range(chunk)])
@@ -400,7 +400,7 @@ class VlmBackend(Backend):
             ns["tq"] = tq.config()                          # (absent when off: the namespace of existing checkpoints is unchanged)
         from .. import ablit
         if (sig := ablit.signature()) is not None:
-            ns["ablit"] = sig                               # decensor hook: other layer outputs (absent when off: namespace unchanged)
+            ns["ablit"] = sig                               # direction hook: other layer outputs (absent when off: namespace unchanged)
         if self.drafter is not None:                # the drafter ring is part of the checkpoint
             ns["draft"] = [list(self.drafter.tap_ids), int(self.drafter.window)]
         return ns
@@ -901,9 +901,293 @@ class VlmBackend(Backend):
         return lg
 
 
+def _per_position(cum) -> list:
+    """Cumulative confidence [n] (DSpark block drafter) -> per-position conditional probabilities."""
+    c = [float(x) for x in cum.tolist()]
+    return [c[0]] + [c[i] / c[i - 1] if c[i - 1] > 0 else 0.0 for i in range(1, len(c))]
+
+
 def COPY_V2() -> bool:
     """Flag copy_v2 (read per call): copy sessions keep their draft ring lazy."""
     return os.environ.get("KYOJIN_COPY_V2", "0") not in ("0", "")
+
+
+
+class GlmPass:
+    """One GLM-5.3 verify pass (GlmBackend.spec_verify_bc): logits [rows, V] fp32 (session k's rows start at starts[k]); commit keeps, per session,
+    its pending token and accepted[k] drafts through mlx-vlm's speculative cache transaction (recurrent states recorded per position, KV trimmed).
+    With the nextn head: the kept rows' target hidden states go to the sessions' draft states."""
+    can_defer = False
+
+    def __init__(self, tx, logits, starts, hidden=None, token_lists=None, rows=None):
+        self.tx, self.logits, self.starts, self.taps = tx, logits, starts, {}
+        self.hidden, self.token_lists = hidden, token_lists                     # hidden [S, K, H]
+        self.rows = rows                                                        # flag glm_lag1: the verify rows [S, K] as built on the device (token_lists is None then)
+
+    def commit(self, accepted: list, drafts=None, p0s=None, defer=None) -> None:
+        self.tx.commit([int(a) + 1 for a in accepted])
+        if self.hidden is not None and drafts is not None:
+            for k, d in enumerate(drafts):
+                if d is not None:
+                    n = int(accepted[k]) + 1
+                    d.append(self.hidden[k, :n], self.rows[k, :n] if self.token_lists is None else mx.array(self.token_lists[k][:n], dtype=mx.int32), p0s[k])
+
+
+class GlmBackend(VlmBackend):
+    """GLM-5.3 served as stored (foreign_linear) on the model's own batch caches. Speculative decode without a draft head yet: `enable_lookup_spec`
+    verifies the per-session n-gram lookup drafts (kyojin_mlx.pld) as [S, K] rows of one forward under start_speculative_cache (34 of 45 layers
+    are recurrent: the cache records each position's state and commit keeps each session's accepted prefix). Rows whose session has no lookup
+    draft that round take the plain step (engine: lookup_only)."""
+    lazy_needs_eager = True                              # engine: flags glm_chain / spec_skip read the drafts first, so they keep the eager path
+
+    def draft_lazy(self, jobs: list, want_logits: bool = False):
+        """Flag glm_lag1 (KYOJIN_GLM_LAG1=1, default off): the draft head's proposals stay on the device (async_eval started, no host read) and
+        `spec_verify_lazy` builds the verify rows from them, so the host builds the verify graph while the GPU drafts (the eager path waits for the draft,
+        reads it, then starts building). The same graphs in the same order on one stream: the same tokens. None = the engine's eager path
+        (draft_many -> lookup_drafts -> spec_verify_bc): flag off, a block drafter, logits asked for (spec_rs), or no job drafted."""
+        if os.environ.get("KYOJIN_GLM_LAG1", "0") in ("0", "") or self.nextn is None or self.block is not None or want_logits:
+            return None
+        outs = {}
+        for i, (d, last, p0, depth, _h) in enumerate(jobs):
+            if depth > 0 and d is not None:
+                o = self.nextn.draft(d, last, p0, depth)
+                if o is not None:
+                    outs[i] = o
+        if not outs:
+            return None
+        mx.async_eval(*outs.values(), *[a for d, *_ in jobs if d is not None for a in d.arrays()])      # the GPU starts the draft now; the host goes on to build the verify
+        return GlmLazyDrafts(jobs, outs)
+    _lookup_only = False
+    nextn = None
+    blocks = None                                       # {kind: kyojin_mlx.glm_block.BlockDrafter}: external DFlash2 / DSpark block drafters (KYOJIN_GLM_BLOCK), replace nextn
+
+    @property
+    def block(self):
+        """The drafter in use: flag glm_block_arm (KYOJIN_GLM_BLOCK_ARM) names it, else the first loaded."""
+        if not self.blocks:
+            return None
+        return self.blocks.get(os.environ.get("KYOJIN_GLM_BLOCK_ARM", "")) or next(iter(self.blocks.values()))
+
+    @property
+    def lookup_only(self) -> bool:
+        """No draft head in the round: a session without an n-gram draft takes the plain step. Also forced with the head loaded by flag glm_lookup_only (read per round: the n-gram-only A/B arm)."""
+        return self._lookup_only or (self.nextn is not None and os.environ.get("KYOJIN_GLM_LOOKUP_ONLY", "0") not in ("0", ""))
+
+    @lookup_only.setter
+    def lookup_only(self, v: bool) -> None:
+        self._lookup_only = bool(v)
+
+    def enable_lookup_spec(self, max_rows: int = 16) -> dict:
+        self.supports_spec = True
+        self.lookup_only = True
+        self.max_spec_rows = max_rows
+        return {"spec": "lookup", "max_rows": max_rows}
+
+    def enable_nextn(self, head: dict, cfg: dict, max_rows: int = 16) -> dict:
+        """The checkpoint's own MTP layer (45) as the draft head, next to the n-gram lookups (kyojin_mlx.glm_nextn)."""
+        from .. import glm_nextn
+        sw = getattr(self.model, "_nvfp4_mtp_switch", {})
+        assert len(sw) == 1, f"GLM-5.3 nextn head: {len(sw)} MTP expert blocks loaded (1 expected)"
+        self.nextn = glm_nextn.NextN.build(self.model, cfg, head, next(iter(sw.values())), getattr(self.model, "_g4_mtp_packs", None))
+        self.nextn.pack = getattr(self, "pack", None)       # flag draftvocab reads the tokenizer next to the pack
+        from .. import glm_cost                              # flags glm_plan / glm_chain: the measured round-cost table (KYOJIN_GLM_COSTS = a re-measured json)
+        self.glm_costs = glm_cost.Costs.from_env()
+        # load gate: KYOJIN_GLM_SPEC_ROWS caps the rows (sessions + drafts) of a verify pass; the engine shortens the longest drafts first, so
+        # 4 = depth 1 for up to 2 active sessions, fewer drafts at 3, plain decode from 4 sessions on (spec turns negative at high concurrency)
+        self.supports_spec, self.lookup_only = True, False
+        self.max_spec_rows = int(os.environ.get("KYOJIN_GLM_SPEC_ROWS", "") or max_rows)
+        return {"spec": "nextn+lookup", "max_rows": max_rows}
+
+    def enable_block(self, spec: str, max_rows: int = 16, log=print) -> dict:
+        """`kind:DIR[,kind:DIR]` (kind = dflash2 | dspark, DIR = the checkpoint): external block drafters read the target's hidden states of a few layers (taps installed on the
+        trunk's layers, nothing runs when this is not called) and propose up to 8 tokens per forward (kyojin_mlx.glm_block). They take the place of the nextn head;
+        with several loaded, flag glm_block_arm picks the one in use."""
+        from .. import glm_block
+        self.blocks = {}
+        for part in spec.split(","):
+            kind, _, path = part.partition(":")
+            if kind not in ("dflash2", "dspark") or not path:
+                raise ValueError(f"KYOJIN_GLM_BLOCK={spec!r}: expected dflash2:DIR and / or dspark:DIR")
+            self.blocks[kind] = glm_block.build(path, kind, self.lm, log=log)
+        self.nextn = None
+        self.supports_spec, self.lookup_only = True, False
+        top = max(b.cfg.block for b in self.blocks.values())
+        self.max_spec_rows = int(os.environ.get("KYOJIN_GLM_SPEC_ROWS", "") or max(max_rows, top + 1))
+        return {"spec": "+".join(self.blocks) + "+lookup", "max_rows": self.max_spec_rows, "block": top}
+
+    def new_draft(self):
+        if self.block is not None:
+            return self.block.new_state()
+        from ..glm_nextn import GlmDraft
+        return GlmDraft() if self.nextn is not None else None
+
+    def draft_snapshot(self, d):
+        return None                                     # a restored session starts a fresh head cache (GlmDraft.append restarts on a position gap)
+
+    def draft_restore(self, snap):
+        return self.new_draft()
+
+    def draft_nbytes(self, d) -> int:
+        return sum(a.nbytes for a in d.arrays()) if d is not None else 0
+
+    def draft_arrays(self, d) -> list:
+        return d.arrays() if d is not None else []
+
+    def draft_many(self, jobs: list, want_logits: bool = False, couple: list | None = None) -> list:
+        if self.block is not None:
+            bl = self.block
+            outs = [bl.draft(d, last, p0, depth) if d is not None and d.kind == bl.kind else None for d, last, p0, depth, _h in jobs]
+            live = [o for o in outs if o is not None]
+            if live:
+                mx.eval(*live, *[a for d, *_ in jobs if d is not None for a in d.arrays()], *[d.conf for d, *_ in jobs if d is not None and d.conf is not None])
+            self._block_confs = [_per_position(d.conf) if (o is not None and d.conf is not None) else None for o, (d, *_) in zip(outs, jobs)]
+            return [bl.trim(d, [int(t) for t in o.tolist()]) if o is not None else [] for o, (d, *_) in zip(outs, jobs)]
+        if self.nextn is None:
+            return [[] for _ in jobs]
+        outs = [self.nextn.draft(d, last, p0, depth) if d is not None else None for d, last, p0, depth, _h in jobs]
+        live = [o for o in outs if o is not None]
+        if live:
+            mx.eval(*live, *[a for d, *_ in jobs if d is not None for a in d.arrays()])
+        return [[int(t) for t in o.tolist()] if o is not None else [] for o in outs]
+
+    def flush_drafts(self, ds) -> None:
+        return None
+
+    def draft_confs(self) -> list | None:
+        """DSpark block drafter: per job the per-position P(accept | prefix accepted) of the last draft_many (the engine's dspol_v2 width policy trains on them); else None."""
+        return getattr(self, "_block_confs", None) if self.block is not None else None
+
+    def _cache_pos(self, cache) -> int:
+        for c in cache:
+            if hasattr(c, "caches"):
+                return int(c.caches[0].offset)
+        return 0
+
+    def prefill_chunk(self, cache, ids, draft=None, skip_dec=False, vl=None):
+        if self.block is not None and draft is not None and not skip_dec:
+            p = self._cache_pos(cache)
+            bl = self.block
+            bl.taps.begin()
+            try:
+                with self.HL.last_row():
+                    out = self.lm(**self._forward_kw(ids, vl), cache=cache)
+            finally:
+                tp = bl.taps.end()
+            lg = out.logits[:, -1].astype(mx.float32)
+            draft.append(tp[0], mx.array(ids, dtype=mx.int32), p)                   # taps of every prompt position (only the last window rows are kept)
+            mx.eval(lg, *self.state(cache), *draft.arrays())
+            self._free_handoff(cache)
+            return lg
+        if self.nextn is None or draft is None or skip_dec:
+            return super().prefill_chunk(cache, ids, None, skip_dec, vl)
+        p = self._cache_pos(cache)
+        with self.HL.last_row():
+            out = self.lm(**self._forward_kw(ids, vl), cache=cache, return_hidden=True)
+        lg = out.logits[:, -1].astype(mx.float32)
+        draft.append(out.hidden_states[0][0], mx.array(ids, dtype=mx.int32), p)
+        self.nextn.feed(draft)                           # the pairs whose next token is in the prompt; the last position waits for the first sampled token
+        mx.eval(lg, *self.state(cache), *draft.arrays())
+        self._free_handoff(cache)
+        return lg
+
+    def step_feed(self, bc, tokens, drafts, p0s):
+        if self.block is not None:
+            self.gated_reset(bc)
+            bl = self.block
+            bl.taps.begin()
+            try:
+                out = self.lm(tokens[:, None], cache=bc)
+            finally:
+                tp = bl.taps.end()                           # [S, 1, T*H]
+            lg = out.logits[:, -1].astype(mx.float32)
+            for k, d in enumerate(drafts):
+                if d is not None:
+                    d.append(tp[k], tokens[k:k + 1], p0s[k])
+            dep = [a for c in bc if hasattr(c, "stacked_arrays") for a in c.stacked_arrays()]
+            return mx.depends(lg, dep) if dep else lg
+        if self.nextn is None:
+            return self.step(bc, tokens)
+        self.gated_reset(bc)
+        out = self.lm(tokens[:, None], cache=bc, return_hidden=True)
+        lg = out.logits[:, -1].astype(mx.float32)
+        h = out.hidden_states[0]                         # [S, 1, H]
+        for k, d in enumerate(drafts):
+            if d is not None:
+                d.append(h[k], tokens[k:k + 1], p0s[k])
+        dep = [a for c in bc if hasattr(c, "stacked_arrays") for a in c.stacked_arrays()]
+        return mx.depends(lg, dep) if dep else lg
+
+    def replay(self, cache, tokens, draft=None):
+        return Backend.replay(self, cache, tokens, draft)
+
+    def settle(self, bc, drafts=()) -> None:
+        mx.async_eval(*self.state(bc), *[a for d in drafts if d is not None for a in d.arrays()])
+
+    def spec_verify_bc(self, bc, token_lists: list):
+        from mlx_vlm.speculative.cache_state import start_speculative_cache
+        self.gated_reset(bc)
+        K = max(len(t) for t in token_lists)
+        rows = [list(map(int, t)) + [int(t[-1])] * (K - len(t)) for t in token_lists]       # pad with the last token: rows past a session's count are never kept
+        return self._verify_rows(bc, mx.array(rows, dtype=mx.int32), [len(t) for t in token_lists], [list(map(int, t)) for t in token_lists])
+
+    def spec_verify_lazy(self, bc, lh, pendings):
+        """Flag glm_lag1: the verify of `spec_verify_bc` with the draft rows still on the device (GlmLazyDrafts / LookupDrafts): row k = [pending token, its drafts], padded
+        with its last token to the longest row like the host rows are."""
+        self.gated_reset(bc)
+        xs = []
+        for i, p in enumerate(pendings):
+            pend = mx.array([p], dtype=mx.int32)
+            xs.append(mx.concatenate([pend, lh.toks[lh.slot[i], :lh.depths[i]].astype(mx.int32)]) if i in lh.slot else pend)
+        K = max(int(x.shape[0]) for x in xs)
+        rows = mx.stack([x if int(x.shape[0]) == K else mx.concatenate([x, mx.broadcast_to(x[-1:], (K - int(x.shape[0]),))]) for x in xs])
+        return self._verify_rows(bc, rows, [int(x.shape[0]) for x in xs], None)
+
+    def _verify_rows(self, bc, rows, lens: list, token_lists):
+        from mlx_vlm.speculative.cache_state import start_speculative_cache
+        K = int(rows.shape[1])
+        tx = start_speculative_cache(bc, K)
+        bl = self.block
+        if bl is not None:
+            bl.taps.begin()
+            try:
+                out = self.lm(rows, cache=bc)
+            finally:
+                hidden = bl.taps.end()                       # [S, K, T*H]
+        else:
+            out = self.lm(rows, cache=bc, return_hidden=self.nextn is not None)
+            hidden = out.hidden_states[0] if self.nextn is not None else None
+        lg = out.logits.astype(mx.float32)               # [S, K, V]
+        starts, parts, r = [], [], 0
+        for k, n in enumerate(lens):
+            starts.append(r); parts.append(lg[k, :n]); r += n
+        return GlmPass(tx, mx.concatenate(parts, axis=0), starts, hidden, token_lists, rows=rows)
+
+
+class GlmLazyDrafts:
+    """Proposals of a GlmBackend.draft_lazy call (flag glm_lag1), the interface of LazyDrafts for the engine's lazy round: `toks` [live, width] int32 on the device
+    (row k of job i = slot[i], padded with 0 past the job's depth), `depths[i]` rows of job i are verified (0 = no draft this round: the head had no state that lines up).
+    No confidence gate (keep None, like the eager GLM path)."""
+
+    is_lookup = False
+
+    def __init__(self, jobs: list, outs: dict):
+        live = sorted(outs)
+        self.depths = [int(j[3]) if i in outs else 0 for i, j in enumerate(jobs)]
+        self.slot = {i: k for k, i in enumerate(live)}
+        self.width = max(self.depths)
+        self.toks = mx.stack([o if int(o.shape[0]) == self.width else mx.concatenate([o, mx.zeros((self.width - int(o.shape[0]),), dtype=mx.int32)])
+                              for o in (outs[i].astype(mx.int32) for i in live)])
+        self.conf = mx.zeros((len(live), self.width), dtype=mx.float32)
+        self.counts = list(self.depths)
+        self.keep, self.rs, self.packed, self.lg = None, False, False, None
+        self.confs = [None] * len(self.depths)
+
+    def set_toks(self, toks) -> None:
+        self.toks, self.rs = toks, True
+
+    def tolist(self):
+        vals = (HS.read if self.packed else (lambda a: a.tolist()))(self.toks)
+        return [[int(t) for t in vals[self.slot[i]][:self.depths[i]]] if i in self.slot else [] for i in range(len(self.depths))]
 
 
 class LookupDrafts:
@@ -1143,6 +1427,227 @@ class GenericBackend(Q35Backend):
         return None if self.pack is None else {"arch": self.arch, "pack": kvdisk.pack_fingerprint(self.pack)}
 
 
+HY4_ONE_SESSION = "Hy4: one session only (Engram n-gram history is per model until delivery B)"
+
+
+class Hy4Cache(list):
+    """The per-layer caches of one Hy4 session (a list, so arrays_of / nbytes walk it as any cache list; a class, so the backend can hold a weak
+    reference to the session that owns the model's Engram history). `hist`: the session's Engram history (numpy) while another session holds the model's."""
+    hist = None
+
+
+class Hy4Backend(Backend):
+    """Hy4-flash (`hy_v4_flash`) on the skeleton Model (foreign_skeleton), reduced (delivery A): prefill and one-row decode for ONE session, no
+    verify, no batch, no speculation, no prefix snapshots, no disk tier. The Engram n-gram history lives in the model (foreign_skeleton.engram_source_of:
+    one history per model, restarted at offset 0), so a second session would read the first one's history: the engine refuses it at submit
+    (`one_session`, HTTP 503) and every forward here checks that it runs on the cache that owns the history (a fork, a restored snapshot or another
+    session's cache raises, it is never decoded on the wrong history). Per-session KV and history = delivery B."""
+    kind = "hy4"
+    max_rows = 1
+    one_session = HY4_ONE_SESSION if os.environ.get("KYOJIN_HY4_ONE_SESSION", "0") == "1" else None   # KYOJIN_HY4_ONE_SESSION=1: delivery A (a second live session is a 503). Default: every
+    #                                                                          session owns its Engram history (swapped in when it runs), so prefix snapshots and a queue of requests work
+
+    def __init__(self, model, stop_ids=()):
+        self.model = model
+        self.stop_ids = frozenset(int(i) for i in stop_ids)     # server.build_app adds them to the stop set (the GGUF eos: 120025 on Hy4-flash)
+        self.pack = None
+        self._owner = None                          # weakref of the Hy4Cache whose tokens the Engram history holds
+
+    def _claim(self, cache):
+        """The model's Engram history belongs to the session that runs: a session that takes over parks the history of the one that leaves (on its cache: `hist`) and
+        loads its own; a new session (offset 0) starts a fresh one. A cache with no parked history and an offset is refused, it is never decoded on another history."""
+        import weakref
+        from ..foreign_skeleton import SkeletonError
+        if not isinstance(cache, Hy4Cache):
+            raise SkeletonError(f"{HY4_ONE_SESSION}: not a Hy4 session cache ({type(cache).__name__})")
+        owner = self._owner() if self._owner is not None else None
+        if owner is cache:
+            return
+        src = getattr(self.model, "engram_source", None)
+        if owner is not None and src is not None and hasattr(src, "get_history"):
+            owner.hist = src.get_history()
+        if cache[0].offset == 0:                    # a new session: the Engram source restarts its history at offset 0
+            cache.hist = None
+        elif cache.hist is None or src is None or not hasattr(src, "set_history"):
+            raise SkeletonError(f"{HY4_ONE_SESSION}: this cache (offset {cache[0].offset}) holds no Engram history of its own")
+        else:
+            src.set_history(cache.hist)
+            cache.hist = None
+        self._owner = weakref.ref(cache)
+
+    def make_cache(self):
+        from .. import fixed_kv
+        if fixed_kv.ENABLED:                        # KYOJIN_HY4_FIXED_KV=1: preallocated buffers + a device write offset (the whole layer compiles)
+            return Hy4Cache(fixed_kv.make_caches(self.model))
+        from mlx_lm.models.cache import KVCache
+        return Hy4Cache(KVCache() for _ in self.model.layers)
+
+    def fork(self, cache):
+        """An independent copy of a session cache (prefix snapshot, restore): the layer caches (arrays shared until a write) and the Engram history of its first
+        `offset` positions (the live owner's from the model, a parked session's from its cache)."""
+        from .. import multiuser as MU
+        from ..fixed_kv import FixedKVCache
+        from ..foreign_skeleton import SkeletonError
+        if self.one_session:
+            raise SkeletonError(f"{HY4_ONE_SESSION}: no fork / snapshot / restore of a session cache")
+        off = cache[0].offset
+        owner = self._owner() if self._owner is not None else None
+        src = getattr(self.model, "engram_source", None)
+        h = src.get_history() if (owner is cache and src is not None) else cache.hist
+        if h is None or len(h) < off:
+            raise SkeletonError(f"Hy4 fork: the Engram history holds {None if h is None else len(h)} positions, the cache {off}")
+        out = Hy4Cache(c.fork() if isinstance(c, FixedKVCache) else MU.fork_cache([c])[0] for c in cache)
+        out.hist = h[:off].copy()
+        return out
+
+    def warm(self, log=print, n: int = 32, steps: int = 6, chunk: int = 2048) -> float:
+        log("[kyojin] hy4: no load warm-up (the first request pays the first reads)")
+        return 0.0
+
+    def warm_prompt(self, ids, a: int, b: int) -> None:
+        """Engine hint (before a prefill chunk): prompt positions [a, b) are the NEXT chunk. Its Engram rows are read from the file in the background while this chunk runs
+        (engram_gguf.RowReader.hint; no page-cache warm-up of the table, no residency). KYOJIN_HY4_ENGRAM_AHEAD=0 / _PREAD=0: nothing."""
+        h = getattr(getattr(self.model, "engram_source", None), "hint", None)
+        if h is not None:
+            h(ids, a, b)
+
+    def warm_main(self, log=print, n: int = 40, steps: int = 6) -> float:
+        """One short session (prefill + plain steps) on the loading thread, before the engine thread starts: the compiled decode programs (KYOJIN_STEP_COMPILE) and the
+        lazily built constants exist before the engine thread first uses them (c124: an engine thread that ran first died with "no Stream(gpu, 0) in current thread").
+        A failure is logged and serving goes on."""
+        import time
+        t0 = time.perf_counter()
+        try:
+            cache = self.make_cache()
+            lg = self.prefill_chunk(cache, list(range(1, 1 + n)))
+            for _ in range(steps):
+                lg = self.step(cache, mx.argmax(lg, axis=-1).reshape(1))
+            mx.eval(lg)
+            self._owner = None
+            del cache
+            mx.clear_cache()
+        except Exception as e:                                      # noqa: BLE001 - a warm-up must not stop the server
+            log(f"[kyojin] hy4: main-thread warm-up failed ({type(e).__name__}: {e})")
+            return 0.0
+        dt = time.perf_counter() - t0
+        log(f"[kyojin] hy4: main-thread warm-up {n} prompt rows + {steps} steps in {dt:.1f} s")
+        return dt
+
+    def _logits(self, cache, toks):
+        self._claim(cache)
+        from .. import headlast
+        prof = toks.shape[-1] == 1 and os.environ.get("KYOJIN_HY4_STEP_PROF", "0") == "1"
+        if prof:
+            import time
+            t0 = time.perf_counter()
+        with headlast.last_row():                                  # prefill chunks read the last row only: the head runs on one row
+            lg = self.model(toks, cache=cache)[:, -1].astype(mx.float32)
+        if prof:
+            t1 = time.perf_counter()
+        mx.eval(lg, *self.state(cache))
+        if toks.shape[-1] >= 256 and os.environ.get("KYOJIN_HY4_ENGRAM_LOG", "0") != "0":
+            self._engram_log(toks.shape[-1])
+        if prof:
+            self._prof_note(t1 - t0, time.perf_counter() - t1)
+        return lg
+
+    def _engram_log(self, n: int) -> None:
+        """KYOJIN_HY4_ENGRAM_LOG=1: one serve-log line per prompt chunk, the Engram row counters since the previous one (engram_gguf.STATS)."""
+        from .. import engram_gguf as EG
+        prev = self.__dict__.get("_eng_prev", {})
+        cur = dict(EG.STATS)
+        d = {k: cur[k] - prev.get(k, 0) for k in cur}
+        self._eng_prev = cur
+        print(f"[kyojin] hy4 engram chunk n={n}: rows {d['rows']} unique {d['unique']} ahead_hit {d['ahead_hit']} pread {d['read_rows']} map {d['map_rows']} hints {d['hints']} "
+              f"read {d['read_s']:.2f}s wait {d['wait_s']:.2f}s hint {d['hint_s']:.2f}s", flush=True)
+
+    def _prof_note(self, build: float, ev: float) -> None:
+        """KYOJIN_HY4_STEP_PROF=1: per 64 plain one-row steps, ms of the graph build (model call) and of the eval (GPU wait), with the path counters once."""
+        p = self.__dict__.setdefault("_prof", [0, 0.0, 0.0])
+        p[0] += 1
+        p[1] += build
+        p[2] += ev
+        if p[0] % 64 == 0:
+            from .. import step_compile as SC
+            from ..foreign_skeleton_mla import MlaAttention
+            msg = f"[kyojin] hy4 step prof: 64 steps build {1e3 * p[1] / 64:.2f} ms eval {1e3 * p[2] / 64:.2f} ms total {1e3 * (p[1] + p[2]) / 64:.2f} ms"
+            if p[0] == 64:
+                msg += f"; PATHS {dict(MlaAttention.PATHS)}; SC.ACTIVE {SC.ACTIVE} ATTN {SC.ATTN} SPLIT {SC.SPLIT} STATS {dict(getattr(SC, 'STATS', {}))}"
+            print(msg, flush=True)
+            p[1] = p[2] = 0.0
+
+    def prefill_chunk(self, cache, ids, vl=None):
+        if vl is not None:
+            raise ValueError("Hy4: no image input")
+        from .. import engram_gguf as EG
+        with EG.phase("pf"):                                       # the decode counters (KYOJIN_HY4_ENGRAM_DEC_LOG) close the request before and skip the prompt
+            return self._logits(cache, mx.array(ids, dtype=mx.int32)[None])
+
+    def batch(self, caches):
+        if len(caches) != 1:
+            raise ValueError(f"{HY4_ONE_SESSION}: a batch of {len(caches)} sessions")
+        return caches[0]
+
+    def unbatch(self, bc, n):
+        return [bc]
+
+    def recast(self, bc, drop, park, add):
+        raise NotImplementedError("Hy4: one session, no batch membership changes")
+
+    def step(self, bc, tokens):
+        return self._logits(bc, tokens.reshape(1, 1).astype(mx.int32))
+
+
+def _all_plain(g) -> bool:
+    """Every tensor of the GGUF is F32 / F16 / BF16 (the Engram table aside, read by row on both loaders): nothing to keep as stored."""
+    from ..foreign_skeleton import ENGRAM_TABLE
+    return all(ti.tname in ("F32", "F16", "BF16") for n, ti in g.tensors.items() if n != ENGRAM_TABLE)
+
+
+def load_hy4(path: str, log=print) -> tuple[Hy4Backend, dict]:
+    """Hy4Backend on the GGUF of a serve directory. A file in a stored quant (the real Q3_K one) goes through foreign_skeleton_stored.load_stored, on its
+    Metal tier when the default device is the GPU, else its CPU tier (dense rest decoded, experts by row); an all-float file (the synthetic test
+    models) through foreign_skeleton.load_cpu. Behind KYOJIN_SKELETON (the routing row itself needs KYOJIN_KIT_UNPROVEN_ROWS)."""
+    import json
+    from .. import flags as FL, foreign_gguf as GF, foreign_skeleton as SK
+    bind = {n: os.environ[f.env] for n, f in FL.FLAGS.items() if f.attrs and f.runtime and f.env in os.environ and os.environ[f.env] != f.default}
+    if bind:                                                    # several levers keep their value in a module attribute that only flags.set writes (kpool_fuse.ON = False at import):
+        FL.set_many(bind)                                       # the lane's environment alone left them off (served plain 27 tok/s vs 41 resident, 19/11); bind what the environment turned on
+        print(f"[kyojin] hy4: levers bound from the environment: {sorted(bind)}", flush=True)
+    if not SK.enabled():
+        raise ValueError(f"{path}: hy_v4_flash is served by the skeleton Model only: set KYOJIN_SKELETON=1 (and KYOJIN_KIT_UNPROVEN_ROWS=1)")
+    from ..foreign_skeleton_rows import ROWS
+    gpath = GF.find_gguf(path)
+    g = GF.GgufFile(gpath)
+    try:
+        plain, eos = _all_plain(g), g.kv.get("tokenizer.ggml.eos_token_id")
+    finally:
+        g.close()
+    if plain:
+        model, rep = SK.load_cpu(gpath, row=ROWS["hy_v4_flash"])
+        how = "load_cpu (all-float file)"
+    else:
+        from .. import foreign_skeleton_stored as SS
+        metal = mx.default_device() == mx.gpu
+        model, rep = SS.load_stored(gpath, metal=metal, row=ROWS["hy_v4_flash"], log=log)
+        how = f"load_stored ({'Metal' if metal else 'CPU'} tier)"
+    cfgp = os.path.join(path, "config.json")
+    cfg = json.load(open(cfgp)) if os.path.isfile(cfgp) else SK.serve_config(GF.GgufFile(gpath))
+    from .. import step_compile                                   # KYOJIN_STEP_COMPILE (off): the generic kit's compiled decode programs, here on the skeleton layers
+    n_sc = step_compile.install(model, log)
+    be = Hy4Backend(model, stop_ids=() if eos is None else (int(eos),))
+    be.pack, be.arch = path, "hy_v4_flash"
+    from .. import hy4_mtp
+    if hy4_mtp.enabled():                           # flag KYOJIN_HY4_MTP (default off): MTP speculative decode with the GGUF's own next-n block
+        from . import hy4mtp
+        be = hy4mtp.install(be, gpath, log=log)
+    be.step_compiled_layers = n_sc
+    if n_sc:
+        be.warm_main(log)
+    log(f"hy4 backend: skeleton Model via {how}, {rep.get('n_tensors', '?')} tensors; one session, plain decode, stop ids {sorted(be.stop_ids)}")
+    return be, cfg
+
+
 def _mlx_lm_classes(cfg: dict):
     """The mlx-lm model / args classes of a config, resolved the way mlx_lm.load does (remap table, architecture remap). ModuleNotFoundError when mlx-lm has
     no class for it, so load_generic falls to the mlx-vlm loader."""
@@ -1329,11 +1834,19 @@ def load_backend(path: str, kind: str | None = None, **kw) -> tuple[Backend, dic
         from ..foreign_gguf import GgufFile, find_gguf
         from ..foreign_names import gguf_config
         cfg = gguf_config(GgufFile(find_gguf(path)))
-    mt = cfg.get("model_type", "")
+    from .. import modeldesc
+    mt = modeldesc.model_key(cfg)                              # model_type; a skeleton serve config: its gguf_architecture (hy_v4_flash)
     mtp, mtp_head = kw.pop("mtp", None), kw.pop("mtp_head", None)
     auto = mtp is None
-    from .. import modeldesc
     row = modeldesc.backend_desc(mt)                           # the table row of the model (exact model_type, else its backend prefix)
+    if row is not None and row.backend == "hy4" and kind is None:
+        return load_hy4(path, log=kw.get("log", print))
+    if row is None and kind is None and cfg.get("model_type") == modeldesc.SKELETON_TYPE:
+        raise ValueError(f"{path}: architecture {mt!r} on the skeleton Model has no serving row: it needs KYOJIN_SKELETON=1 KYOJIN_KIT_UNPROVEN_ROWS=1 "
+                         "(an unproven row) and a backend for it")
+    if row is not None and row.arch:                           # the architecture's default levers, before any lever module is imported (they read their flag once at import)
+        from .. import archs as _archs, opflags
+        opflags.apply_arch_defaults(_archs.ARCHS[row.arch], log=kw.get("log", print))
     if row is None and kind is None:
         from .. import foreign_linear as FL
         from ..foreign_names import ARCHS
@@ -1345,10 +1858,50 @@ def load_backend(path: str, kind: str | None = None, **kw) -> tuple[Backend, dic
             from ..foreign_names import gguf_has_mtp
             mtp = has_mtp_tensors(mtp_head or path, prefix) or gguf_has_mtp(path)
         return load_q35(path, mtp=mtp, mtp_head=mtp_head, log=kw.get("log", print))
+    if row is not None and row.backend == "generic_foreign":      # an unproven row (KYOJIN_KIT_UNPROVEN_ROWS, modeldesc.UNPROVEN_DESCS): qwen4_exp GGUF / FP4-Local pack read as stored
+        from .. import foreign_linear as FL
+        if FL.is_foreign(path):
+            model, cfg = FL.load_foreign(path, log=kw.get("log", print), mtp=False)
+            be = GenericBackend(model)
+            be.pack = path
+            be.foreign = True
+            from . import fnmtp                                 # flag KYOJIN_FOREIGN_MTP (default off): verified MTP speculative decode with the pack's own head, or KYOJIN_FOREIGN_MTP_HEAD=<pack dir>
+            if fnmtp.ENABLED:
+                be = fnmtp.install(be, model, path, cfg, log=kw.get("log", print))
+            if fnmtp.LOOKUP and not getattr(be, "supports_spec", False):   # flag KYOJIN_FOREIGN_LOOKUP_SPEC (default off): no head -> n-gram drafts through the same verify
+                be = fnmtp.install_lookup(be, model, log=kw.get("log", print))
+            return be, cfg
     if kind == "vlm" or (row is not None and row.backend == "vlm"):
         from .. import foreign_linear as FL
         if FL.is_foreign(path):
-            raise ValueError(f"{path}: a GGUF / NVFP4 / MXFP4 model of family {mt!r} (GLM, DeepSeek V4) is not served as stored yet: only the Qwen3 family is mapped (foreign_linear)")
+            if mt != "glm5_next":
+                raise ValueError(f"{path}: a GGUF / NVFP4 / MXFP4 model of family {mt!r} (DeepSeek V4) is not served as stored yet: only Qwen3 and GLM-5.3 are mapped (foreign_linear)")
+            from .. import patch as P                       # GLM-5.3 modelopt pack (NVFP4 experts, MXFP8 linears) served as stored: foreign_linear builds the model,
+            spec = P.arch_of(cfg)                           # the arch hooks of glm5_next apply as for a converted pack; no EXL3 patching, MTP / CED not wired yet
+            P.activate(spec)
+            model, cfg = FL.load_foreign(path, log=kw.get("log", print), mtp=bool(mtp))
+            kw.get("log", print)(f"[kyojin] GLM-5.3 prompt hooks: {P.install_glm_pf(model)}")
+            P._install_linear_hook()                        # patch_model (which installs it) is not on this path: without it mlx_vlm's tokenwise runs every verify block row by row and the flags glm_dense_rows / glm_vrows never fire
+            be = GlmBackend(model, spec, union=kw.get("union", False))
+            be.pack = path
+            from .. import glm_compile
+            glm_compile.install(be.lm)                      # flag KYOJIN_GLM_COMPILE (default off): compiled linear-attention decode layers
+            if mtp:                                         # --mtp-depth N: no draft head wired yet -> n-gram lookup drafts through the GLM verify
+                head = FL.take_mtp(model)
+                try:
+                    info = be.enable_nextn(head, cfg) if (head and not os.environ.get("KYOJIN_GLM_BLOCK")) else None
+                except Exception as e:                  # no usable nextn weights: the lookup-only path
+                    kw.get("log", print)(f"[kyojin] GLM-5.3 nextn head refused ({type(e).__name__}: {e}); lookup drafts only")
+                    info = None
+                blk = os.environ.get("KYOJIN_GLM_BLOCK", "")
+                if blk:                                     # flag KYOJIN_GLM_BLOCK=dflash2:DIR[,dspark:DIR]: external block drafters instead of the nextn head
+                    info = be.enable_block(blk, log=kw.get("log", print))
+                kw.get("log", print)(f"[kyojin] GLM-5.3 speculative decode: {info or be.enable_lookup_spec()}")
+            from .. import glm_hostgap
+            glm_hostgap.install(be.lm)                      # flag KYOJIN_GLM_HOSTGAP (default off): the decode step is committed in groups of layers while the host builds it
+            from .. import verify_glue
+            verify_glue.install()                            # flags KYOJIN_VERIFY_POOLSEL / KYOJIN_DRAFT_HEAD_F16 (default off): cheaper speculative verify rounds (kyojin_mlx.verify_glue)
+            return be, cfg
         if auto:                                            # DS4.1 / GLM: MTP stays opt-in (--mtp-depth N) as before (ModelDesc.mtp_auto False); a row that sets it gets the draft head when the pack carries it
             mtp = bool(row is not None and row.mtp_auto and has_mtp_tensors(mtp_head or path, prefix))
         return load_vlm(path, mtp=bool(mtp), **kw)

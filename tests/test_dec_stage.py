@@ -158,7 +158,7 @@ def test_fallback_outside_the_covered_shapes(model):
 
 
 def test_ablit_hook_applies_in_the_stage_path(model, tmp_path, monkeypatch):
-    """The refusal-direction hook sits before both expands: armed, the stage path equals the armed chain bit for bit and moves the
+    """The direction hook sits before both expands: armed, the stage path equals the armed chain bit for bit and moves the
     output away from the unarmed model (the hook is applied, at the attention and the MoE output)."""
     n = 4
     layers = model.language_model.layers

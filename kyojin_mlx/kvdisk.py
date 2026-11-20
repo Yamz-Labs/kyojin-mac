@@ -264,6 +264,10 @@ class KvDisk:
         self.children: dict = {}              # parent key -> number of children in the index
         self.stats = dict(saved=0, bytes_saved=0, save_s=0.0, loaded=0, bytes_loaded=0, load_s=0.0, hits=0, misses=0, skipped=0, evicted=0, bad=0)
         self._scan()
+        before = len(self.index)
+        self._evict()                         # a cap lowered since the last run applies at startup, not only on the next save
+        if len(self.index) < before:
+            self.log(f"kvdisk: cap {self.cap >> 20} MiB at startup: evicted {before - len(self.index)} files, {self.bytes() >> 20} MiB left")
 
     # -- index
     def _scan(self) -> None:

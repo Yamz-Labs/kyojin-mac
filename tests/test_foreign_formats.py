@@ -204,8 +204,10 @@ def test_gguf_rejects(tmp_path):
     SY.write_gguf(p, {}, [("t", (32, 1), "Q4_0", np.zeros(18, np.uint8))])
     data = bytearray(p.read_bytes()); i = data.index(struct.pack("<I", 2) + struct.pack("<Q", 0))
     data[i:i + 4] = struct.pack("<I", 9999); p.write_bytes(bytes(data))
-    with pytest.raises(GF.GgufTypeError, match="9999"):
-        GF.GgufFile(p)
+    g = GF.GgufFile(p)                                                      # the file opens: the unknown type fails per tensor, naming the id and the tensor
+    assert not g.tensors["t"].known
+    with pytest.raises(GF.GgufTypeError, match=r"tensor t: ggml type id 9999"):
+        g.raw("t")
 
 
 @pytest.mark.parametrize("t", GF.KERNEL_TYPES)

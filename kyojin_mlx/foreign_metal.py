@@ -13,6 +13,7 @@ Two kernels per format, the same A-element decode in both:
          No threadgroup memory, no barrier, a simdgroup owns NTN * 8 output rows and walks the whole k (no k split).
   dequant  w half [n, k] with the same decode (prefill with many rows: one fp16 matmul)."""
 from __future__ import annotations
+import contextlib
 import functools
 import os
 
@@ -111,7 +112,7 @@ def _gemv_xmap(fmt):
     return "(ul * 32u)", 16
 
 
-def gemv_source(fmt: str, nbr: int = 2, gather: bool = False, rowgs: bool = False, glu: bool = False) -> str:
+def gemv_source(fmt: str, nbr: int = 2, gather: bool = False, rowgs: bool = False, glu: bool = False, partial: bool = False) -> str:
     """Kernel body. Template ints: R (rows, 1 when gather), KIN, N, NBR (= nbr). Inputs x (half [rows, KIN]), qs (uint32), mt, gs (float [1], or [E] when gather);
     gather adds xrows (uint32 [S]) and eids (uint32 [S]) before qs and writes y half [S, N]. Output y half [R, N].
     rowgs (flag cfmtspeed, same-input groups): gs is float [N], one scale per output row (the members' global scales repeated over their rows), read as
@@ -187,6 +188,13 @@ def gemv_source(fmt: str, nbr: int = 2, gather: bool = False, rowgs: bool = Fals
       }}
     }}
 """
+    if partial:  # flag moe_partialk (iq4_nl routed experts, k % 32 == 0, k % 512 != 0): the partial-chunk edits of gemvk_source (zeros staged past k, unit index clamped to the row)
+        v_line = "uint4 v = *(device const uint4*)(XP + r * uint(KIN) + c * 512u + j * 8u);"
+        for o, n_ in (("NC = uint(KIN) / 512u;", "NC = (uint(KIN) + 511u) / 512u;"), ("u = ul; qc[j]", "u = min(ul, UPR - 1u); qc[j]"),
+                      ("u = (c + 1u) * 16u + ul; qn[j]", "u = min((c + 1u) * 16u + ul, UPR - 1u); qn[j]"),
+                      (v_line, "if (c * 512u + j * 8u >= uint(KIN)) { *(threadgroup uint4*)(xs + r * 640u + j * 8u + (j >> 2) * 8u) = uint4(0u); continue; }\n        " + v_line)):
+            assert src.count(o) == 1, o
+            src = src.replace(o, n_)
     if glu:      # dense down projection of a gated MLP (GLU_STAGE): the staged input is silu(x) * x2
         s_old = "uint4 v = *(device const uint4*)(XP + r * uint(KIN) + c * 512u + j * 8u);"
         assert not gather and src.count(s_old) == 1
@@ -347,8 +355,20 @@ def gemv8_inputs(fmt, gather=False, glu=False):
     return ["x", "xrows", "eids"] + base[1:] if gather else base
 
 
+GEMV8_XIO_HELPER = r"""
+inline uint4 g8_pack_f(float4 a, float4 b) { return uint4(as_type<uint>(half2(a.xy)), as_type<uint>(half2(a.zw)), as_type<uint>(half2(b.xy)), as_type<uint>(half2(b.zw))); }
+inline uint g8_bf2h(uint w) { return as_type<uint>(half2(as_type<float>(w << 16), as_type<float>(w & 0xFFFF0000u))); }
+inline uint4 g8_pack_b(uint4 v) { return uint4(g8_bf2h(v.x), g8_bf2h(v.y), g8_bf2h(v.z), g8_bf2h(v.w)); }
+"""
+# Cast-free variant of gemv8_source (flag foreign_castfree): xin "f" / "b" stages a float32 / bfloat16 x as half while it is copied to threadgroup memory
+# (the cast the caller would have launched: round to nearest even, same as MLX astype), yout "f" writes the fp16-rounded result widened to float32
+# (= the half output followed by astype(float32)). Same products, same order, same roundings: bit-identical to the stock cast + GEMV + cast chain.
+GEMV8_XIN = ("h", "f", "b")
+GEMV8_YOUT = ("h", "f")
+
+
 @functools.lru_cache(maxsize=None)     # the launch wrappers rebuild the source on every call: 18 us of Python per linear without the cache
-def gemv8_source(fmt: str, nbr: int = 2, gather: bool = False, glu: bool = False) -> str:
+def gemv8_source(fmt: str, nbr: int = 2, gather: bool = False, glu: bool = False, xin: str = "h", yout: str = "h") -> str:
     """Body. Template ints: R (rows, any 1..16), KIN, N, NBR. Inputs x (half [R, KIN]), qs (uint32 [N, KIN/4]), [mt], gs (float [N]); output y half [R, N].
     The structure of gemv_source: a simdgroup owns 2 NBR output rows, a lane owns 32 consecutive weights of each row per 512-chunk (two 16-byte units), the chunk of x
     sits in threadgroup memory, the next chunk's words are prefetched. Needs KIN % 32 == 0 and N % (8 NBR) == 0: a last partial chunk (KIN % 512, e.g. the 768-wide experts
@@ -435,6 +455,24 @@ def gemv8_source(fmt: str, nbr: int = 2, gather: bool = False, glu: bool = False
         s_old = "uint4 v = *(device const uint4*)(XP + r * uint(KIN) + c * 512u + j * 8u);"
         assert src.count(s_old) == 1
         src = src.replace(s_old, GLU_STAGE)
+    if xin != "h" or yout != "h":
+        assert xin in GEMV8_XIN and yout in GEMV8_YOUT and not gather and not glu, (xin, yout, gather, glu)
+        reps = []
+        if xin == "f":
+            reps += [("device const half* XP = (device const half*)x;", "device const float* XP = (device const float*)x;"),
+                     ("uint4 v = *(device const uint4*)(XP + r * uint(KIN) + c * 512u + j * 8u);",
+                      "device const float4* xf_ = (device const float4*)(XP + r * uint(KIN) + c * 512u + j * 8u); uint4 v = g8_pack_f(xf_[0], xf_[1]);")]
+        elif xin == "b":
+            reps += [("device const half* XP = (device const half*)x;", "device const ushort* XP = (device const ushort*)x;"),
+                     ("uint4 v = *(device const uint4*)(XP + r * uint(KIN) + c * 512u + j * 8u);",
+                      "uint4 v = g8_pack_b(*(device const uint4*)(XP + r * uint(KIN) + c * 512u + j * 8u));")]
+        if yout == "f":
+            sat = SAT16.format(v="v * gs[rbase + j]")
+            reps += [("device half* YP = y;", "device float* YP = y;"),        # bit-cast: the fp16 rounding cannot be folded away by fast math
+                     (f"YP[r * uint(N) + rbase + j] = half({sat});", f"YP[r * uint(N) + rbase + j] = float(as_type<half>(as_type<ushort>(half({sat}))));")]
+        for old, new in reps:
+            assert src.count(old) == 1, old
+            src = src.replace(old, new)
     return src
 
 
@@ -538,11 +576,13 @@ def mma8_source(fmt: str, ntn: int = 1, half_a: bool = False) -> str:
 #   q6_k  : 2 words of high 2-bit pairs (hi), meta = 5 words per 256 (16 int8 scales, d as half in the low bits of word 4), qs in H order (byte j = element j | j+16 << 4)
 #   iq4_xs: no hi, meta = 2 words per 256 (d | scales_h << 16, scales_l), qs in H order, codebook KVC
 # The GEMV is the gemv_source frame (a simdgroup owns 2 NBR rows, a lane one 32-unit per 512-chunk); the unit state is the KU struct so the frame is shared.
-FORMATSK = ("q5_k", "q6_k", "iq4_xs", "q3_k", "iq3_s", "iq3_xxs", "q2_k", "iq2_xxs", "iq2_xs", "iq2_s", "iq1_s", "iq1_m")
+FORMATSK = ("q5_k", "q6_k", "iq4_xs", "q3_k", "iq3_s", "iq3_xxs", "q2_k", "iq2_xxs", "iq2_xs", "iq2_s", "iq1_s", "iq1_m", "q4_1", "q5_0", "q5_1", "q2_0")
 FORMATSK_MMA = ("q5_k", "q6_k", "iq4_xs")         # the stored simdgroup-matrix kernel exists for these only (the 3-bit types are GEMV only; a resident fp16 copy serves the rows above)
-_LAYOUTK = {"q5_k": "Q", "q6_k": "H", "iq4_xs": "H", "q3_k": "H", "iq3_s": "H", "iq3_xxs": "H", "q2_k": "H", "iq2_xxs": "H", "iq2_xs": "H", "iq2_s": "H", "iq1_s": "H", "iq1_m": "H"}
+_LAYOUTK = {"q5_k": "Q", "q6_k": "H", "iq4_xs": "H", "q3_k": "H", "iq3_s": "H", "iq3_xxs": "H", "q2_k": "H", "iq2_xxs": "H", "iq2_xs": "H", "iq2_s": "H", "iq1_s": "H", "iq1_m": "H", "q4_1": "H", "q5_0": "H", "q5_1": "H", "q2_0": "H"}
 _K2 = ("q2_k", "iq2_xxs", "iq2_xs", "iq2_s", "iq1_s", "iq1_m")      # 2-bit class: qs = 4 or 8 bytes per 32-unit (see foreign_gguf._to_pack_k2)
-_NOHI = ("iq4_xs", "q2_k", "iq2_xs", "iq1_s", "iq1_m")      # K formats without a hi array
+_L2 = ("q2_0",)      # GGUF Q2_0 (id 42, flag q2_0_stored): 64-blocks, a 32-unit = 8 bytes of 2-bit codes (uint2, natural order), one fp16 d per 2 units in meta, see foreign_gguf._to_pack_q20
+_L5 = ("q4_1", "q5_0", "q5_1")      # legacy 32-blocks (GGUF Q4_1 / Q5_0 / Q5_1) as stored: qs in H order, hi = the block's qh word (q5), meta = d (| m << 16) words, see foreign_gguf._to_pack_l5
+_NOHI = ("iq4_xs", "q2_k", "iq2_xs", "iq1_s", "iq1_m", "q4_1", "q2_0")      # K formats without a hi array
 _K3 = ("q3_k", "iq3_s", "iq3_xxs")      # 3-bit class: qs = 2 words per 32-unit, hi = 1 word per unit (see foreign_gguf._to_pack_k3)
 HDRK = HDR + r"""
 struct KU { uint4 q; uint4 m; uint2 h; uint d; };
@@ -723,6 +763,17 @@ inline void dp_iq3s(KU c, uint u, thread half2* w, int) {
     gp8(IQ3_G[a | ((qh << (8u - 2u * l)) & 256u)], IQ3_G[b | ((qh << (7u - 2u * l)) & 256u)], (c.h.x >> (8u * l)) & 255u, db, &w[4u * l]); }
 }
 """
+HDRKPQ3 = r"""
+inline void dp_q3k(KU c, uint u, thread half2* w, int) {
+  float d = float(as_type<half2>(c.d).x); uint ib = (u & 7u) * 2u; float a = d * q6sc(c.m, ib), b = d * q6sc(c.m, ib + 1u);
+  half2 S0 = h2sat(a), Z0 = h2sat(-4.0f * a), S1 = h2sat(b), Z1 = h2sat(-4.0f * b);
+  uint ha = (c.h.x & 0xFFu) | ((c.h.x & 0xFF00u) << 8), hb = ((c.h.x >> 16) & 0xFFu) | ((c.h.x >> 8) & 0x00FF0000u);   // hi bits of codes e / e + 8 on bits 0 / 16
+  UNR for (uint e = 0; e < 8; ++e) {
+    half2 x0 = as_type<half2>(((c.q.x >> (2u * e)) & 0x00030003u) | (((ha >> e) & 0x00010001u) << 2) | 0x64006400u) - half2(1024.0h);
+    half2 x1 = as_type<half2>(((c.q.y >> (2u * e)) & 0x00030003u) | (((hb >> e) & 0x00010001u) << 2) | 0x64006400u) - half2(1024.0h);
+    w[e] = h2cl(fma(S0, x0, Z0)); w[8u + e] = h2cl(fma(S1, x1, Z1)); }
+}
+"""
 HDRKP2 = r"""
 template <typename TP> inline void dp_iq2xxs(KU c, uint u, thread half2* w, TP T) {
   half2 db = h2sat(float(as_type<half2>(c.d).x) * (0.5f + float(c.h.x >> 28)) * 0.25f);
@@ -777,9 +828,74 @@ def _tab(name, vals, ctype="uint"):
     return f"constant {ctype} {name}[{len(vals)}] = {{" + ",".join(str(int(v)) + "u" for v in vals) + "};\n"
 
 
+HDRK20 = r"""
+inline KU ld_q20(device const uint* qs, device const uint* mt, uint n, uint u, uint UPR) {
+  KU c; uint2 q = ((device const uint2*)qs)[n * UPR + u]; c.q = uint4(q.x, q.y, 0u, 0u);
+  c.m = uint4(uint(((device const ushort*)mt)[n * (2u * ((UPR / 2u + 1u) / 2u)) + (u >> 1)]), 0u, 0u, 0u); c.h = uint2(0u); c.d = 0u; return c; }
+inline void dec_q20(KU c, uint u, thread float* w) {
+  const float d = float(as_type<half2>(c.m.x).x);
+  UNR for (uint e = 0; e < 16; ++e) {
+    w[e] = (float((c.q.x >> (2u * e)) & 3u) - 1.0f) * d;
+    w[16u + e] = (float((c.q.y >> (2u * e)) & 3u) - 1.0f) * d; }
+}
+"""
+
+HDRK5 = r"""
+inline KU ld_q41(device const uint4* q4, device const uint* mt, uint n, uint u, uint UPR) {
+  KU c; c.q = q4[n * UPR + u]; c.m = uint4(mt[n * UPR + u], 0u, 0u, 0u); c.h = uint2(0u); c.d = 0u; return c; }
+inline KU ld_q51(device const uint4* q4, device const uint* mt, device const uint* hi, uint n, uint u, uint UPR) {
+  KU c; c.q = q4[n * UPR + u]; c.m = uint4(mt[n * UPR + u], 0u, 0u, 0u); c.h = uint2(hi[n * UPR + u], 0u); c.d = 0u; return c; }
+inline KU ld_q50(device const uint4* q4, device const uint* mt, device const uint* hi, uint n, uint u, uint UPR) {
+  KU c; c.q = q4[n * UPR + u]; c.m = uint4(uint(((device const ushort*)mt)[n * (2u * ((UPR + 1u) / 2u)) + u]), 0u, 0u, 0u); c.h = uint2(hi[n * UPR + u], 0u); c.d = 0u; return c; }
+inline void dec_q41(KU c, uint u, thread float* w) {
+  const float2 dm = float2(as_type<half2>(c.m.x));
+  UNR for (uint i = 0; i < 4; ++i) { uint wd = c.q[i];
+    UNR for (uint b = 0; b < 4; ++b) { uint by = (wd >> (8u * b)) & 255u, e = i * 4u + b;
+      w[e] = float(by & 15u) * dm.x + dm.y;
+      w[16u + e] = float(by >> 4) * dm.x + dm.y; } }
+}
+inline void dec_q50(KU c, uint u, thread float* w) {
+  const float d = float(as_type<half2>(c.m.x).x);
+  UNR for (uint i = 0; i < 4; ++i) { uint wd = c.q[i];
+    UNR for (uint b = 0; b < 4; ++b) { uint by = (wd >> (8u * b)) & 255u, e = i * 4u + b;
+      w[e] = (float((by & 15u) | (((c.h.x >> e) & 1u) << 4)) - 16.0f) * d;
+      w[16u + e] = (float((by >> 4) | (((c.h.x >> (16u + e)) & 1u) << 4)) - 16.0f) * d; } }
+}
+inline void dec_q51(KU c, uint u, thread float* w) {
+  const float2 dm = float2(as_type<half2>(c.m.x));
+  UNR for (uint i = 0; i < 4; ++i) { uint wd = c.q[i];
+    UNR for (uint b = 0; b < 4; ++b) { uint by = (wd >> (8u * b)) & 255u, e = i * 4u + b;
+      w[e] = float((by & 15u) | (((c.h.x >> e) & 1u) << 4)) * dm.x + dm.y;
+      w[16u + e] = float((by >> 4) | (((c.h.x >> (16u + e)) & 1u) << 4)) * dm.x + dm.y; } }
+}
+"""
+
+
+# q3_k: the half2 decoder dp_q3k (layout K2) exists only for the grouped-expert kernel (foreign_kqgmm, flag KYOJIN_KQGMM_KLOW). The dense few-row MMA keeps dec_q3k + layout K
+# exactly as before: kqp() switches the decoder / layout / header lookups for the duration of a kqgmm source build.
+_KQP = [False]
+
+
+@contextlib.contextmanager
+def kqp(on: bool = True):
+    old = _KQP[0]; _KQP[0] = bool(on)
+    try:
+        yield
+    finally:
+        _KQP[0] = old
+
+
+def decp_of(fmt):
+    return "dp_q3k" if fmt == "q3_k" and _KQP[0] else _DECP.get(fmt)
+
+
+def layout_of(fmt):
+    return "K2" if fmt == "q3_k" and _KQP[0] else _FMMA_LAYOUT[fmt]
+
+
 def hdrkp(fmt):
     """hdrk plus the half2 decoders (dp_*), for the few-row MMA."""
-    return hdrk(fmt) + HDRKP + (HDRKP3 if fmt in ("iq3_s", "iq3_xxs") else HDRKP2 if fmt in _K2 else "")
+    return hdrk(fmt) + HDRKP + (HDRKP3 if fmt in ("iq3_s", "iq3_xxs") else HDRKPQ3 if fmt == "q3_k" and _KQP[0] else HDRKP2 if fmt in _K2 else "")
 
 
 def hdrk(fmt):
@@ -797,6 +913,10 @@ def hdrk(fmt):
         if fmt in ("iq1_s", "iq1_m"):
             h += _tab("IQ1_G", S.KGRID_1BIT_2048, "ushort")
         return h + HDRK2
+    if fmt in _L5:
+        return HDRK + HDRK5
+    if fmt in _L2:
+        return HDRK + HDRK20
     if fmt not in _K3:
         return HDRK
     if fmt == "q3_k":
@@ -810,7 +930,9 @@ _KLD = {"q5_k": "ld_q5k(q4, (device const uint4*)mt, hi, {n}, {u}, UPR)", "q6_k"
         "iq4_xs": "ld_iqxs(q4, (device const uint2*)mt, {n}, {u}, UPR)",
         "q3_k": "ld_q3k(qs, mt, hi, {n}, {u}, UPR)", "iq3_xxs": "ld_iq3x(qs, mt, hi, {n}, {u}, UPR)", "iq3_s": "ld_iq3s(qs, mt, hi, {n}, {u}, UPR)",
         "q2_k": "ld_q2k(qs, mt, {n}, {u}, UPR)", "iq2_xxs": "ld_iq2xxs(qs, mt, hi, {n}, {u}, UPR)", "iq2_xs": "ld_iq2xs(qs, mt, {n}, {u}, UPR)", "iq2_s": "ld_iq2s(qs, mt, hi, {n}, {u}, UPR)",
-        "iq1_s": "ld_iq1s(qs, mt, {n}, {u}, UPR)", "iq1_m": "ld_iq1m(qs, mt, {n}, {u}, UPR)"}
+        "iq1_s": "ld_iq1s(qs, mt, {n}, {u}, UPR)", "iq1_m": "ld_iq1m(qs, mt, {n}, {u}, UPR)",
+        "q4_1": "ld_q41(q4, mt, {n}, {u}, UPR)", "q5_0": "ld_q50(q4, mt, hi, {n}, {u}, UPR)", "q5_1": "ld_q51(q4, mt, hi, {n}, {u}, UPR)",
+        "q2_0": "ld_q20(qs, mt, {n}, {u}, UPR)"}
 IQ2S_SEED = os.environ.get("KYOJIN_IQ2S_SEED", "0") == "1"     # IQ2_S grid as 1024 ushort seeds rebuilt in registers (off: the full table is 2.1x faster at R1 since the wrapper cache)
 _KTAB = {"iq2_xxs": ("IQ2_G", "uint", 512), "iq2_xs": ("IQ2_G", "uint", 1024), "iq2_s": ("IQ2_G", "ushort", 1024) if IQ2S_SEED else ("IQ2_G", "uint", 2048),
          "iq1_s": ("IQ1_G", "ushort", 2048), "iq1_m": ("IQ1_G", "ushort", 2048)}
@@ -835,7 +957,7 @@ def ktab_arg(fmt):
 
 
 _KDEC = {"q5_k": "dec_q5k", "q6_k": "dec_q6k", "iq4_xs": "dec_iqxs", "q3_k": "dec_q3k", "iq3_xxs": "dec_iq3x", "iq3_s": "dec_iq3s", "q2_k": "dec_q2k",
-         "iq2_xxs": "dec_iq2xxs", "iq2_xs": "dec_iq2xs", "iq2_s": "dec_iq2s_sd" if IQ2S_SEED else "dec_iq2s", "iq1_s": "dec_iq1s", "iq1_m": "dec_iq1m"}
+         "iq2_xxs": "dec_iq2xxs", "iq2_xs": "dec_iq2xs", "iq2_s": "dec_iq2s_sd" if IQ2S_SEED else "dec_iq2s", "iq1_s": "dec_iq1s", "iq1_m": "dec_iq1m", "q4_1": "dec_q41", "q5_0": "dec_q50", "q5_1": "dec_q51", "q2_0": "dec_q20"}
 
 
 def gemvk_inputs(fmt, gather=False, glu=False):
@@ -850,13 +972,16 @@ def dequantk_inputs(fmt):
 
 
 @functools.lru_cache(maxsize=None)
-def gemvk_source(fmt: str, nbr: int = 2, gather: bool = False, glu: bool = False) -> str:
+def gemvk_source(fmt: str, nbr: int = 2, gather: bool = False, glu: bool = False, partial: bool = False) -> str:
     """Body. Template ints: R (1..16), KIN, N, NBR (= nbr). Inputs x (half [R, KIN]), qs (uint32 [N, KIN/8]), mt, [hi] (see gemvk_inputs); output y half [R, N], saturated to +-65504.
     Needs KIN % 512 == 0 and N % (8 NBR) == 0.
     gather (routed experts, R = 1): the arrays hold E stacked matrices as E * N rows; slot = grid y reads row xrows[slot] of x and expert eids[slot] (rows EXO = eid * N on),
     and writes y half [S, N] row slot. Every loader indexes by row, so the expert offset is added to the row number only.
     glu (gather only, down projection of a gated MLP): the staged input of slot s is silu(x[s]) * x2[s], rounded to half per element (GLU_HELPER), so the
-    gate / up products need no separate silu-mul launch; x and x2 are [S, KIN] and xrows is the slot id."""
+    gate / up products need no separate silu-mul launch; x and x2 are [S, KIN] and xrows is the slot id.
+    partial (flag gemvk_partial; any KIN % 32 == 0, the K formats KIN % 256 == 0, the legacy and Q2_0 ones KIN % 32 / % 64): the last chunk may hold fewer than 16 units. As
+    gemv8_source: NC = ceil(KIN / 512), the staging writes zeros past KIN and the unit index of every load is clamped to the row (min(u, UPR - 1)), so an idle lane multiplies
+    real weights by 0. With partial False the source is the one it always was (the clamps and the guard only exist in the partial text)."""
     if gather:
         setup = """const uint slot = threadgroup_position_in_grid.y; const uint ex = eids[slot];
     device const half* XP = (device const half*)(x + ulong(xrows[slot]) * uint(KIN));
@@ -916,6 +1041,14 @@ def gemvk_source(fmt: str, nbr: int = 2, gather: bool = False, glu: bool = False
       }}
     }}
 """
+    if partial:
+        v_line = "uint4 v = *(device const uint4*)(XP + r * uint(KIN) + c * 512u + j * 8u);"
+        for old, new in (("NC = uint(KIN) / 512u;", "NC = (uint(KIN) + 511u) / 512u;"),
+                         ("u = ul; cu[j]", "u = min(ul, UPR - 1u); cu[j]"),
+                         ("u = (c + 1u) * 16u + ul; nu[j]", "u = min((c + 1u) * 16u + ul, UPR - 1u); nu[j]"),
+                         (v_line, "if (c * 512u + j * 8u >= uint(KIN)) { *(threadgroup uint4*)(xs + r * 640u + j * 8u + (j >> 2) * 8u) = uint4(0u); continue; }\n        " + v_line)):
+            assert src.count(old) == 1, old
+            src = src.replace(old, new)
 
     if glu and not gather:
         s_old = "uint4 v = *(device const uint4*)(XP + r * uint(KIN) + c * 512u + j * 8u);"
@@ -942,6 +1075,19 @@ inline uint4 glu8(uint4 a, uint4 b) {
   return *(thread uint4*)h;
 }
 """
+
+
+_GLU8_OLD = "h[i] = half(av * (1.0f / (1.0f + metal::precise::exp(-av))) * float(pb[i]));"
+
+
+def glu_helper(act=None) -> str:
+    """The glu8 header function (staged input of a gated down projection). act None: GLU_HELPER unchanged (silu(a) * b). act = ("situ", scale_gate, scale_lin):
+    ((sg tanh(a / sg)) * sigmoid(a)) * (sl tanh(b / sl)), the same expression and rounding as the elementwise kernels of the foreign path."""
+    if act is None:
+        return GLU_HELPER
+    kind, sg, sl = act
+    assert kind == "situ" and sg > 0.0 and sl > 0.0 and GLU_HELPER.count(_GLU8_OLD) == 1, act
+    return GLU_HELPER.replace(_GLU8_OLD, f"h[i] = half((({float(sg)!r}f * metal::precise::tanh(av / {float(sg)!r}f)) * (1.0f / (1.0f + metal::precise::exp(-av)))) * ({float(sl)!r}f * metal::precise::tanh(float(pb[i]) / {float(sl)!r}f)));")
 
 
 @functools.lru_cache(maxsize=None)
@@ -1069,6 +1215,20 @@ _FMMA_HI = {"q5_k": "uint", "q6_k": "uint2"}                                    
 _FMMA_KDEC = tuple(f for f in FORMATSK if f not in ("q5_k", "q6_k", "iq4_xs"))   # the 3- and 2-bit classes: the lane decodes its whole unit with the GEMV decoder (dec_*), any weight pairing works
 _FMMA_K = ("q5_k", "q6_k", "iq4_xs") + _FMMA_KDEC                              # no global scale input
 _FMMA_PAIR.update({f: "kdec" for f in _FMMA_KDEC})
+_FMMA_LAYOUT["iq4_nl"] = "B"                  # same weight order as iq4_xs (H storage: byte = weight b | weight 16 + b); read only through layout_of / xperm
+
+
+@contextlib.contextmanager
+def kqnl(on: bool = True):
+    """Flag moe_partialk (foreign_kqgmm): the grouped kernel reads iq4_nl experts through the iq4_xs table pair ("lut", layout B) with the unit's fp16 d. The dense paths never see the row."""
+    had = "iq4_nl" in _FMMA_PAIR
+    if on:
+        _FMMA_PAIR["iq4_nl"] = "lut"
+    try:
+        yield
+    finally:
+        if on and not had:
+            _FMMA_PAIR.pop("iq4_nl", None)
 _DECP = {"iq3_xxs": "dp_iq3x", "iq3_s": "dp_iq3s", "iq2_xxs": "dp_iq2xxs", "iq2_xs": "dp_iq2xs", "iq2_s": "dp_iq2s_sd" if IQ2S_SEED else "dp_iq2s", "q2_k": "dp_q2k", "iq1_s": "dp_iq1s", "iq1_m": "dp_iq1m"}
 # half2 decoders (dp_*) fill 16 pairs per unit; pair m = 4 q + t holds the weights below (the lane lays the unit out by what is cheap to unpack, xperm follows)
 _FMMA_LAYOUT.update({f: ("KG" if f in ("iq3_xxs", "iq3_s", "iq2_xxs", "iq2_xs", "iq2_s") else "K2" if f == "q2_k" else "K1" if f in ("iq1_s", "iq1_m") else "K") for f in _FMMA_KDEC})
@@ -1106,7 +1266,7 @@ def fmma_xperm_index(fmt: str, k: int):
     u = 4 * kb + (s >> 1)
     e = s & 1
     nj = t + 4 * e
-    L = _FMMA_LAYOUT[fmt]
+    L = layout_of(fmt)
     if L in ("K", "KG", "K2", "K1"):                     # kdec: pair (q, t) of the unit is pair 4 q + t of the lane's decoder
         first, second = _pair_elements(L, 4 * q + t)
         return (32 * u + np.where(e == 0, first, second)).astype(np.int32)
@@ -1150,6 +1310,8 @@ def _fmma_scales(fmt: str) -> str:
         return ("device const uint* mp_ = MTP + (ulong(rn) * (UPR / 8u) + (uu >> 3)) * 5u; const float d_ = float(as_type<half2>(mp_[4]).x);"
                 " const uint ib_ = (uu & 7u) * 2u; S[j][0] = half2(half(d_ * float(((device const char*)mp_)[ib_]))); S[j][1] = half2(half(d_ * float(((device const char*)mp_)[ib_ + 1u])));")
     ml = _mload("q4_k" if fmt == "q5_k" else fmt, "rn", "uu")
+    if fmt == "iq4_nl":      # the unit's fp16 d; the table holds the codebook values
+        return f"S[j][0] = half2(half({ml}));"
     if fmt == "q4_0":
         return f"const half d_ = half({ml}); S[j][0] = half2(d_); Z[j][0] = half2(-8.0h * d_);"
     if fmt == "mxfp4":
@@ -1165,7 +1327,7 @@ def _fmma_blk_dec(fmt: str):
     pair = _FMMA_PAIR[fmt]
     kd = pair == "kdec"
     sel = {"q4_k": "(t & 1u)", "q5_k": "(t & 1u)", "q6_k": "(t & 1u)", "nvfp4": "(q >> 1)"}.get(fmt, "0u")
-    if kd and fmt in _DECP:
+    if kd and decp_of(fmt):
         dec = "const half2 w2 = wp[j][q * 4u + t];"
     elif kd:
         dec = ("const float2 f2_ = clamp(float2(wf[j][2u * (q * 4u + t)], wf[j][2u * (q * 4u + t) + 1u]), -65504.0f, 65504.0f); const half2 w2 = half2(f2_);")
@@ -1188,9 +1350,9 @@ def _fmma_blk_dec(fmt: str):
                f" * 16384.0h * S[j][{sel}];")
     hload = {"q5_k": "hv[j] = hi[ulong(rn) * UPR + uu];", "q6_k": "hv[j] = ((device const uint2*)hi)[ulong(rn) * UPR + uu];"}.get(fmt, "")
     hdecl = f"{_FMMA_HI[fmt]} hv[NT];" if fmt in _FMMA_HI else ""
-    if kd and fmt in _DECP:
+    if kd and decp_of(fmt):
         blk = (f"half2 wp[NT][16];\n      const uint uu = kb * 4u + c;\n      UNR for (uint j = 0; j < uint(NT); ++j) {{ const uint rn = rowt[j];"
-               f" KU cu_ = {_KLD[fmt].format(n='rn', u='uu')}; {_DECP[fmt]}(cu_, uu, wp[j]{ktab_arg(fmt) or ', 0'}); }}")
+               f" KU cu_ = {_KLD[fmt].format(n='rn', u='uu')}; {decp_of(fmt)}(cu_, uu, wp[j]{ktab_arg(fmt) or ', 0'}); }}")
     elif kd:
         blk = (f"float wf[NT][32];\n      const uint uu = kb * 4u + c;\n      UNR for (uint j = 0; j < uint(NT); ++j) {{ const uint rn = rowt[j];"
                f" KU cu_ = {_KLD[fmt].format(n='rn', u='uu')}; {_KDEC[fmt]}(cu_, uu, wf[j]{ktab_arg(fmt)}); }}")
@@ -1283,3 +1445,207 @@ def pair_gather(src: str, rest: list[str]):
     sel = "".join(f" auto {n} = sec_ ? {n}B : {n}A;" for n in rest)
     src = src.replace(a, "const uint s2_ = threadgroup_position_in_grid.y; const bool sec_ = s2_ >= uint(SP); const uint slot = sec_ ? s2_ - uint(SP) : s2_;" + sel)
     return src.replace(b, "y + ulong(s2_) * uint(N)"), [n + "A" for n in rest] + [n + "B" for n in rest]
+
+
+# ----------------------------------------------------------------------------------------------------------------------------------- NVFP4 routed-expert gather, register-fed (flag g2a)
+def gemv_g2_source(partial: bool = False) -> str:
+    """NVFP4 one-row routed-expert gather GEMV (slot = grid.y: expert id, x row), same inputs / output / launch names as gemv_source(nvfp4, gather=True) so pair_gather
+    applies. Template ints: KIN (% 1024), N, NBR (output rows per simdgroup), SGN (simdgroups per threadgroup = the threadgroup is 32 * SGN threads, rows per
+    threadgroup SGN * NBR, grid.x = N / (SGN * NBR) * 32 * SGN). A simdgroup owns NBR whole rows; lane l reads units l, l + 32, ... of each (16 B per unit, a row's units
+    of one load are 512 contiguous bytes), ALL the weight loads of the simdgroup are issued before the x staging barrier (bytes in flight = 4 KB * NBR per simdgroup instead of
+    one chunk ahead), no further barrier. The E2M1 pair decode is 5 integer ops per half2 (the 2^-14 rides in the scale), the e4m3 scales go to half by one shift each
+    (value * 2^-8, subnormals included; the NaN code 0x7F is not special-cased: encoders never write it), the block scale multiplies the 16-weight dot product (not each weight).
+    The sum order differs from gemv_source (float rounding only). partial (flag KYOJIN_MOE_PARTIALK_FP4, k % 32 == 0, k % 1024 != 0): NU = ceil(UPR / 32) and the units
+    past the row (lane + 32 i >= UPR) load nothing and add nothing; the default text is untouched."""
+    src = r"""
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint tgi = threadgroup_position_in_grid.x;
+    const uint slot = threadgroup_position_in_grid.y;
+    const uint ex = eids[slot];
+    device const half* XP = (device const half*)(x + ulong(xrows[slot]) * uint(KIN));
+    device half* YP = y + ulong(slot) * uint(N);
+    device const uint4* q4 = (device const uint4*)(qs + ulong(ex) * (ulong(N) * uint(KIN) / 8u));
+    device const ushort* MTP = (device const ushort*)(mt + ulong(ex) * (ulong(N) * (uint(KIN) / 32u)));
+    const float GS = gs[ex];
+    constexpr uint UPR = uint(KIN) / 32u, NU = uint(KIN) / 1024u, NT = 32u * uint(SGN);
+    const uint rbase = (tgi * uint(SGN) + sg) * uint(NBR);
+    uint4 qv[NBR][NU]; ushort mv[NBR][NU];
+    UNR for (uint j = 0; j < uint(NBR); ++j) UNR for (uint i = 0; i < NU; ++i) {
+      const ulong o = ulong(rbase + j) * UPR + lane + 32u * i;
+      qv[j][i] = q4[o]; mv[j][i] = MTP[o];
+    }
+    threadgroup half xs[(uint(KIN) / 32u) * 40u];
+    for (uint j = tid; j < uint(KIN) / 8u; j += NT) *(threadgroup uint4*)(xs + j * 8u + (j >> 2) * 8u) = *(device const uint4*)(XP + j * 8u);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float acc[NBR];
+    UNR for (uint j = 0; j < uint(NBR); ++j) acc[j] = 0.0f;
+    UNR for (uint i = 0; i < NU; ++i) {
+      threadgroup const half4* xp = (threadgroup const half4*)(xs + (lane + 32u * i) * 40u);
+      float4 xf[8];
+      UNR for (uint t = 0; t < 8; ++t) xf[t] = float4(xp[t]);
+      UNR for (uint j = 0; j < uint(NBR); ++j) {
+        const uint m = mv[j][i];
+        const half2 sh = as_type<half2>(((m & 0x7Fu) << 7) | ((m & 0x7F00u) << 15));
+        const float2 sc = float2(sh) * 4194304.0f;                       // 2^22 = 2^8 (e4m3 -> half shift) * 2^14 (e2m1 -> half)
+        float pb[2] = {0.0f, 0.0f};
+        UNR for (uint wi = 0; wi < 4; ++wi) {
+          const uint wd = qv[j][i][wi];
+          float p = pb[wi >> 1];
+          UNR for (uint t = 0; t < 4; ++t) {
+            const uint mg = (t < 3u ? (wd << (9u - 4u * t)) : (wd >> 3)) & 0x0E000E00u;
+            const uint sn = (wd << (12u - 4u * t)) & 0x80008000u;
+            const float2 f = float2(as_type<half2>(mg | sn));
+            p = fma(f.x, xf[2u * wi][t], p);
+            p = fma(f.y, xf[2u * wi + 1u][t], p);
+          }
+          pb[wi >> 1] = p;
+        }
+        acc[j] = fma(pb[0], sc.x, fma(pb[1], sc.y, acc[j]));
+      }
+    }
+    UNR for (uint j = 0; j < uint(NBR); ++j) {
+      const float v = simd_sum(acc[j]);
+      if (lane == 0u) YP[rbase + j] = half(v * GS);
+    }
+"""
+    if partial:
+        reps = (("NU = uint(KIN) / 1024u", "NU = (UPR + 31u) / 32u"),
+                ("      qv[j][i] = q4[o]; mv[j][i] = MTP[o];", "      const bool on = lane + 32u * i < UPR;\n      qv[j][i] = on ? q4[o] : uint4(0u); mv[j][i] = on ? MTP[o] : ushort(0);"),
+                ("      threadgroup const half4* xp = (threadgroup const half4*)(xs + (lane + 32u * i) * 40u);\n      float4 xf[8];\n      UNR for (uint t = 0; t < 8; ++t) xf[t] = float4(xp[t]);",
+                 "      const bool on = lane + 32u * i < UPR;\n      threadgroup const half4* xp = (threadgroup const half4*)(xs + (on ? lane + 32u * i : 0u) * 40u);\n      float4 xf[8];\n      UNR for (uint t = 0; t < 8; ++t) xf[t] = on ? float4(xp[t]) : float4(0.0f);"))
+        for x, y in reps:
+            assert src.count(x) == 1, x[:50]
+            src = src.replace(x, y)
+    return src
+
+
+# ----------------------------------------------------------------------------------------------------------------------------------- G3 dense GEMV (flag glmdense)
+# One-byte-per-weight GEMV for 1..4 rows, fp8 / fp8b (E4M3 + per-32 half scale): the decode is arithmetic (no constant-table read per byte), a lane reads one
+# 16-byte unit of a row per 512-chunk and the rows of a simdgroup share the staged activation; the whole x (or KC columns of it) is staged once per
+# threadgroup; the NR * R accumulators are reduced over the 32 lanes by a reduce-scatter (NR * R shuffles instead of 5 NR * R). Same products and the same fp32
+# accumulation as gemv8_source (one unit of 16 products is summed first, then scaled), the sums are ordered differently: not bit-identical, fp16 outputs differ in <= 1 ulp
+# on a few elements. E4M3 codes 0x7F / 0xFF (NaN, never written by the quantisers) decode to +-480 here, to 0 in the table kernels.
+# The activation is staged as half whatever it is stored as (xmode "h" half, "f" float32, "b" bfloat16: the cast the caller would have launched, round to nearest even,
+# is done while staging), or as the gated product of a gate | up row ("glu": silu(min(gate, L)) * clip(up, -L, L), the down projection of a gated MLP).
+def _rs_epilogue(nv: int, r: int, nsg_unused=None) -> str:
+    """Reduce nv fp32 accumulators acc[0..nv) over the 32 lanes of a simdgroup (reduce-scatter), then lane holding value vi writes y[(vi % r) * N + row0 + vi / r]."""
+    m = 1
+    while m < nv:
+        m *= 2
+    ls = [f"float v[{m}];"] + [f"v[{i}] = {'acc[%d]' % i if i < nv else '0.0f'};" for i in range(m)]
+    off, cur, bits = 16, m, []
+    while cur > 1:
+        half = cur // 2
+        ls.append(f"{{ const bool up = (lane & {off}u) != 0u; float nv_[{half}];")
+        ls.append(f"  UNR for (uint i = 0; i < {half}u; ++i) {{ const float send = up ? v[i] : v[i + {half}u]; const float keep = up ? v[i + {half}u] : v[i]; nv_[i] = keep + simd_shuffle_xor(send, {off}u); }}")
+        ls.append(f"  UNR for (uint i = 0; i < {half}u; ++i) v[i] = nv_[i]; }}")
+        bits.append((off, half))
+        cur, off = half, off // 2
+    while off >= 1:
+        ls.append(f"v[0] += simd_shuffle_xor(v[0], {off}u);")
+        off //= 2
+    idx = " + ".join(f"((lane & {o}u) != 0u ? {h}u : 0u)" for o, h in bits) or "0u"
+    ls.append(f"const uint vi = {idx};")
+    ls.append(f"if (vi < {nv}u) {{ const uint j = vi / {r}u, r_ = vi % {r}u; if (row0 + j < uint(N)) y[r_ * uint(N) + row0 + j] = half(clamp(v[0] * gs[row0 + j], -65504.0f, 65504.0f)); }}")
+    return "\n    ".join(ls)
+
+
+G3_HDR = UNR + r"""
+inline uint4 g3_pack_f(float4 a, float4 b) { return uint4(as_type<uint>(half2(a.xy)), as_type<uint>(half2(a.zw)), as_type<uint>(half2(b.xy)), as_type<uint>(half2(b.zw))); }
+inline uint g3_bf2h(uint w) { return as_type<uint>(half2(as_type<float>(w << 16), as_type<float>(w & 0xFFFF0000u))); }
+inline uint4 g3_pack_b(uint4 v) { return uint4(g3_bf2h(v.x), g3_bf2h(v.y), g3_bf2h(v.z), g3_bf2h(v.w)); }
+inline uint4 g3_glu(uint4 a, uint4 b, float lim) {
+  half h[8]; const thread half* pa = (const thread half*)&a; const thread half* pb = (const thread half*)&b;
+  for (uint i = 0; i < 8; ++i) { const float g = min(float(pa[i]), lim), u = clamp(float(pb[i]), -lim, lim); h[i] = half(g * (1.0f / (1.0f + metal::precise::exp(-g))) * u); }
+  return *(thread uint4*)h;
+}
+"""
+
+
+@functools.lru_cache(maxsize=None)
+def gemv8g3_source(r: int, nr: int, u: int, nsg: int, meta: bool = True, xmode: str = "h", limit: float = 0.0) -> str:
+    """Body. Template ints: KIN (% 512 == 0), N, KC (columns of x staged at once, % 512 == 0, r * KC * 2 <= 32 KiB), NPH (= ceil(KIN / KC)). Inputs x ([r, KIN] half /
+    float / bfloat16 by xmode; [r, 2 KIN] half for "glu"), qs (uint32 [N, KIN/4]), [mt (half [N, KIN/32]) when meta], gs (float [N]); output y half [r, N].
+    Threadgroup = nsg simdgroups x nr rows each."""
+    nv = nr * r
+    d_load = "d[u_][j] = mt[rn[j] * UPR + (kk >> 1)];" if meta else "d[u_][j] = half(1.0f);"
+    stage = {"h": "xs4[r_ * (uint(KC) / 8u) + c_] = X4[(r_ * uint(KIN) + kbase) / 8u + c_];",
+             "f": "{ device const float4* XF = (device const float4*)x; const uint b_ = (r_ * uint(KIN) + kbase + c_ * 8u) / 4u; xs4[r_ * (uint(KC) / 8u) + c_] = g3_pack_f(XF[b_], XF[b_ + 1u]); }",
+             "b": "xs4[r_ * (uint(KC) / 8u) + c_] = g3_pack_b(X4[(r_ * uint(KIN) + kbase) / 8u + c_]);",
+             "glu": f"{{ const uint b_ = (r_ * 2u * uint(KIN) + kbase) / 8u + c_; xs4[r_ * (uint(KC) / 8u) + c_] = g3_glu(X4[b_], X4[b_ + uint(KIN) / 8u], {float(limit)!r}f); }}"}[xmode]
+    return f"""
+    const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint row0 = (threadgroup_position_in_grid.x * {nsg}u + sg) * {nr}u;
+    constexpr uint KW = uint(KIN) / 16u, UPR = uint(KIN) / 32u;
+    threadgroup uint4 xs4[{r} * uint(KC) / 8u];
+    device const uint4* q4 = (device const uint4*)qs;
+    device const uint4* X4 = (device const uint4*)x;
+    uint rn[{nr}];
+    UNR for (uint j = 0; j < {nr}u; ++j) rn[j] = min(row0 + j, uint(N) - 1u);
+    float acc[{nv}];
+    UNR for (uint i = 0; i < {nv}u; ++i) acc[i] = 0.0f;
+    for (uint ph = 0; ph < uint(NPH); ++ph) {{
+      const uint kbase = ph * uint(KC), kcn = min(uint(KC), uint(KIN) - kbase);
+      if (ph > 0u) threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint i = tid; i < {r}u * kcn / 8u; i += {nsg * 32}u) {{ const uint r_ = i / (kcn / 8u), c_ = i % (kcn / 8u); {stage} }}
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      const uint nit = kcn / 512u;
+      if (row0 < uint(N)) {{
+        for (uint it0 = 0; it0 < nit; it0 += {u}u) {{
+          uint4 w[{u}][{nr}]; half d[{u}][{nr}];
+          UNR for (uint u_ = 0; u_ < {u}u; ++u_) {{
+            const uint kk = (kbase / 512u + min(it0 + u_, nit - 1u)) * 32u + lane;
+            UNR for (uint j = 0; j < {nr}u; ++j) {{ w[u_][j] = q4[rn[j] * KW + kk]; {d_load} }}
+          }}
+          UNR for (uint u_ = 0; u_ < {u}u; ++u_) {{
+            if (it0 + u_ >= nit) break;
+            const uint kl = (it0 + u_) * 32u + lane;
+            float xv[{r}][16];
+            UNR for (uint r_ = 0; r_ < {r}u; ++r_) {{
+              const uint4 xa = xs4[r_ * (uint(KC) / 8u) + 2u * kl], xb = xs4[r_ * (uint(KC) / 8u) + 2u * kl + 1u];
+              const uint xw[8] = {{xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w}};
+              UNR for (uint i = 0; i < 8u; ++i) {{ const half2 h = as_type<half2>(xw[i]); xv[r_][2u * i] = float(h.x); xv[r_][2u * i + 1u] = float(h.y); }}
+            }}
+            UNR for (uint j = 0; j < {nr}u; ++j) {{
+              const uint ww[4] = {{w[u_][j].x, w[u_][j].y, w[u_][j].z, w[u_][j].w}};
+              float2 p0[4], p1[4];
+              UNR for (uint i = 0; i < 4u; ++i) {{
+                const uint v = ww[i];
+                const uint a = ((v << 7) & 0x3F803F80u) | ((v << 8) & 0x80008000u);
+                const uint b = ((v >> 1) & 0x3F803F80u) | (v & 0x80008000u);
+                p0[i] = float2(as_type<half2>(a)); p1[i] = float2(as_type<half2>(b));
+              }}
+              const float sc = float(d[u_][j]) * 256.0f;
+              UNR for (uint r_ = 0; r_ < {r}u; ++r_) {{
+                float s = 0.0f;
+                UNR for (uint i = 0; i < 4u; ++i) {{
+                  s = fma(p0[i].x, xv[r_][4u * i], s); s = fma(p1[i].x, xv[r_][4u * i + 1u], s);
+                  s = fma(p0[i].y, xv[r_][4u * i + 2u], s); s = fma(p1[i].y, xv[r_][4u * i + 3u], s);
+                }}
+                acc[j * {r}u + r_] = fma(s, sc, acc[j * {r}u + r_]);
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}
+    if (row0 >= uint(N)) return;
+    {_rs_epilogue(nv, r)}
+"""
+
+
+def gemv8g3_config(r: int, n: int, k: int) -> tuple:
+    """(nr, nsg, u) of the G3 GEMV for r rows of a [n, k] matrix (micro-bench sweep on real GLM-5.3 weights, M5 Ultra, 16/11)."""
+    ov = os.environ.get("KYOJIN_G3_CFG")                      # "nr,nsg,u" (bench sweeps)
+    if ov:
+        return tuple(int(v) for v in ov.split(","))
+    if r <= 2:
+        return (8, 16, 1) if k <= 2048 and n >= 4096 else (4, 16, 1)
+    return (4, 8, 1) if n * k >= (16 << 20) else (4, 16, 1)
+
+
+def gemv8g3_kc(r: int, k: int) -> int:
+    return min(k, int(os.environ.get("KYOJIN_G3_KC", "2048")) // 512 * 512)      # columns of x staged at once: 2048 beat the whole row (K 8192-16384 R1: +4-5 %, smaller threadgroup memory = more resident groups); r * KC * 2 <= 16 KiB

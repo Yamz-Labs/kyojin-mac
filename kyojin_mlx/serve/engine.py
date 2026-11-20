@@ -82,6 +82,9 @@ from .. import gpuspan as GS
 from .. import plainsplit as PLS
 from .. import fired as FD
 from .. import pld as PLD
+from .. import glm_cost as GC
+from .. import glm_adaptive as GA
+from .. import spec_depth as SD
 from .. import ds41_vision
 from .. import copyv2 as CV2
 from .. import ladder as LADDER
@@ -220,6 +223,10 @@ def _oracle_read(path: str | None = None):
     except (OSError, ValueError, TypeError):
         return None, []
 
+class SessionRefused(RuntimeError):
+    """Engine.submit on a one-session backend (backend.one_session) while another session is live: the server answers 503 with this text."""
+
+
 class Handle:
     """What the HTTP thread holds for one request."""
 
@@ -319,6 +326,9 @@ class Session:
     rw_drop: bool = False                   # the next park drops the cache: the session is rebuilt from the prompt + its kept output
     th_n: int = -1                          # tokens of `out` folded into th_in (-1 = not started: th_in comes from the prompt)
     lk_full_n: int = 0                      # ... and how many consecutive lookup rounds did (flag lookup_confirm)
+    lk_cand: object = None                  # flag glm_chain: the n-gram match of this round (pld.Match), kept even when the lookup gate refused it
+    gx_rho: float = 0.8                     # flag glm_chain: P(an n-gram token is accepted | the head agreed and the previous one was accepted), smoothed
+    glm_idle: int = 0                       # flag glm_plan: rounds since this session last drafted
     lk_adapt: object = None                 # flag spec_lookup_adapt: pld.SuffixBuckets (short-suffix acceptance), created on first use
     lk_suffix: int = 0                      # agreement of the lookup draft planned for this round (read by _spec_update)
     cp_scale: float = 1.0                   # flag copy_v2: confidence scale of the session's copy matches (halved by a spent match)
@@ -328,6 +338,7 @@ class Session:
     trim_n: int = 0                         # ... and the drafted rounds since the last untrimmed one (every TRIM_PROBE-th round asks the full plan)
     gate_thr: float = 0.5                   # flag gate_adapt: the confidence threshold the next round drafts with
     gate_rate: list = field(default_factory=list)   # ... and the decayed tokens per ms measured for every candidate threshold
+    sd: object = None                       # flag spec_depth_auto: spec_depth.State (per-position acceptance EMA, last depth, probe clock)
     dsp2: object = None                     # flag dspol_v2: dspol2.State (confidence track + the last decision, for the trace)
     anchor: object = None                   # flag kv_tail: the chunk end where the tail anchor snapshot is taken (0 = none, None = not computed)
 
@@ -932,6 +943,61 @@ class Engine:
         return os.environ.get("KYOJIN_SPEC_LOOKUP", "0") not in ("0", "")
 
     @property
+    def _glm_plan(self) -> bool:
+        """GLM-5.3: drafts planned per round from the measured cost table and each session's acceptance (flag glm_plan; read per round; needs backend.glm_costs)."""
+        return os.environ.get("KYOJIN_GLM_PLAN", "0") not in ("0", "") and getattr(self.backend, "glm_costs", None) is not None
+
+    @property
+    def _glm_adaptive(self) -> bool:
+        """GLM-5.3: drafts per session from the live cost / acceptance controller (flag glm_adaptive; read per round; needs backend.glm_costs; a fixed depth wins)."""
+        return os.environ.get("KYOJIN_GLM_ADAPTIVE", "0") not in ("0", "") and getattr(self.backend, "glm_costs", None) is not None and self.depth_override is None
+
+    @property
+    def _plain_min_sessions(self) -> int:
+        """Session-count depth policy threshold N (flag spec_plain_min_sessions, read per round; 0 = off): with N or more sessions decoding the round is the TRUE plain step of the decode
+        tick (HOSTGAP + lookahead, no verify pass, no head feed, tuner not consulted); fewer sessions draft as the policy says. KYOJIN_GLM_MULTI_PLAIN=1 (name kept from DEPTH-B) is the alias
+        for N = 2 when the new flag is unset or 0. A fixed depth wins. Measured 17/11 on GLM-5.3 after the dec10 ship: d1 beats plain at 2 sessions, plain wins at 4."""
+        if self.depth_override is not None:
+            return 0
+        try:
+            n = int(os.environ.get("KYOJIN_SPEC_PLAIN_MIN_SESSIONS", "0") or 0)
+        except ValueError:
+            n = 0
+        if n <= 0 and os.environ.get("KYOJIN_GLM_MULTI_PLAIN", "0") not in ("0", ""):
+            n = 2
+        n = max(0, n)
+        if self._spec_depth_auto:                                     # flag spec_depth_auto: a crowd of 3+ has no verify rows left (SD.CROWD_ROWS), so it takes the true plain tick, not a depth 0 through the plan
+            n = SD.PLAIN_CROWD if n <= 0 else min(n, SD.PLAIN_CROWD)
+        return n
+
+    @property
+    def _glm_multi_plain(self) -> bool:
+        """The session-count policy is on (threshold N >= 1; see _plain_min_sessions)."""
+        return self._plain_min_sessions > 0
+
+    def _plain_crowd(self, n: int) -> bool:
+        """n sessions decoding: does the policy send the round to the plain step (n >= N, N >= 1; N = 1 would make a lone session plain, N = 2 is the old MULTI_PLAIN rule)?"""
+        m = self._plain_min_sessions
+        return m > 0 and n >= max(m, 2)
+
+    @property
+    def _spec_depth_auto(self) -> bool:
+        """Flag spec_depth_auto (kyojin_mlx.spec_depth, any MTP backend; read per round): the depth of a solo session follows its recent acceptance per draft position
+        (argmax expected tokens / ms, plain below 0.9 x plain's rate); mtp_depth is the ceiling. A crowd keeps the engine's rule, capped at depth 1 / SD.CROWD_ROWS rows. A fixed depth wins."""
+        return SD.enabled() and self.spec and self.depth_override is None
+
+    @property
+    def _auto_owns_depth(self) -> bool:
+        """spec_depth_auto decides the depth of this round (it is on and the nondet fix, which forbids a plan that reads a measured ms, is not): glm_adaptive / glm_plan keep their
+        cost tables but do not rewrite the depth, so the policy's own `last` (the one-row-up-per-round clock) stays what was run."""
+        return self._spec_depth_auto and not NONDET_FIX
+
+    @property
+    def _glm_chain(self) -> bool:
+        """GLM-5.3: the n-gram continuation that agrees with the head's first draft token joins the verify rows (flag glm_chain; read per round)."""
+        return os.environ.get("KYOJIN_GLM_CHAIN", "0") not in ("0", "") and getattr(self.backend, "glm_costs", None) is not None
+
+    @property
     def _copy_v2(self) -> bool:
         """Copy path on the request's own tokens, route copy > block > plain (flag copy_v2; read per round)."""
         return os.environ.get("KYOJIN_COPY_V2", "0") not in ("0", "")
@@ -1050,6 +1116,8 @@ class Engine:
         self._dsp2_cal = DSP2.Calibration()             # flag dspol_v2: P(accept k | kept so far) by bin of -log10(1 - conf), shared like the one above
         self._dsp2_cost = DSP2.RowCost.load()           # flag dspol_v2: the measured width table (scaled by the live plain step per decision)
         self._d_ms: dict = {}                           # solo drafted-round ms per depth (last K_WINDOW warm rounds): the measured cost behind _fit_cost
+        self._d_ms_ctx: dict = {}                       # the same windows tagged by context bucket (SD.ctx_bucket): flag spec_depth_auto reads its costs from the bucket of the session, never another one
+        self._spec_obs_bucket = None
         self._rd_win: list = []                         # KYOJIN_RATE_PAIR: (tokens, ms) of the last PAIR_WINDOW solo drafted rounds, any proposal length
         self._rp_win: list = []                         # ... and (1, ms) of the last PAIR_WINDOW solo plain rounds: the paired rate's two sides
         self._ladder = LADDER.Ladder()                  # flag spec_ladder: cost ladder of a solo pass (one verify pass = one round, the row cap is shared)
@@ -1064,6 +1132,8 @@ class Engine:
         self.prefix = PrefixCache(backend, block, prefix_bytes, disk=disk, log=self.log)
         self._lk_kept = collections.deque(maxlen=LK_KEEP)
         self.cv = threading.Condition()
+        self._live_cv = threading.Condition()           # one-session backends (backend.one_session): the live session, sid -> Session (submit .. _finish)
+        self._live: dict = {}
         self._last_work = time.monotonic()
         self._inbox: collections.deque = collections.deque()
         self._stop = False
@@ -1083,7 +1153,8 @@ class Engine:
         self._since_chunk = 0
         self.stats = collections.Counter()
         self.bad_ids = frozenset()                                   # server: the begin-of-text id when it is not also a stop id
-        for _k in ("spec_lookup_rounds", "spec_lookup_drafted", "spec_lookup_accepted", "spec_skip_rounds", "spec_skip_held", "spec_lookup_short_drafted", "spec_lookup_short_accepted",
+        for _k in ("spec_multi_plain_rounds", "spec_multi_solo_rounds", "spec_ad_rounds", "spec_ad_d0", "spec_ad_d1", "spec_ad_d2", "spec_ad_d3", "spec_ad_probe_rounds", "spec_ad_probes", "spec_ad_park", "spec_ad_switch", "spec_ad_obs", "spec_ad_unclean", "spec_glm_plan_rounds", "spec_glm_plan_d0", "spec_glm_plan_d1", "spec_glm_plan_d2", "spec_glm_plan_d3", "spec_glm_probe", "spec_glm_chain_cand", "spec_glm_chain_agree",
+                   "spec_glm_chain_rounds", "spec_glm_chain_drafted", "spec_glm_chain_accepted", "spec_lookup_rounds", "spec_lookup_drafted", "spec_lookup_accepted", "spec_skip_rounds", "spec_skip_held", "spec_lookup_short_drafted", "spec_lookup_short_accepted",
                    "spec_lookup_match", "spec_lookup_nomatch", "spec_lookup_short", "spec_lookup_refused", "spec_gate_cut", "spec_typical_relaxed", "spec_typical_rep_refused", "spec_typical_cooldown_triggers", "spec_typical_cooldown_tokens", "spec_typical_rewinds", "spec_typical_rewound_tokens", "spec_typical_think_skipped", "spec_block_cut", "spec_lazy_rounds", "spec_eager_rounds",
                    "spec_oracle_rounds", "spec_oracle_drafted", "spec_oracle_accepted", "spec_oracle_miss", "spec_oracle_resync",
                    "spec_gate_adapt_rounds", "spec_gate_adapt_up",
@@ -1150,10 +1221,31 @@ class Engine:
             raise ValueError(f"request needs about {self._need_bytes(s) / GIB:.2f} GiB of KV ({len(ids)} prompt tokens + up to {limit} reply tokens at "
                              f"{self.bpt:.0f} bytes per token), the KV budget is {self.kv_budget / GIB:.2f} GiB: shorten the prompt or max_tokens")
         s.seed = sampling.seed if sampling.seed is not None else int.from_bytes(np.random.bytes(7), "little")
+        only = getattr(self.backend, "one_session", None)
+        if only:                                                     # a backend that serves one session at a time (Hy4 delivery A): a second live one is refused, never queued
+            self._claim_live(s, only)
         with self.cv:
             self._inbox.append(s)
             self.cv.notify_all()
         return h
+
+    def _claim_live(self, s: Session, msg: str, wait_s: float = 30.0) -> None:
+        """One-session backends: s becomes THE live session, or SessionRefused. A live session that is only cancelled (the client left, the loop guard
+        resubmits) ends within a tick: wait for it instead of refusing."""
+        with self._live_cv:
+            t_end = time.monotonic() + wait_s
+            while self._live and all(x.handle.cancelled.is_set() for x in self._live.values()) and time.monotonic() < t_end:
+                self.wake()
+                self._live_cv.wait(0.05)
+            if self._live:
+                self.stats["refused_one_session"] += 1
+                raise SessionRefused(msg)
+            self._live[s.sid] = s
+
+    def _release_live(self, s: Session) -> None:
+        with self._live_cv:
+            if self._live.pop(s.sid, None) is not None:
+                self._live_cv.notify_all()
 
     def status(self) -> dict:
         p = self.prefix
@@ -1248,8 +1340,19 @@ class Engine:
             return
         t0 = time.perf_counter()
         PLS.tick_begin()                                            # probe plain_split: the round's own start (plan, then the plain tick)
-        tun = self._multi_tuner()                                   # several sessions: the tuner keeps the plan (its arm is the ladder's cap), the ladder prices a solo / unshared pass
-        if tun is not None:
+        if len(self.members) + len(self.ready) > 1 and self._spec_depth_auto:
+            for s in self.members + list(self.ready):                # a crowd runs the round: the solo clock restarts at d1 when it leaves (no straight climb back to the old depth, its graph is cold)
+                if s.sd is not None:
+                    s.sd.last = 0
+        mp = self.spec and self._glm_multi_plain
+        mp_crowd = mp and self._plain_crowd(len(self.members) + len(self.ready))
+        tun = None if mp_crowd else self._multi_tuner()             # several sessions: the tuner keeps the plan (its arm is the ladder's cap), the ladder prices a solo / unshared pass
+        if mp:                                                      # flag glm_multi_plain: a crowd runs the TRUE plain step (_decode_tick: HOSTGAP + lookahead, no head feed, no tuner)
+            self.stats["spec_multi_plain_rounds" if mp_crowd else "spec_multi_solo_rounds"] += 1
+        if mp_crowd:
+            self._round_D = None
+            spec_now = False
+        elif tun is not None:
             n = len(self.members) + len(self.ready)
             tkey = tuple(id(s) for s in self.members + list(self.ready))
             dmax = min(self.mtp_depth, max(0, getattr(self.backend, "max_spec_rows", 0) // n - 1))
@@ -1490,6 +1593,8 @@ class Engine:
                     key = "t_ttft_" + k.removesuffix("_ms")
                     self.stats[key] += v                             # sum over the finished requests
                     self.stats[key + "_max"] = max(self.stats[key + "_max"], v)
+        if self._live:                                               # before "done": a client that submits again on it finds the slot free
+            self._release_live(s)
         s.handle.events.put(("done", reason, stats))
         self.stats["finished_" + reason] += 1
 
@@ -1573,6 +1678,8 @@ class Engine:
 
     def _lookup_cost_ms(self, ctx: int, k: int) -> float | None:
         """Measured cost of a lookup round (k drafts -> k + 1 verify rows, no draft call); None before one is measured."""
+        if self._glm_plan:                                          # GLM-5.3: the measured verify / commit table (glm_cost), shared by the sessions of the pass
+            return self.backend.glm_costs.lookup_round_ms(int(k), max(1, len(self.members)))
         if self._lk_long:
             got = self._lk_costs.estimate(k)                        # measured lookup rounds first (the fit below is from MTP rounds of <= 6 rows)
             if got is not None:
@@ -1590,6 +1697,9 @@ class Engine:
     def _mtp_cost_ms(self, ctx: int, width: int) -> float | None:
         """Measured cost of the planned MTP round at `width` drafts (the engine's spec_fit tables when present; the cost
         ladder of flag spec_ladder when it has priced that width)."""
+        if self._glm_plan:
+            n = max(1, len(self.members))
+            return self.backend.glm_costs.plain(n) if width <= 0 else self.backend.glm_costs.mtp_round_ms(int(width), n)
         if self._spec_ladder:                                       # the same measured ladder the width was chosen from (of this many sessions)
             n = max(1, len(self.members))
             plain = self.plain_ms if n == 1 else self._plain_n.get(n)
@@ -1613,6 +1723,7 @@ class Engine:
 
     def _lookup_depth(self, s: Session, mtp_width: int):
         """(depth, draft) when a lookup should replace this session's MTP drafts this round, else (0, None)."""
+        s.lk_cand = None
         room = min(s.max_new - s.n_gen, self.ctx - s.n_prompt - s.n_gen) - 1
         if room <= 0 or s.lookup_index is None:
             return 0, None
@@ -1632,6 +1743,7 @@ class Engine:
             return 0, None
         ctx = s.n_prompt + s.n_gen
         s.lk_suffix = m.suffix
+        s.lk_cand = m                                                # flag glm_chain: a continuation the gate may refuse alone can still extend the head's draft
         self.stats["spec_lookup_match"] += 1
         if m.suffix < PLD.MIN_SUFFIX:
             self.stats["spec_lookup_short"] += 1                     # a match below the fixed floor (only flag spec_lookup_adapt tries these)
@@ -2377,11 +2489,25 @@ class Engine:
             return
         if self.kv_budget is not None and self.stats["decode_ticks"] % self.kv_refresh == 0:
             self.bc_bytes = self.backend.nbytes(self.bc)
+        _ps = PLS.begin(self.stats) if PLS.on() else None            # flag decode_trace / plain_split: the host split of this plain step (plainsplit.py)
+        _rows = max(1, len(self.members))
+        try:
+            self._decode_steady(_ps)
+        finally:
+            if _ps is not None:
+                _ps.mark("end")
+                _ps.close(self.stats, _rows)
+
+    def _decode_steady(self, _ps) -> None:
         # steady state: launch the next step from the lazy tokens of the one in flight, then read the one in flight
-        if self.lookahead and self.nxt is None and not self.ready and self._lookahead_ok():
+        if (self.lookahead or (self._lookahead_arg and self._glm_multi_plain)) and self.nxt is None and not self.ready and self._lookahead_ok():   # glm_multi_plain: the plain epoch of a speculative engine looks ahead too (a mode flip reads cur and nxt first: _end_epoch)
             self.nxt = self._launch()
+        if _ps is not None:
+            _ps.mark("launch")
         leaving = {}
         self._consume(self.cur, leaving, self.nxt is None)
+        if _ps is not None:
+            _ps.mark("consume")
         cross = self._tq_crossing()
         if cross:                                                # KYOJIN_TQ_FROM: a member reached the depth: end the epoch, convert its KV, rebatch next tick
             if self.nxt is not None:
@@ -2434,6 +2560,103 @@ class Engine:
             ph = s._rlog_ph = hashlib.md5(np.asarray(s.ids, dtype=np.int32).tobytes()).hexdigest()[:8]
         return ph
 
+    def _glm_depths(self, members: list) -> list:
+        """Flag glm_plan: the drafts per session of this round, from one cost-model plan over the whole pass (kyojin_mlx.glm_cost.plan_depths)."""
+        be = self.backend
+        rows = int(getattr(be, "max_spec_rows", 0) or 0)
+        ps, caps = [], []
+        for s in members:
+            room = min(s.max_new - s.n_gen, self.ctx - s.n_prompt - s.n_gen) - 1
+            caps.append(max(0, min(self.mtp_depth, room)))
+            ps.append([GC.Acc.p(s.pos_succ, s.pos_trial, j) for j in range(max(1, self.mtp_depth))])
+        top = max(caps) if caps else 0
+        ds = GC.plan_depths(ps, top, be.glm_costs, max_rows=rows)
+        out = []
+        for s, d, c in zip(members, ds, caps):
+            d = min(d, c)
+            if d == 0 and c > 0:
+                s.glm_idle += 1
+                if s.glm_idle >= GC.PROBE_EVERY and len(members) == 1:   # a solo session planned plain keeps no statistics: try one draft now and then (a crowd is priced by rows, not by p)
+                    s.glm_idle, d = 0, 1
+                    self.stats["spec_glm_probe"] += 1
+            else:
+                s.glm_idle = 0
+            out.append(d)
+        self.stats["spec_glm_plan_rounds"] += 1
+        for d in out:
+            self.stats[f"spec_glm_plan_d{min(d, 3)}"] += 1
+        return out
+
+    def _adaptive_depths(self, members: list) -> list:
+        """Flag glm_adaptive: the drafts per session of this round from the online controller (kyojin_mlx.glm_adaptive.DepthController)."""
+        be = self.backend
+        ad = getattr(self, "_ad", None)
+        if ad is None:
+            ad = self._ad = GA.DepthController(be.glm_costs, use_class=os.environ.get("KYOJIN_GLM_ADAPTIVE_CLASS", "1") != "0")
+        ad.max_rows = int(getattr(be, "max_spec_rows", 0) or 0)
+        views = []
+        for s in members:
+            room = min(s.max_new - s.n_gen, self.ctx - s.n_prompt - s.n_gen) - 1
+            views.append(GA.SessView(s.sid, max(0, min(self.mtp_depth, room)), s.out[-GA.CLASS_WINDOW:]))
+        ds = ad.choose(views)
+        self._ad_views = views
+        st = self.stats
+        st["spec_ad_rounds"] += 1
+        for d in ds:
+            st[f"spec_ad_d{min(d, 3)}"] += 1
+        for k, nk in (("probe_rounds", "spec_ad_probe_rounds"), ("probes", "spec_ad_probes"), ("park", "spec_ad_park"), ("switch", "spec_ad_switch")):
+            st[nk] = ad.stats[k]
+        return ds
+
+    def _adaptive_observe(self, members: list, depths: list, drafted: list, accepted: list, clean: bool, t0: float, t3: float) -> None:
+        """Flag glm_adaptive: the verify pass that just ran (acceptance of every session; the cost of a clean round: its cycle = from the end of the previous spec round when
+        that one directly precedes this one, else the round alone)."""
+        ad, views = getattr(self, "_ad", None), getattr(self, "_ad_views", None)
+        if ad is None or views is None or len(views) != len(members):
+            return
+        cyc = None
+        if clean:
+            cyc = (t3 - t0) * 1e3
+            prev = getattr(self, "_ad_prev_t3", None)
+            if prev is not None and 0 <= t0 - prev < 0.5 * (t3 - t0):                  # back to back: the host's own gap between two rounds is a cost of the round
+                cyc = (t3 - prev) * 1e3
+        self.stats["spec_ad_obs" if clean else "spec_ad_unclean"] += 1
+        ad.observe(views, depths, drafted, accepted, cyc)
+        self._ad_prev_t3 = t3 if clean else None
+        if clean:
+            n = len(members)
+            rows = n + sum(drafted)
+            self.stats[f"spec_ad_ms_n{n}_r{rows}"] = round(ad.costs.t.get((n, rows), 0.0), 3)
+
+    def _glm_extend(self, members: list, rows: dict, depths: list, lookups: dict) -> dict:
+        """Flag glm_chain: for a session whose head draft opens with the same token as its n-gram continuation, the continuation's next tokens join the draft
+        (free rows: no head step). Returns {session index: (head drafts, extension)}."""
+        be = self.backend
+        costs = be.glm_costs
+        cap = int(getattr(be, "max_spec_rows", 0) or 0)
+        lk_rows = sum(k for k, _ in lookups.values())
+        info = {}
+        for i, s in enumerate(members):
+            m, dr = s.lk_cand, rows.get(i)
+            if m is None or not dr or i in lookups:
+                continue
+            self.stats["spec_glm_chain_cand"] += 1
+            if not m.draft or int(m.draft[0]) != int(dr[0]):
+                continue
+            self.stats["spec_glm_chain_agree"] += 1
+            p1 = GC.Acc.p(s.pos_succ, s.pos_trial, 0)
+            room = min(s.max_new - s.n_gen, self.ctx - s.n_prompt - s.n_gen) - 1 - len(dr)
+            ext = min(len(m.draft) - 1, PLD.MAX_DRAFT, room)
+            if ext <= 0:
+                continue
+            ds = [len(rows.get(j, [])) for j in range(len(members))]                 # live: earlier extensions of this round count
+            e = GC.chain_extra(p1, s.gx_rho, ds, i, costs, ext, max_rows=(cap - lk_rows) if cap else 0)
+            if e > 0:
+                info[i] = (len(dr), e)
+                rows[i] = list(dr) + [int(t) for t in m.draft[1:1 + e]]
+                depths[i] = len(rows[i])
+        return info
+
     def _plan_depth(self, s: Session) -> int:
         """Drafts to ask for this round: the best D in 0..mtp_depth for the acceptance seen so far (tokens per round / cost of the round, in solo
         steps, the fixed cost of a step shared by the sessions of the pass), never more than the reply can still use. D = 0 is probed with D = 1 every
@@ -2447,6 +2670,13 @@ class Engine:
             return 0
         if self.depth_override is not None:
             return min(cap, self.depth_override)
+        if self._plain_crowd(len(self.members)):                      # flag spec_plain_min_sessions / glm_multi_plain: a crowd takes the plain step (the verify rows cost more than the tokens they win)
+            return 0
+        auto = self._spec_depth_auto                                  # flag spec_depth_auto
+        if auto and len(self.members) > 1:
+            cap = min(cap, 1, max(0, SD.CROWD_ROWS // len(self.members) - 1))   # a crowd: the served d1 rows, then the rule below (3 or more never get here: _plain_min_sessions sends them to the plain step)
+            if cap <= 0:
+                return 0
         if self._round_D is not None and len(self.members) > 1:       # the tuner's arm for this round
             return min(cap, self._round_D)
         md = getattr(self.backend, "multi_depth", None)
@@ -2455,6 +2685,8 @@ class Engine:
         if NONDET_FIX:                                                # flags.py nondet_fix: no wall time in the plan (the width moves a row's bits)
             FD.hit("nondet_plan")
             return cap
+        if auto and len(self.members) <= 1:                           # solo auto: AFTER the nondet fix (it reads the measured ms, which the fix forbids)
+            return self._plan_auto(s, cap)
         if self._dspol_v2 and len(self.members) <= 1:                 # flag dspol_v2: one calibrated policy, R = 1 (plain) .. cap + 1 rows
             FD.hit("dspol_v2")
             return self._plan_v2(s, cap)
@@ -2511,6 +2743,15 @@ class Engine:
             s.idle_rounds, s.probing = 0, True
             return self._probe_depth(cap)
         return 0
+
+    def _plan_auto(self, s: Session, cap: int) -> int:
+        """Flag spec_depth_auto, solo session: the depth from the session's per-position acceptance EMA and the measured round ms (kyojin_mlx.spec_depth.choose)."""
+        st = s.sd
+        if st is None:
+            st = s.sd = SD.State()
+        d = SD.choose(st, cap, self.plain_ms, self._d_ms_ctx.get(SD.ctx_bucket(s.n_prompt + s.n_gen), {}))
+        self.stats[f"spec_auto_d{d}"] += 1
+        return d
 
     def _plan_rate(self, s: Session, cap: int) -> int:
         """Solo depth from measured rates: the cap, unless the session's tokens per cap round over the median ms of a cap round (warm samples)
@@ -2583,7 +2824,7 @@ class Engine:
 
     def _learn_k(self) -> None:
         """Cost of a drafted round against the formula (row_cost, draft_cost), from the last drafted solo round and the measured plain round."""
-        if self._spec_obs is None or not self.plain_ms:
+        if self._spec_obs is None or (not self.plain_ms and not self._spec_depth_auto):    # flag spec_depth_auto prices rounds without a measured plain step (its prior shape)
             return
         ms, d, tok = self._spec_obs
         self._spec_obs = None
@@ -2591,7 +2832,12 @@ class Engine:
             self._k_warm.add(d)                                      # Without this one cold round pinned spec_k at its cap and the depth policy never drafted again.
             return
         self._d_ms[d] = (self._d_ms.get(d, []) + [ms])[-K_WINDOW:]
+        if self._spec_obs_bucket is not None:
+            w = self._d_ms_ctx.setdefault(self._spec_obs_bucket, {})
+            w[d] = (w.get(d, []) + [ms])[-K_WINDOW:]
         self._rd_win = (self._rd_win + [(tok, ms)])[-PAIR_WINDOW:]   # flag rate_pair: the same round's tokens against its own ms
+        if not self.plain_ms:
+            return
         k = min(4.0, ms / self.plain_ms / (1.0 + self.row_cost * d + self.draft_cost))
         if self.robust:
             self._k_samples = (self._k_samples + [k])[-K_WINDOW:]
@@ -2872,6 +3118,13 @@ class Engine:
         for i in range(reached):                                   # only the reached positions decay: one not drafted keeps its last value
             s.pos_trial[i] = 0.9 * s.pos_trial[i] + 1
             s.pos_succ[i] = 0.9 * s.pos_succ[i] + (1 if i < accepted else 0)
+        if self._spec_depth_auto:                                   # flag spec_depth_auto: the per-position EMA behind the depth, and the served per-position counts
+            if s.sd is None:
+                s.sd = SD.State()
+            s.sd.observe(drafted, accepted)
+            for i in range(reached):
+                self.stats[f"spec_pos{i + 1}_try"] += 1
+                self.stats[f"spec_pos{i + 1}_acc"] += 1 if i < accepted else 0
         if conf is not None and self._dspol_v2:                     # flag dspol_v2: the calibration of P(accept k | kept so far)
             self._v2_observe(s, list(conf), drafted, accepted)
         if conf is not None and self._dspol_on:                     # the confidence head's per-position values train the width policy
@@ -2899,6 +3152,7 @@ class Engine:
         """A round without drafts: the plain step of the batched cache, pipelined like the decode loop (the next step is launched from the lazy
         tokens of the one in flight before those are read). p0s = position of the pending token of each session (the step in flight, if any).
         rlog (flag round_log): (mtp_depths, pre, pin, depths) of the plan that sent this round to the plain step, for the trace."""
+        self._ad_prev_t3 = None                                     # flag glm_adaptive: a plain step between two verify rounds ends their back-to-back cycle
         t0 = time.perf_counter()
         c0 = time.thread_time()
         _ps = PLS.begin(self.stats) if PLS.on() else None           # probe plain_split: the host's own marks of this tick
@@ -2942,6 +3196,8 @@ class Engine:
             dt = (time.perf_counter() - t0) * 1e3
             n = len(members)
             self._plain_n[n] = dt if n not in self._plain_n else 0.9 * self._plain_n[n] + 0.1 * dt
+        if warm and not leaving and self._glm_adaptive and getattr(self, "_ad", None) is not None:   # flag glm_adaptive: the plain pass of n sessions is the controller's baseline
+            self._ad.observe_plain(len(members), (time.perf_counter() - t0) * 1e3)
         st = self.stats
         st["spec_rounds"] += 1
         st["spec_rows"] += len(members)
@@ -3087,6 +3343,14 @@ class Engine:
             depths = self._round_depths(members)
         else:
             depths = [self._plan_depth(s) for s in members]
+        _own = self._auto_owns_depth                                  # flag spec_depth_auto: its depth (and SD.State.last) is not overwritten by the controllers below
+        _ad_on = self._glm_adaptive and not _own
+        if _ad_on:                                                    # flag glm_adaptive: the live controller (before glm_plan)
+            depths = self._adaptive_depths(members)
+        elif self._glm_plan and not _own:                                        # flag glm_plan: one cost-model plan for the whole pass
+            depths = self._glm_depths(members)
+        if self._plain_crowd(len(members)):                           # flag spec_plain_min_sessions / glm_multi_plain: _decode_phase sends a crowd to _decode_tick; this is the guard for a caller that did not
+            depths = [0] * len(members)
         if self._spec_skip:                                           # flag spec_skip: a session whose head was all cut rests (lookups still apply below)
             for i, s in enumerate(members):
                 if s.skip_hold > 0 and depths[i] > 0:
@@ -3099,6 +3363,8 @@ class Engine:
             depths, lookups = self._oracle_plan(members)
         else:
             depths, lookups = self._lookup_plan(members, mtp_depths)
+        if getattr(be, "lookup_only", False):                         # no draft head (GLM-5.3 lookup spec): a session without a lookup draft takes the plain step
+            depths = [d if i in lookups else 0 for i, d in enumerate(depths)]
         _pin = ([(s.probing, self.plain_ms, RLOG.median(self._d_ms.get(self.mtp_depth, ())), self.spec_k, mtp_depths[i])
                  for i, s in enumerate(members)] if _rl else None)
         HL.mark("spec_plan")
@@ -3121,6 +3387,8 @@ class Engine:
                 return
             p0s = [s.n_prompt + s.n_gen - 1 for s in members]
             depths, lookups = self._oracle_plan(members) if self._oracle else self._lookup_plan(members, mtp_depths, clamp=True)   # the token of the step in flight moves the tail: re-plan
+            if getattr(be, "lookup_only", False):
+                depths = [d if i in lookups else 0 for i, d in enumerate(depths)]
             if not any(depths) and hasattr(be, "step_feed"):          # the re-plan found no draft: the plain step, never a one-row verify
                 if self._spec_lookup:
                     for s in members:
@@ -3153,6 +3421,8 @@ class Engine:
         jobs = [(s.draft, s.last, p0, 0 if i in lookups else depths[i], (s.rids, s.out))
                 for i, (s, p0) in enumerate(zip(members, p0s))]
         lazy = getattr(be, "draft_lazy", None)
+        if lazy is not None and getattr(be, "lazy_needs_eager", False) and (self._glm_chain or self._spec_skip):
+            lazy = None                                               # flag glm_lag1: the n-gram extension / the skip cut read the drafts before the verify is built
         if self._dspol_v2 >= 2 and len(members) <= 1:                 # dspol_v2 mode 2: the rows are chosen from this round's confidences, so the draft is read first
             lazy = None
         cpl = {}
@@ -3165,6 +3435,7 @@ class Engine:
         lh_lazy = lh is not None
         rs = None
         res = None
+        gx = {}                                                       # flag glm_chain: {session: (head drafts, n-gram extension rows)} of this round
         if lh is not None and want_lg:                               # spec_rs: the proposals are drawn from the draft head's q, not its argmax
             rs = self._rs_draws(lh, members)
             if rs is not None:
@@ -3177,6 +3448,8 @@ class Engine:
             else:
                 drafted = be.draft_many(jobs)
             rows = {i: [int(t) for t in dr[:depths[i]]] for i, dr in enumerate(drafted) if i not in lookups}
+            if self._glm_chain and not self._orc_round:
+                gx = self._glm_extend(members, rows, depths, lookups)
             if self._dspol_v2 >= 2 and len(members) <= 1 and rows:
                 asked = any(depths)
                 self._v2_cut(members, rows, depths, lookups)
@@ -3351,8 +3624,19 @@ class Engine:
                 s.kept_ema = float(len(drafts)) if s.kept_ema < 0 else s.kept_ema + TRIM_RATE * (len(drafts) - s.kept_ema)
             conf = confs[k] if confs is not None and k < len(confs) else None
             lk = k in lookups and not self._orc_round
-            self._spec_update(s, len(drafts), a, conf=None if (rs is not None and k in rs[0]) or self._spec_chain > 1 else conf,
-                              planned=depths[k] if full else None, lookup=lk)
+            gk = gx.get(k)
+            if gk is not None:                                        # flag glm_chain: the head's draft and the n-gram extension are scored apart (the head's positions must stay its own)
+                n_h, n_x = gk
+                self._spec_update(s, n_h, min(a, n_h), conf=None, planned=None, lookup=False)
+                acc_x = max(0, a - n_h)
+                if a >= n_h:                                          # the extension was reached only when the head's draft(s) passed
+                    s.gx_rho = 0.8 * s.gx_rho + 0.2 * (acc_x / n_x)
+                self.stats["spec_glm_chain_rounds"] += 1
+                self.stats["spec_glm_chain_drafted"] += n_x
+                self.stats["spec_glm_chain_accepted"] += acc_x
+            else:
+                self._spec_update(s, len(drafts), a, conf=None if (rs is not None and k in rs[0]) or self._spec_chain > 1 else conf,
+                                  planned=depths[k] if full else None, lookup=lk)
             if self._gate_adapt and conf is not None:
                 self._gate_learn(s, conf, a, 1 + raw_n, depths[k], (t2 - t0) * 1e3)
             if self._orc_round:
@@ -3408,6 +3692,11 @@ class Engine:
             self._dissolve(leaving)
         t3 = time.perf_counter()
         HL.mark("spec_commit")
+        if _ad_on:                                                    # flag glm_adaptive: feed the controller (a lookup / oracle / chain / sampled round teaches acceptance only for the rows the head drafted)
+            _dr = [0 if (k in lookups or self._orc_round or k in gx) else built[k] for k in range(len(members))]
+            _ac = [accepted[k] if _dr[k] else 0 for k in range(len(members))]
+            self._adaptive_observe(members, mtp_depths, _dr, _ac, clean=(not lookups and not self._orc_round and not gx and rs is None and not leaving
+                                                                       and built == list(depths)), t0=t0, t3=t3)
         if self._spec_ladder and self._round_D is None and not lookups and mtp_depths and len(set(mtp_depths)) == 1 and mtp_depths[0] > 0:
             nn_ = len(members)
             plain = self.plain_ms if nn_ == 1 else self._plain_n.get(nn_)
@@ -3418,6 +3707,7 @@ class Engine:
             self._lk_costs.observe(depths[0], (t3 - t0) * 1e3)       # a solo lookup round: the price of that draft count
         if len(members) == 1 and depths[0] > 0 and self.spec_costs is None and not lookups and not self._orc_round:
             self._spec_obs = ((t3 - t0) * 1e3, depths[0], sum(a + 1 for a in accepted))
+            self._spec_obs_bucket = SD.ctx_bucket(members[0].n_prompt + members[0].n_gen)
             self._learn_k()
         st = self.stats
         st["spec_rounds"] += 1

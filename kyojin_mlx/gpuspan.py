@@ -111,6 +111,8 @@ def _merge(iv: list) -> list:
 SEQ_LOG = os.environ.get("KYOJIN_GPU_SEQ_LOG", "")        # probe only, gpu_kern on: write the kernel order of one one-row round here
 BIG_LOG = os.environ.get("KYOJIN_GPU_BIG_LOG", "/tmp/kyojin_gpu_big.log")      # probe only, gpu_span on: one line per round with a gap over 15 ms
 
+FULL_DIR = os.environ.get("KYOJIN_GPU_FULL", "")        # G2h probe: dir; phase name read from <dir>/cur, one JSONL per phase
+_FULL_SEEN = set()
 MARKS = []
 JOBS = []
 TL_LOG = os.environ.get("KYOJIN_GPU_TL", "")           # probe only: per-buffer timeline of every completed round (decgap)
@@ -176,6 +178,27 @@ def _fold(stats: dict, rows: int, prefix: str, s0: int, s1: int) -> None:
                         k = _sane(kname(_lib.cb_disp(s, i)))
                         a, b = kn.get(k, (0.0, 0))
                         kn[k] = (a + ms / n, b + 1)
+    if FULL_DIR and prefix.endswith("L") and s1 > s0:       # G2h probe: every buffer of the round, in commit order, with ALL its dispatch names (exact with MLX_MAX_OPS_PER_BUFFER=1)
+        try:
+            ph = open(os.path.join(FULL_DIR, "cur")).read().strip()
+        except OSError:
+            ph = ""
+        if ph:
+            o = min(commits) if commits else 0.0
+            recs, newn = [], {}
+            for s in range(s0, s1):
+                _lib.cb_times(s, ctypes.byref(t0), ctypes.byref(t1))
+                _lib.cb_commit_time(s, ctypes.byref(ct))
+                ids = [_lib.cb_disp(s, i) for i in range(_lib.cb_ndisp(s))]
+                for i in ids:
+                    if i not in _FULL_SEEN:
+                        _FULL_SEEN.add(i)
+                        newn[i] = kname(i)
+                recs.append([round((ct.value - o) * 1e3, 4), round((t0.value - o) * 1e3, 4), round((t1.value - o) * 1e3, 4), ids])
+            with open(os.path.join(FULL_DIR, ph + ".jsonl"), "a") as fh:
+                if newn:
+                    fh.write(json.dumps({"names": newn}) + "\n")
+                fh.write(json.dumps({"rows": rows, "b": recs}) + "\n")
     if seq and rows == 1 and not os.path.exists(SEQ_LOG):
         with open(SEQ_LOG, "w") as fh:                       # the ordered kernel names (and us each) of the first one-row round
             fh.write("\n".join(seq))

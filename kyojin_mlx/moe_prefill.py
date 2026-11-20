@@ -234,10 +234,10 @@ class MoePrefill:
 
     def _mid(self, inner, ids_s, wts_s, n, oh, perm, cap=None, bounded=None):
         m = self.m
-        km = _kernel(("mid", m.limit, m.wpre, m.fq, m.alpha, m.beta, oh, perm, bounded is not None), "kyojin_midpf",
+        km = _kernel(("mid", m.limit, m.wpre, m.fq, m.alpha, m.beta, oh, perm, bounded is not None, m.act), "kyojin_midpf",
                      input_names=["part", "ids", "wts", "svh0", "svh1", "suhd", "params"] + (["rows"] if bounded is not None else []),
                      output_names=["xh2"],
-                     source=PF.mid_pf_source(m.limit, m.wpre, m.fq, m.alpha, m.beta, oh, oh, perm, bounded=bounded is not None))
+                     source=PF.mid_pf_source(m.limit, m.wpre, m.fq, m.alpha, m.beta, oh, oh, perm, bounded=bounded is not None, act=m.act))
         rows = n if bounded is None else bounded[1]
         grid, tgp = _had(m.g.nout // 128, rows)
         return km(inputs=[inner, ids_s, wts_s, m.g.svh, m.u.svh, m.d.suh, mx.array([n, m.g.nout], dtype=mx.uint32)]

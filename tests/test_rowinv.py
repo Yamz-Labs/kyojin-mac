@@ -57,3 +57,36 @@ def test_batched_step_bitwise_equal_to_solo(pack):
     assert r.returncode == 0, r.stderr[-2000:]
     lines = [l for l in r.stdout.splitlines() if l.startswith("N=")]
     assert len(lines) == 4 and all("equal to solo" in l and ": True; greedy tokens equal: True" in l for l in lines), r.stdout
+
+
+@pytest.mark.parametrize("rows", [2, 3, 4, 8])
+@pytest.mark.parametrize("K,N", [(12288, 24), (3072, 256), (4096, 40)])
+@pytest.mark.parametrize("xd,wd", [(np.float32, np.float32), (np.float16, np.float32)])
+def test_skinny_mm_close_to_matmul_and_row_invariant(monkeypatch, rows, K, N, xd, wd):
+    monkeypatch.setattr(RI, "SKINNY_ROWS", 8)
+    rng = np.random.default_rng(rows * 1000 + K + N)
+    w = mx.array((rng.standard_normal((N, K)) * 0.05).astype(wd))
+    x = mx.array(rng.standard_normal((1, rows, K)).astype(xd))                   # [B, S, K]: the chained verify layout
+    y = RI.skinny_mm(x, w)
+    assert y.shape == (1, rows, N)
+    ref = x.astype(mx.float32) @ w.astype(mx.float32).T
+    np.testing.assert_allclose(np.array(y), np.array(ref), rtol=2e-4, atol=2e-4)
+    two = RI.skinny_mm(x[:, :2], w)                                              # the same row alone with one neighbour: same bits (the rowdot order is a function of K, N only)
+    assert np.array_equal(bits(y)[0, 0], bits(two)[0, 0])
+    flat = RI.skinny_mm(x[0], w)                                                 # [S, K] input: same launch
+    assert np.array_equal(bits(flat), bits(y)[0])
+
+
+def test_skinny_mm_keeps_the_stock_matmul_outside_its_band(monkeypatch):
+    rng = np.random.default_rng(5)
+    w = mx.array(rng.standard_normal((24, 4096)).astype(np.float32))
+    for rows in (1, 2, 9):
+        x = mx.array(rng.standard_normal((rows, 4096)).astype(np.float32))
+        stock = np.array(x @ w.T)
+        monkeypatch.setattr(RI, "SKINNY_ROWS", 0)
+        assert np.array_equal(bits(RI.skinny_mm(x, w)), bits(stock))              # flag off: always the stock matmul
+        monkeypatch.setattr(RI, "SKINNY_ROWS", 8)
+        if rows in (1, 9):
+            assert np.array_equal(bits(RI.skinny_mm(x, w)), bits(stock))          # one row (gemv) and more rows than the band (prompt chunk): stock
+        else:
+            np.testing.assert_allclose(np.array(RI.skinny_mm(x, w)), np.array(stock), rtol=2e-4, atol=2e-4)

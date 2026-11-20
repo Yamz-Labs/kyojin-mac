@@ -36,6 +36,43 @@ or `tools/mac_serve.sh /path/to/model ...` (same options, keeps the Mac awake).
 Options derive from the pack. `--help` lists them all. Details: `docs/SERVER.md`.
 To add a model see `docs/ADD_A_MODEL.md` and `docs/NEW_MODEL.md`. To convert to EXL3 see `CONVERT.md`.
 
+## Hy4-flash (GGUF)
+
+Hy4-flash runs from the public Q3_K GGUF (2 files, 144 GiB) published by AngelSlim: [AngelSlim/Hy4-flash-GGUF](https://huggingface.co/AngelSlim/Hy4-flash-GGUF). The model keeps the publisher's licence.
+Tested on a Mac Studio with 256 GB of unified memory.
+
+    pip install -U "huggingface_hub[cli]"
+    hf download AngelSlim/Hy4-flash-GGUF --include "Hy4-flash-Q3_K-*.gguf" --local-dir ./hy4-flash
+    set -a; . tools/hy4_mac.env; set +a
+    python -m kyojin_mlx.serve.server --model ./hy4-flash --port 8080 --model-id Hy4-flash \
+        --sessions 1 --ctx 262144 --kv-mode fp16 --no-kv-disk --prefill-chunk 2048 --mtp-depth 3 --cache-limit-mb 16384
+
+`tools/hy4_mac.env` holds the kernel flags of the measured line. The prefill speed depends on the MLX buffer cache limit: `--cache-limit-mb 16384` is the value of the measured line (without the flag the limit is derived from the weights and the free memory). Speculative decoding uses the model's own multi-token-prediction head (`--mtp-depth 3`).
+Speed numbers: see the benchmark table.
+
+- Context: 256K tokens (`--ctx 262144`). 1M tokens is not part of this release.
+- One request decodes at a time; other requests queue. Batched multi-user decode of Hy4 is not in this release.
+- The Engram tables (59 GiB) stay on disk and are read by row (parallel preads with a background prefetch, `KYOJIN_HY4_ENGRAM_PREAD` and `KYOJIN_HY4_ENGRAM_DECPF` in `tools/hy4_mac.env`); nothing is loaded or pinned in memory. The first request after a start is slower while rows are read. The read helper `tools/rowread/rowread.c` is compiled with `clang` on first use; without a compiler the rows are read through the memory map (same results, slower on a cold table).
+- One model and one quantization (Q3_K). The model row is marked unproven in the loader, which is why `tools/hy4_mac.env` sets `KYOJIN_SKELETON=1` and `KYOJIN_KIT_UNPROVEN_ROWS=1`.
+- Tests: `tests/test_hy4_*.py`, `tests/test_skeleton_hy4_*.py` and `tests/test_engram_hy4.py` (run one file at a time).
+
+### Decensor spec (optional)
+
+The server can remove a refusal direction from the Hy4-flash hidden stream at run time, without editing or re-quantising the weights. It is off by default. To arm it, point `KYOJIN_ABLIT_SPEC` at a spec directory before the serve command:
+
+    export KYOJIN_ABLIT_SPEC=/path/to/spec_dir
+
+The directory holds `edit_spec.json` (hidden size 3072, 42 layers, per-layer weights, `"r_per_layer": true`) and `edit_spec.safetensors` (tensor `r`, float32, shape `[42, 3072]`, one direction per layer). The path of `edit_spec.json` itself also works. A spec whose hidden size differs from the model is refused at load. To go back to the measured line, unset the variable.
+
+- The hook edits the attention output (after its post norm) and the MLP / MoE output (after its post norm) of the trunk layers whose weight is not 0. The speculative draft head is never edited.
+- Blocks with an armed hook run the unfused sub-layer path, so decode is slower than the unarmed line. The compiled decode step and the fused hyper-connection kernels are not armed.
+
+A spec ships with the repository in `specs/hy4/` (off by default). To arm it, one line before the serve command:
+
+    export KYOJIN_ABLIT_SPEC=specs/hy4
+
+The sha256 of both files is listed in `specs/hy4/SHA256SUMS`. Measured cost of the armed hook on the Mac Studio (4K context, speculative decode, depth 3): about 20 to 30 % lower decode speed than the line in the table above, because armed blocks run the unfused path (see the second note above). Reasoning answers also get much longer on the refusal-style test prompts (in our check 4 of 17 answers reached the 4096-token limit and 3 came back empty). Treat the armed hook as experimental: it is not part of the measured table, and a faster fused version is in progress.
+
 ## Speed
 
 Kyojin 1.8.9 on a Mac Studio M5 Ultra, 256 GB. Served through the real server, real text, tokens per second.
@@ -50,6 +87,7 @@ One warm-up discarded, then one measured run.
 | DeepSeek V4.1 Flash, prefill at 983K | 2199-2291 |
 | DeepSeek V4.1 Flash, decode at 983K | 48-49 |
 | DeepSeek V4.1 Flash, 4 sessions, 8K, aggregate decode | 112 |
+| Hy4-flash Q3_K (GGUF), decode at 4K to 128K, against llama.cpp | see the Hy4-flash table below |
 | Qwen 35B-A3B UD-Q4_K_XL (GGUF), prefill 8K | ~7000 |
 | Qwen 35B-A3B UD-Q4_K_XL (GGUF), prefill 32K | 6304 |
 | Qwen 35B-A3B UD-Q4_K_XL (GGUF), decode at 1K | 185 |
@@ -59,6 +97,63 @@ One warm-up discarded, then one measured run.
 
 Memory: one resident copy of the weights. The 35B GGUF is a 20.8 GiB file and uses 21.6-22.0 GB in MLX.
 DeepSeek V4.1 uses 176-178 GB at 8K context and 187 GB at 983K.
+
+### Hy4-flash Q3_K (GGUF) against llama.cpp
+
+Decode speed in tokens per second, Mac Studio M5 Ultra 256 GB, same Q3_K GGUF, same fixed text, speculative decode with the model's own head on both sides (ours: `--mtp-depth 3`; llama.cpp: `draft-mtp`). Served through the real server, real text, median of repeated runs. "next" marks a cell that is measured next and added to this table.
+
+| context | ours, speculative (depth 3) | ours, plain | llama.cpp, speculative | llama.cpp, plain |
+|---|---|---|---|---|
+| 4K | 64.20 | 44.38 | 50.92 | 48.66 |
+| 16K | 56.88 | 42.42 | 57.17 | 48.85 |
+| 24K | 55.58 | 41.14 | 52.78 | 48.92 |
+| 32K | 46.08 | not measured | 50.4 | 48.7 |
+| 64K | next | next | 52.69 | 48.72 |
+| 128K | next | next | next | next |
+
+Where llama.cpp leads:
+
+- Speculative decode: ours is ahead at 4K (+26 %) and 24K (+5 %), level at 16K (57.17 against 56.88, llama.cpp is 0.5 % ahead), and behind at 32K (46.08 against 50.4). The 64K cell is measured next: llama.cpp holds 52.69 there.
+- Plain decode (no draft): llama.cpp is faster at every context we measured (4K: 48.66 against 44.38; 16K: 48.85 against 42.42; 24K: 48.92 against 41.14). Our advantage comes from speculation, not from the plain step.
+- The speculative cells use the shipped serve line. Passkey retrieval passed 3 of 3 at 4K, 16K and 24K in both modes. The peak footprint is 150-151 GiB for a 144 GiB file (one resident copy of the weights).
+
+## New in 1.10.0
+
+Hy4-flash (GGUF Q3_K) on a Mac Studio, up to 256K tokens of context. Numbers: see the benchmark table. Guide: the Hy4-flash section above.
+
+What is new against 1.9.x:
+
+- Hy4-flash (GGUF Q3_K) is served on the generic decoder skeleton, with speculative decode on the model's own head (MTP, depth 3).
+- `attn_vec`: the MLA decode attention runs in one launch per layer (about 20 small launches before).
+- Engram rows are read from disk by parallel pread, with a background prefetch during decode. The 59 GiB table is never loaded or pinned.
+- Four kernels for the verify rows and the output head: `fmm8` (few-row Q8_0 matrix product), `head_q` (shared packed 8-bit output head), `nbr_small` (small 8-bit GEMVs), `moe_route_sel` (fused router selection).
+- Context: 256K tokens are configured. Decode speed at 64K and 128K context is measured next and will be added to the table.
+
+Run it (copy and paste; needs the install steps above and about 150 GiB of free memory):
+
+    pip install -U "huggingface_hub[cli]"
+    hf download AngelSlim/Hy4-flash-GGUF --include "Hy4-flash-Q3_K-*.gguf" --local-dir ./hy4-flash
+    set -a; . tools/hy4_mac.env; set +a
+    python -m kyojin_mlx.serve.server --model ./hy4-flash --port 8080 --model-id Hy4-flash \
+        --sessions 1 --ctx 262144 --kv-mode fp16 --no-kv-disk --prefill-chunk 2048 --mtp-depth 3 --cache-limit-mb 16384
+
+| change | effect | off |
+|---|---|---|
+| Hy4-flash serve backend on the generic decoder skeleton: prefill, decode, Engram rows read from the GGUF by row | serves the public Q3_K GGUF | - |
+| multi-token-prediction speculation with the model's own head, depth 3 (depth 5 measured slower at 4K, 16K and 24K) | `--mtp-depth 3` | `--mtp-depth 0` |
+| optional gather attention over the kept keys with pooled keys carried in the cache state (same speed and memory as the default path up to 40K tokens) | long context | off by default; `KYOJIN_HY4_FIXED_GATHER=16384`, `KYOJIN_HY4_FIXED_GATHER_DEC=32768`, `KYOJIN_HY4_FIXED_PKCACHE=1` |
+| fused attention, hyper-connection and expert kernels for the skeleton (`tools/hy4_mac.env`) | decode and prefill speed | unset the flag |
+| optional hierarchical candidate-restricted indexer for prompt chunks | `KYOJIN_HY4_HISA` (default off) | - |
+| few-row Q8_0 simdgroup-matrix product for the verify rows (2 to 8 rows) of the dense Q8_0 linears | Hy4-flash speculative decode, the four 8-bit and router levers (FMM8, ROUTE_SEL, HEAD_Q, NBR_SMALL) measured together, no single-lever served number: 58.50 -> 60.94 tok/s at 4K (+4.2 %), 42.06 -> 42.70 at 16K (+1.5 %), 39.14 -> 40.21 at 24K (+2.7 %), speculative depth 3, same prompt repeated (bundle) | `KYOJIN_FOREIGN_FMM8=0` |
+| fused MoE router selection: gating, bias, group limit, top-k, normalisation and scale in one launch | Hy4-flash speculative decode, the four 8-bit and router levers (FMM8, ROUTE_SEL, HEAD_Q, NBR_SMALL) measured together, no single-lever served number: 58.50 -> 60.94 tok/s at 4K (+4.2 %), 42.06 -> 42.70 at 16K (+1.5 %), 39.14 -> 40.21 at 24K (+2.7 %), speculative depth 3, same prompt repeated (bundle) | `KYOJIN_MOE_ROUTE_SEL=0` |
+| output head of 1 to 16 row passes through one shared packed 8-bit copy | Hy4-flash speculative decode, the four 8-bit and router levers (FMM8, ROUTE_SEL, HEAD_Q, NBR_SMALL) measured together, no single-lever served number: 58.50 -> 60.94 tok/s at 4K (+4.2 %), 42.06 -> 42.70 at 16K (+1.5 %), 39.14 -> 40.21 at 24K (+2.7 %), speculative depth 3, same prompt repeated (bundle) | `KYOJIN_HEAD_Q=0` |
+| one output row per simdgroup on small 8-bit GEMVs (twice the threadgroups) | Hy4-flash decode, output bit-equal; speed measured only inside the bundle of the four levers above (+4.2 % at 4K, +1.5 % at 16K, +2.7 % at 24K, speculative depth 3) | `KYOJIN_FOREIGN_NBR_SMALL=0` |
+| one-launch flash-attention core for the MLA decode attention (windowed layers and pooled-key layers, 1 to 8 rows; replaces about 20 small launches per layer) | Hy4-flash speculative decode, depth 3, same prompt repeated: 60.94 -> 66.58 tok/s at 4K (+9 %), 42.70 -> 52.29 at 16K (+22 %), 40.21 -> 51.66 at 24K (+28 %), 31.50 -> 43.03 at 28K (+37 %); on its own it slows one-row plain decode by 8 % at 4K, 16 % at 16K and 20 % at 24K (see next row) | `KYOJIN_HY4_ATTN_VEC=0` |
+| plain decode (one row) keeps the stock attention core; speculative verify rows (2 to 8) use the one-launch core | Hy4-flash plain decode keeps its speed with the gate: 44.66 / 43.14 / 40.33 tok/s at 4K / 16K / 24K (44.70 / 43.16 / 40.51 without the one-launch core), against 41.3 / 36.1 / 32.5 without the gate; speculative speed is unchanged | `KYOJIN_HY4_ATTN_VEC_MIN_ROWS=1` |
+| Engram rows read by deduplicated parallel preads instead of one page-in per row from the memory map (the table stays on disk: no warm-up, no pinning) | Hy4-flash first request and prompt chunks: 8K prefill 2016 -> 2068 tok/s (+2.6 %, loss bit-equal); decode on new text at 4K, speculative depth 3: 55.0 -> 49.7 ms per round (44.6 -> 50.7 tok/s), at 24K 73.6 -> 71.3 ms (33.8 -> 36.7 tok/s) | `KYOJIN_HY4_ENGRAM_PREAD=0` |
+| Engram rows of a speculative round read in the background while the draft head runs (rows stay on disk, only the cold rows are read) | Hy4-flash speculative decode on new text, depth 3: on top of the pread row, 49.7 -> 45.7 ms per round at 4K (-4.0 ms) and 71.3 -> 68.5 ms at 24K; with the pread row together 49.0 -> 41.1 ms per round at 4K (51.7 -> 60.8 tok/s) and 55.6 -> 50.9 ms at 24K (47.2 -> 49.6 tok/s); no change when the prompt repeats (rows already warm) | `KYOJIN_HY4_ENGRAM_DECPF=0` |
+
+- Hy4 runs one session at a time; extra requests queue.
 
 ## New in 1.9.8
 

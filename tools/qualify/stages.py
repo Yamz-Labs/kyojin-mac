@@ -207,7 +207,7 @@ def probe_factory(c: Ctx, sessions: int):
             if not h.ok:
                 g = guard_kill_for(c.prof["guard_log"], h.proc.pid)
                 tail = log.read_text(errors="replace").strip().splitlines()[-1:] or [""]
-                return False, ("killed by macguard: " + g if g else "no start: " + tail[0][:160])
+                return False, ("killed by memory guard: " + g if g else "no start: " + tail[0][:160])
             if not state["cal"]:
                 cl.calibrate(); state["cal"] = True
             for slot in (0, 1):                                  # 2 distinct near-full prompts back to back

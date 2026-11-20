@@ -266,6 +266,163 @@ def mhc_mix_pre(mixes: mx.array, scale: mx.array, base: mx.array, x: mx.array, p
     return y, pre_o, post, comb
 
 
+# ------------------------------------------------------------------------------------------- mHC identity form (2 hc mix rows, no comb)
+# The identity form of the hyper-connection (foreign_skeleton_hc: fn has 2 hc rows, no sinkhorn, the residual passes as is). Its seams in two
+# launches around the sub-layer (the mix itself is gluefuse.mixvec, any T and N = 2 hc):
+#   mhc_pre_identity     split (pre / post sigmoids) + collapse (_PRE's sum) [+ the sub-layer's pre rms_norm]   (stock: ~13 launches + 1 norm)
+#   mhc_expand_identity  [the sandwich post rms_norm of the sub-layer output] + expand h_j + post_j y          (stock: ~4 launches + 1 norm)
+# Any stream dtype T (fp32 / fp16 / bf16), any hc (HC), any D % 4 == 0, one threadgroup of 1024 threads per row (row independent). The arithmetic is
+# the stock op sequence of foreign_skeleton_hc + foreign_skeleton.Norm (fp contract off; each stock op rounds to its output dtype, the kernel
+# rounds at the same points; mx.sigmoid's 1 / (1 + exp(-|z|)) form). The row reduction of the norms is the rms_looped / single-row layout of MLX
+# (thread lid owns 4 lid .. 4 lid + 3 of every 4096, rounds in order, two-level simd_sum, precise rsqrt), the text of gluefuse._MIXVEC.
+# No clamp at the fp16 range: the stock identity path has none either.
+_HC_RMS = r"""
+    acc = simd_sum(acc);
+    if (sg == 0) { ls[ln] = 0.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ln == 0) { ls[sg] = acc; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        acc = simd_sum(ls[ln]);
+        if (ln == 0) { inv_s[0] = metal::precise::rsqrt(acc / float(D) + NEPS_EXPR); }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = inv_s[0];
+"""
+_PRE_ID = r"""
+    // mixes [R, 2 HC] fp32, scale [>= 2], base [2 HC], prm = [eps, magnitude, post_eps, norm_eps] fp32, x [R, HC, D] T, nw [D] T (NORM only)
+    // -> y [R, D] T = T(sum_j pre_j x_j) or its rms_norm (NORM), post [R, HC] fp32
+    const uint b = threadgroup_position_in_grid.y;
+    const uint lid = thread_position_in_threadgroup.x;
+    const uint sg = simdgroup_index_in_threadgroup, ln = thread_index_in_simdgroup;
+    threadgroup float ls[32];
+    threadgroup float inv_s[1];
+    const float s0 = scale[0], s1 = scale[1];
+    float pre[HC];
+    for (uint j = 0; j < HC; ++j) {
+        const float z = mixes[b * 2 * HC + j] * s0 + base[j];
+        const float e = 1.0f / (1.0f + metal::precise::exp(-metal::abs(z)));
+        pre[j] = ((z < 0.0f) ? 1.0f - e : e) + prm[0];
+    }
+    if (lid < HC) {
+        const float z = mixes[b * 2 * HC + HC + lid] * s1 + base[HC + lid];
+        const float e = 1.0f / (1.0f + metal::precise::exp(-metal::abs(z)));
+        float p = prm[1] * ((z < 0.0f) ? 1.0f - e : e);
+        if (POST_EPS) { p = p + prm[0]; }
+        post[b * HC + lid] = p;
+    }
+    const device T* xr = x + ulong(b) * HC * D;
+    device T* yr = y + ulong(b) * D;
+    float acc = 0.0f;
+    for (uint r = 0; r < ROUNDS; ++r) {
+        const uint off = r * 4096 + lid * 4;
+        if (off + 4 <= D) {
+            for (uint i = 0; i < 4; ++i) {
+                float c = 0.0f;
+                for (uint j = 0; j < HC; ++j) { c += pre[j] * float(xr[j * D + off + i]); }
+                const float ct = float(static_cast<T>(c));
+                if (NORM) { acc += ct * ct; } else { yr[off + i] = static_cast<T>(c); }
+            }
+        }
+    }
+    if (NORM) {
+""" + _HC_RMS.replace("NEPS_EXPR", "prm[3]") + r"""
+        for (uint r = 0; r < ROUNDS; ++r) {
+            const uint off = r * 4096 + lid * 4;
+            if (off + 4 <= D) {
+                for (uint i = 0; i < 4; ++i) {
+                    float c = 0.0f;
+                    for (uint j = 0; j < HC; ++j) { c += pre[j] * float(xr[j * D + off + i]); }
+                    const float ct = float(static_cast<T>(c));
+                    yr[off + i] = static_cast<T>(float(nw[off + i]) * float(static_cast<T>(ct * inv)));
+                }
+            }
+        }
+    }
+"""
+_EXPAND_ID = r"""
+    // yv [R, D] Y (sub-layer output), h [R, HC, D] T, post [R, HC] fp32, nw [D] Y (NORM only), prm = [norm_eps] fp32
+    // -> out [R, HC, D] T = T(h_j + post_j * n), n = yv, or its rms_norm w * Y(v * inv) (NORM == 1), or Y(Y(v * w) * inv) (NORM == 2: rms_norm(w * v))
+    const uint b = threadgroup_position_in_grid.y;
+    const uint lid = thread_position_in_threadgroup.x;
+    const uint sg = simdgroup_index_in_threadgroup, ln = thread_index_in_simdgroup;
+    threadgroup float ls[32];
+    threadgroup float inv_s[1];
+    const device Y* yr = yv + ulong(b) * D;
+    float inv = 1.0f;
+    if (NORM) {
+        float acc = 0.0f;
+        for (uint r = 0; r < ROUNDS; ++r) {
+            const uint off = r * 4096 + lid * 4;
+            if (off + 4 <= D) {
+                for (uint i = 0; i < 4; ++i) {
+                    float v = float(yr[off + i]);
+                    if (NORM == 2) { v = float(static_cast<Y>(v * float(nw[off + i]))); }
+                    acc += v * v;
+                }
+            }
+        }
+""" + _HC_RMS.replace("const float inv = inv_s[0];", "inv = inv_s[0];").replace("NEPS_EXPR", "prm[0]") + r"""
+    }
+    float pj[HC];
+    for (uint j = 0; j < HC; ++j) { pj[j] = post[b * HC + j]; }
+    for (uint r = 0; r < ROUNDS; ++r) {
+        const uint off = r * 4096 + lid * 4;
+        if (off + 4 <= D) {
+            for (uint i = 0; i < 4; ++i) {
+                float v = float(yr[off + i]);
+                if (NORM == 1) { v = float(static_cast<Y>(float(nw[off + i]) * float(static_cast<Y>(v * inv)))); }
+                if (NORM == 2) { v = float(static_cast<Y>(float(static_cast<Y>(v * float(nw[off + i]))) * inv)); }
+                for (uint j = 0; j < HC; ++j) {
+                    const ulong k = (ulong(b) * HC + j) * D + off + i;
+                    out[k] = static_cast<T>(float(h[k]) + pj[j] * v);
+                }
+            }
+        }
+    }
+"""
+_k_hcid: dict = {}
+_prm_cache: dict = {}
+
+
+def _prm(*vals) -> mx.array:
+    a = _prm_cache.get(vals)
+    if a is None:
+        a = _prm_cache[vals] = mx.array(list(vals), dtype=mx.float32)
+    return a
+
+
+def mhc_pre_identity(x: mx.array, mixes: mx.array, scale: mx.array, base: mx.array, eps: float, magnitude: float, post_eps: bool,
+                     nw: mx.array | None = None, norm_eps: float = 0.0) -> tuple[mx.array, mx.array]:
+    """x [R, hc, D] stream (T), mixes [R, 2 hc] / scale / base fp32 -> (y [R, D] T, post [R, hc] fp32). y = collapse(x, pre) as T, or
+    rms_norm(that, nw, norm_eps) when nw (dtype T, shape [D]) is given. Equals foreign_skeleton_hc.split (identity form) + collapse [+ Norm]."""
+    R, H, D = x.shape
+    norm = nw is not None
+    k = _k_hcid.get("pre")
+    if k is None:
+        k = _k_hcid["pre"] = mx.fast.metal_kernel(name="kyojin_mhc_pre_identity", input_names=["mixes", "scale", "base", "prm", "x", "nw"],
+                                                  output_names=["y", "post"], source=_PRE_ID, header=_HEADER)
+    y, post = k(inputs=[mixes, scale, base, _prm(eps, magnitude, eps, norm_eps), x, nw if norm else x],
+                template=[("T", x.dtype), ("HC", H), ("D", D), ("ROUNDS", -(-D // 4096)), ("NORM", norm), ("POST_EPS", bool(post_eps))],
+                grid=(1024, R, 1), threadgroup=(1024, 1, 1), output_shapes=[(R, D), (R, H)], output_dtypes=[x.dtype, mx.float32])
+    return y, post
+
+
+def mhc_expand_identity(y: mx.array, h: mx.array, post: mx.array, nw: mx.array | None = None, norm_eps: float = 0.0,
+                        mul_first: bool = False) -> mx.array:
+    """y [R, D] sub-layer output (Y), h [R, hc, D] stream (T), post [R, hc] fp32 -> [R, hc, D] T = h_j + post_j * n, n = y, or Norm(y): rms_norm(y, nw)
+    (nw dtype Y), or rms_norm(y * nw, ones) when mul_first. Equals foreign_skeleton_hc.expand(Norm(y), h, post, None)."""
+    R, H, D = h.shape
+    mode = 0 if nw is None else (2 if mul_first else 1)
+    k = _k_hcid.get("expand")
+    if k is None:
+        k = _k_hcid["expand"] = mx.fast.metal_kernel(name="kyojin_mhc_expand_identity", input_names=["yv", "h", "post", "nw", "prm"],
+                                                     output_names=["out"], source=_EXPAND_ID, header=_HEADER)
+    return k(inputs=[y, h, post, nw if mode else y, _prm(norm_eps)],
+             template=[("T", h.dtype), ("Y", y.dtype), ("HC", H), ("D", D), ("ROUNDS", -(-D // 4096)), ("NORM", mode)],
+             grid=(1024, R, 1), threadgroup=(1024, 1, 1), output_shapes=[(R, H, D)], output_dtypes=[h.dtype])[0]
+
+
 # --------------------------------------------------------------------------------------------------------------- wiring
 MIN_PROMPT_ROWS = 64
 _last = (None, None)          # (array, its fp32 copy) written by the last mhc_expand: the next mHC mix reads the copy instead of casting
@@ -357,6 +514,9 @@ def install(spec, only=None) -> int:
     import importlib
     if spec.fuse is None or not ENABLED:
         return 0
+    if os.environ.get("KYOJIN_GLM_DSA_FAST", "0") == "1" and spec.index_patch == "glm":
+        from .glm_dsa import install as _dsa_install
+        _dsa_install()
     if os.environ.get("KYOJIN_DSA_INDEX_GLM", "0") == "1" and spec.index_patch == "glm":
         from .glm_index import install as _glm_install
         _glm_install()

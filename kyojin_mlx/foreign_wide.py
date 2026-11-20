@@ -39,7 +39,7 @@ def wide_inputs(fmt: str):
 
 def wide_layout(fmt: str) -> str:
     """Key of the activation permutation: formats with the same letter share one index."""
-    return "8" if fmt in FM.FORMATS8 else FM._FMMA_LAYOUT[fmt]
+    return "8" if fmt in FM.FORMATS8 else FM.layout_of(fmt)
 
 
 def wide_xperm_index(fmt: str, k: int):
@@ -53,7 +53,7 @@ def wide_xperm_index(fmt: str, k: int):
     if fmt in FM.FORMATS8:       # one byte per weight: pair (q, t) = bytes (t & 1) and (t & 1) + 2 of word 2 q + (t >> 1) of the 32-byte unit, element e picks one of the two
         return (32 * u + 8 * q + 4 * (t >> 1) + (t & 1) + 2 * e).astype(np.int32)
     nj = t + 4 * e
-    L = FM._FMMA_LAYOUT[fmt]
+    L = FM.layout_of(fmt)
     if L in ("K", "KG", "K2", "K1"):
         first, second = FM._pair_elements(L, 4 * q + t)
         return (32 * u + np.where(e == 0, first, second)).astype(np.int32)

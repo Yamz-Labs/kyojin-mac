@@ -143,7 +143,7 @@ class LineWatch:
         return hit
 
 
-THINK_CLOSE = "</think>"                   # the chat templates of every family here (ds41, qwen, glm) close a think block with this text
+THINK_CLOSE = "</think>"                   # the close tag of the ds41 / qwen / glm templates; the server closes with chat.think_tags(family)[1] (Hy4: </think:6124c78e>)
 
 
 def in_think(parser) -> bool:

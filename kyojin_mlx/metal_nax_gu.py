@@ -31,10 +31,10 @@ _ids = itertools.count()
 _kc: dict = {}
 
 
-def _mid_tail(limit: float, wpre: bool, fq: bool, alpha: float, beta: float) -> str:
+def _mid_tail(limit: float, wpre: bool, fq: bool, alpha: float, beta: float, act: str = "swiglu") -> str:
     """The `mid` body after the gate / up values gu[2] exist: SwiGLU, routing weight, fp8 fake quant, rotation, permuted half store."""
-    s = S.mid_source(limit, wpre, fq, alpha, beta)
-    i = s.index("float4 g4 = min(")
+    s = S.mid_source(limit, wpre, fq, alpha, beta, act)
+    i = s.index("float4 g4 = ")                              # first statement of the activation (both kinds)
     t = s[i:]
     old = "*((device float4*)(xh2 + ulong(p) * N + col)) = float4(v0, v1, v2, v3) * " + S.RSQRT_HAD + ";"
     assert t.count(old) == 1
@@ -43,7 +43,7 @@ def _mid_tail(limit: float, wpre: bool, fq: bool, alpha: float, beta: float) -> 
 
 @functools.lru_cache(maxsize=None)
 def gu_source(Kg: int, Ku: int, cb: str, bmu: int, nmb: int, bns: int, bks: int, limit: float, wpre: bool, fq: bool,
-              alpha: float, beta: float, skip_tail: bool = True, rowmap: bool = False) -> str:
+              alpha: float, beta: float, skip_tail: bool = True, rowmap: bool = False, act: str = "swiglu") -> str:
     """Inputs: eids i32 [GL], rowoff u32 [GL + 1], tr0 tr1 u32 (gate, up trellis), off0 off1 u32 [E + 1],
     A half [2n, KD] (gate rows, up rows; k permuted) or, with rowmap, x half [T, KD], tok u32 [n vs slots],
     suh0 suh1 half [E, KD]; params u32 [KT, NT, GL, n], svh0 svh1 half [E, N], suhd half [E, N], wts f32 [n].
@@ -137,7 +137,7 @@ def gu_source(Kg: int, Ku: int, cb: str, bmu: int, nmb: int, bns: int, bks: int,
                 "      const float4 sv = float4(*((const device half4*)((pj ? svh1 : svh0) + ulong(e) * N + col)));",
                 "      gu[pj] = float4(v0, v1, v2, v3) * " + S.RSQRT_HAD + " * sv;",
                 "    }",
-                _mid_tail(limit, wpre, fq, alpha, beta),
+                _mid_tail(limit, wpre, fq, alpha, beta, act),
                 "  }",
                 "  threadgroup_barrier(mem_flags::mem_threadgroup);"]
     store = "\n".join(epi)
@@ -212,10 +212,10 @@ def fused_gu_swiglu(g, u, d, eids: mx.array, ex, rowoff: mx.array, A: mx.array |
         assert len(rowmap) == 4 and g.kin % 128 == 0
         bmu, nmb = 32, 1                                     # staging keeps one 32-row block (8 + 8 + 8 KB threadgroup)
     cbk = NX.dec_cb(g.cb)
-    key = (Kg, Ku, cbk, bmu, nmb, bns, bks, m.limit, m.wpre, m.fq, m.alpha, m.beta, NX.SKIP_TAIL, rm)
+    key = (Kg, Ku, cbk, bmu, nmb, bns, bks, m.limit, m.wpre, m.fq, m.alpha, m.beta, NX.SKIP_TAIL, rm, m.act)
     kern = _kc.get(key)
     if kern is None:
-        src = gu_source(Kg, Ku, cbk, bmu, nmb, bns, bks, m.limit, m.wpre, m.fq, m.alpha, m.beta, NX.SKIP_TAIL, rm).replace("ROWSMB", str(nmb))
+        src = gu_source(Kg, Ku, cbk, bmu, nmb, bns, bks, m.limit, m.wpre, m.fq, m.alpha, m.beta, NX.SKIP_TAIL, rm, m.act).replace("ROWSMB", str(nmb))
         names = ["eids", "rowoff", "tr0", "tr1", "off0", "off1"] + (["x", "tok", "suh0", "suh1"] if rm else ["A"]) + \
                 ["params", "svh0", "svh1", "suhd", "wts"]
         kern = _kc[key] = mx.fast.metal_kernel(name=f"kyojin_gu_{cbk}_{Kg}_{Ku}_{bmu}_{nmb}_{bns}_{bks}_{'rm' if rm else 'a'}_{next(_ids)}",

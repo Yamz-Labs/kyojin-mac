@@ -17,6 +17,7 @@ import mlx.core as mx
 import numpy as np
 
 from . import vendor_input as vi
+from .csf_scale import CsfCheckpoint, csf_stream_names
 
 _MX_OK = {"F32", "F16", "BF16", "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "BOOL", "F64", "F8_E4M3", "F8_E8M0"}
 
@@ -42,6 +43,8 @@ class SrcDict(dict):
         for p in plan.values():
             for sfx in vi_companions(ck.info(), p):
                 self.pop(sfx, None)
+        for n in csf_stream_names(ck.info()):                 # CSF scale streams: decoded to `.weight_scale` by CsfCheckpoint
+            self.pop(n, None)
         for wn in plan:
             self.setdefault(wn, None)                         # placeholder key (E5M2 weights are not in the mlx dict)
 
@@ -81,7 +84,7 @@ def src_items(W, prefix):
 
 
 def load_source(src, files, log=print):
-    ck = vi.Checkpoint(src)
+    ck = CsfCheckpoint(src)
     info = ck.info()
     rep = vi.detect_checkpoint(info, ck.config)
     if rep["primary"] == "unsupported-integer-quant":

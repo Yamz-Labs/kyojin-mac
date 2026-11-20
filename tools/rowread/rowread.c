@@ -61,3 +61,19 @@ int64_t rr_hot(const uint8_t *map, const int64_t *rows, int64_t n, int64_t width
     }
     return hot;
 }
+
+// Per row: out[i] = 1 when every page of row rows[i] is in the page cache, else 0 (the decode path reads the cached rows from the map and only the cold ones by pread).
+// Returns the number of cached rows.
+int64_t rr_hotmask(const uint8_t *map, const int64_t *rows, int64_t n, int64_t width, uint8_t *out) {
+    int64_t page = (int64_t)getpagesize(), hot = 0;
+    for (int64_t k = 0; k < n; k++) {
+        const uint8_t *p = map + rows[k] * width;
+        uintptr_t a = (uintptr_t)p & ~(uintptr_t)(page - 1), b = (uintptr_t)p + (uintptr_t)width;
+        char vec[4];
+        int64_t np = (int64_t)((b - a + page - 1) / page), ok = np <= 4 && mincore((void *)a, b - a, vec) == 0;
+        for (int64_t q = 0; ok && q < np; q++) ok = vec[q] & MINCORE_INCORE;
+        out[k] = (uint8_t)ok;
+        hot += ok;
+    }
+    return hot;
+}

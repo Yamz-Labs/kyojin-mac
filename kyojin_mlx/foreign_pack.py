@@ -22,16 +22,18 @@ import numpy as np
 E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], np.float32)
 KVALUES_IQ4NL = np.array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113], np.float32)
 FORMATS = ("q4_0", "iq4_nl", "q4_k", "nvfp4", "mxfp4")
-FORMATSK = ("q5_k", "q6_k", "iq4_xs", "q3_k", "iq3_s", "iq3_xxs", "q2_k", "iq2_xxs", "iq2_xs", "iq2_s", "iq1_s", "iq1_m")           # flag kstored: GGUF K / IQ blocks read as stored (same bytes, bit fields split per 32-unit; see the K section of foreign_metal)
+FORMATSK = ("q5_k", "q6_k", "iq4_xs", "q3_k", "iq3_s", "iq3_xxs", "q2_k", "iq2_xxs", "iq2_xs", "iq2_s", "iq1_s", "iq1_m", "q4_1", "q5_0", "q5_1", "q2_0")           # flag kstored: GGUF K / IQ blocks read as stored (same bytes, bit fields split per 32-unit; see the K section of foreign_metal)
 FORMATS8 = ("fp8", "q8_0", "fp8b")                      # flag fp8stored: one byte per weight, natural order (see foreign_metal 8-bit section); not in FORMATS
 LAYOUT = {"q4_0": "H", "iq4_nl": "H", "q4_k": "Q4K", "nvfp4": "N", "mxfp4": "N"}
 UNIT = {"q4_0": 32, "iq4_nl": 32, "q4_k": 32, "nvfp4": 32, "mxfp4": 32}
 KALIGN = {"q4_0": 32, "iq4_nl": 32, "q4_k": 256, "nvfp4": 32, "mxfp4": 32}      # k must be a multiple of this
 
 
+FORMATS_L2 = ("q2_0",)                         # in FORMATSK for the kernels (flag q2_0_stored); 64-blocks of 2-bit codes, no super-block (see Pack.__post_init__)
+FORMATS_L5 = ("q4_1", "q5_0", "q5_1")          # in FORMATSK for the kernels; their packs have no 256-super-block (see Pack.__post_init__)
 K_META_WORDS = {"q5_k": 4, "q6_k": 5, "iq4_xs": 2, "q3_k": 5, "iq3_s": 4, "iq3_xxs": 1, "q2_k": 5, "iq2_xxs": 1, "iq2_xs": 3, "iq2_s": 5, "iq1_s": 5, "iq1_m": 7}     # uint32 per 256-super-block in `meta`
-K_HI_WORDS = {"q5_k": 1, "q6_k": 2, "iq4_xs": 0, "q3_k": 1, "iq3_s": 1, "iq3_xxs": 1, "q2_k": 0, "iq2_xxs": 1, "iq2_xs": 0, "iq2_s": 1, "iq1_s": 0, "iq1_m": 0}   # uint32 per 32-unit in extra["hi"]
-K_QS_BYTES = {"q5_k": 16, "q6_k": 16, "iq4_xs": 16, "q3_k": 8, "iq3_s": 8, "iq3_xxs": 8, "q2_k": 8, "iq2_xxs": 4, "iq2_xs": 8, "iq2_s": 4, "iq1_s": 4, "iq1_m": 4}   # bytes of qs per 32-unit
+K_HI_WORDS = {"q5_k": 1, "q6_k": 2, "iq4_xs": 0, "q3_k": 1, "iq3_s": 1, "iq3_xxs": 1, "q2_k": 0, "iq2_xxs": 1, "iq2_xs": 0, "iq2_s": 1, "iq1_s": 0, "iq1_m": 0, "q4_1": 0, "q5_0": 1, "q5_1": 1, "q2_0": 0}   # uint32 per 32-unit in extra["hi"]
+K_QS_BYTES = {"q5_k": 16, "q6_k": 16, "iq4_xs": 16, "q3_k": 8, "iq3_s": 8, "iq3_xxs": 8, "q2_k": 8, "iq2_xxs": 4, "iq2_xs": 8, "iq2_s": 4, "iq1_s": 4, "iq1_m": 4, "q4_1": 16, "q5_0": 16, "q5_1": 16, "q2_0": 8}   # bytes of qs per 32-unit
 
 
 @dataclass
@@ -50,6 +52,20 @@ class Pack:
         if self.fmt in FORMATS8:
             if self.k % 32 or self.qs.shape[-2:] != (self.n, self.k) or self.qs.dtype != np.uint8:
                 raise ValueError(f"{self.fmt}: qs {self.qs.shape} {self.qs.dtype} != uint8 [{self.n}, {self.k}] with k % 32 == 0")
+            return
+        if self.fmt in FORMATS_L2:
+            nb = self.k // 64           # 64-blocks, k % 64 == 0; qs uint8 [n, k/4] (the stored code bytes), meta uint32 [n, ceil(nb / 2)] (two fp16 d per word, a last odd block padded with 0)
+            if (self.k % 64 or self.qs.shape != (self.n, self.k // 4) or self.qs.dtype != np.uint8 or self.meta is None or self.meta.shape != (self.n, (nb + 1) // 2)
+                    or self.meta.dtype != np.uint32):
+                raise ValueError(f"{self.fmt}: bad shapes for n={self.n} k={self.k} (k % 64 == 0, qs uint8 [n, k/4], meta uint32 [n, ceil(k/64 / 2)])")
+            return
+        if self.fmt in FORMATS_L5:
+            nu = self.k // 32           # legacy 32-blocks: no super-block, k % 32 == 0; meta uint32 [n, nu] (q4_1, q5_1: d | m << 16) or [n, ceil(nu / 2)] (q5_0: two fp16 d per word), hi uint32 [n, nu]
+            mw = (nu + 1) // 2 if self.fmt == "q5_0" else nu
+            hi = self.extra.get("hi")
+            if (self.k % 32 or self.qs.shape != (self.n, self.k // 2) or self.qs.dtype != np.uint8 or self.meta.shape != (self.n, mw) or self.meta.dtype != np.uint32
+                    or (self.fmt != "q4_1" and (hi is None or hi.shape != (self.n, nu) or hi.dtype != np.uint32))):
+                raise ValueError(f"{self.fmt}: bad shapes for n={self.n} k={self.k} (k % 32 == 0, qs uint8 [n, k/2], meta uint32 [n, {mw}], hi uint32 [n, k/32] unless q4_1)")
             return
         if self.fmt in FORMATSK:
             nsb, nu = self.k // 256, self.k // 32
@@ -199,10 +215,45 @@ def dequant(p: Pack, g=True) -> np.ndarray:
     return (E2M1[codes].reshape(n, k // 32, 32) * s[..., None]).reshape(n, k)
 
 
+def _dequant_l5(p: Pack) -> np.ndarray:
+    """float32 [n, k] of a q4_1 / q5_0 / q5_1 pack from the device layout (see foreign_gguf._to_pack_l5): w = q d + m (q4_1, q5_1), (q - 16) d (q5_0)."""
+    n, k = p.n, p.k
+    nu = k // 32
+    mw = np.ascontiguousarray(p.meta).reshape(n, -1)
+    h16 = lambda w: (w & 0xFFFF).astype(np.uint16).view(np.float16).astype(np.float32)
+    if p.fmt == "q5_0":
+        d = np.stack([h16(mw), h16(mw >> 16)], -1).reshape(n, -1)[:, :nu].reshape(n, nu, 1)
+        m = np.float32(0.0)
+    else:
+        d, m = h16(mw).reshape(n, nu, 1), h16(mw >> 16).reshape(n, nu, 1)
+    q = p.qs.reshape(n, nu, 16)
+    x = np.concatenate([q & 15, q >> 4], -1).astype(np.float32)
+    if p.fmt != "q4_1":
+        hw = np.ascontiguousarray(p.extra["hi"]).reshape(n, nu, 1)
+        x += (((hw >> np.arange(32, dtype=np.uint32)) & 1) << 4).astype(np.float32)
+    if p.fmt == "q5_0":
+        return ((x - 16) * d).reshape(n, k).astype(np.float32)
+    return (x * d + m).reshape(n, k).astype(np.float32)
+
+
+def _dequant_q20(p: Pack) -> np.ndarray:
+    """float32 [n, k] of a q2_0 pack from the device layout (see foreign_gguf._to_pack_q20): w = (code - 1) d, code e of a 64-block = bits 2 (e % 4) of byte e / 4."""
+    n, k = p.n, p.k
+    nb = k // 64
+    mw = np.ascontiguousarray(p.meta).reshape(n, -1)
+    d = np.stack([mw & 0xFFFF, mw >> 16], -1).reshape(n, -1)[:, :nb].astype(np.uint16).view(np.float16).astype(np.float32)
+    c = ((p.qs.reshape(n, nb, 16, 1) >> (2 * np.arange(4, dtype=np.uint8))) & 3).reshape(n, nb, 64).astype(np.int32)
+    return ((c - 1).astype(np.float32) * d[..., None]).reshape(n, k)
+
+
 def _dequant_k(p: Pack) -> np.ndarray:
     """float32 [n, k] of a K-format pack, from the device layout (independent of the GGUF reader: tests compare the two)."""
     n, k = p.n, p.k
     nsb, nu = k // 256, k // 32
+    if p.fmt in ("q4_1", "q5_0", "q5_1"):
+        return _dequant_l5(p)
+    if p.fmt == "q2_0":
+        return _dequant_q20(p)
     if p.fmt == "q5_k":
         q = p.qs.reshape(n, nsb, 4, 32)
         m4 = np.ascontiguousarray(p.meta).reshape(n, nsb, 4)

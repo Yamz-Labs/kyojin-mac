@@ -37,7 +37,7 @@ def oom_in(log: Path) -> bool:
 
 
 def guard_kill_for(guard_log: str, pid: int) -> str | None:
-    """The macguard line that TERMed `pid` (a probe killed by the guard is 'does not fit under the cap', not a crash of the model)."""
+    """The memory guard line that TERMed `pid` (a probe killed by the guard is 'does not fit under the cap', not a crash of the model)."""
     try:
         for line in reversed(Path(guard_log).read_text(errors="replace").splitlines()[-200:]):
             if f"TERM {pid} " in line:

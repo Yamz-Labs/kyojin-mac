@@ -92,7 +92,7 @@ class MoeSharedFused(M.MoeGather):
             return AZ.zeros_like_shape((rows * self.topk, self.g.nout), mx.float32)
         P = self._extra(rows)
         kern = self._kern("midsh", 0, f"kyojin_midsh_{int(self.wpre)}{int(self.fq)}", ["part", "ids", "wts", "svh0", "svh1", "suhd", "params"], ["xh2"],
-                          lambda: S.mid_sh_source(self.limit, self.wpre, self.fq, self.alpha, self.beta))
+                          lambda: S.mid_sh_source(self.limit, self.wpre, self.fq, self.alpha, self.beta, self.act))
         gt = P.get("hg_mid")
         if gt is None:
             gt = P["hg_mid"] = S.had_grid(self.g.nout // 128, P["npairs"])
@@ -143,11 +143,11 @@ def _lin_parts(lin):
     return b.words, b.K, b.suh, b.svh, lin._kt, lin._nt, lin.cb
 
 
-def wire_shared(g: M.Stack, u: M.Stack, d: M.Stack, shared_mod, limit: float, alpha: float, beta: float):
+def wire_shared(g: M.Stack, u: M.Stack, d: M.Stack, shared_mod, limit: float, alpha: float, beta: float, act: str = "swiglu"):
     """Stacks with the model's shared expert appended as the last expert, or None when it cannot ride the routed launches: `shared_mod` needs
     gate_proj / up_proj / down_proj Exl3Linear (no bias, no fused gate_up), the routed stacks' shapes and codebook, the routed swiglu (limit,
     alpha 1, beta 0)."""
-    if alpha != 1.0 or beta != 0.0:
+    if alpha != 1.0 or beta != 0.0 or act != "swiglu":
         return None
     sl = getattr(shared_mod, "swiglu_limit", None)
     if sl is not None and float(sl) != float(limit):

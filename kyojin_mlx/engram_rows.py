@@ -226,6 +226,7 @@ _rr_fn = None
 class _RowRead:
     read: object
     hot: object
+    hotmask: object = None                                                # rr_hotmask (per-row page-cache mask); None: a library built before it
 
 
 def _rowread():
@@ -245,7 +246,11 @@ def _rowread():
                 lib.rr_read.restype = ctypes.c_int
                 lib.rr_hot.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64]
                 lib.rr_hot.restype = ctypes.c_int64
-                _rr_fn = _RowRead(lib.rr_read, lib.rr_hot)
+                hm = getattr(lib, "rr_hotmask", None)
+                if hm is not None:
+                    hm.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p]
+                    hm.restype = ctypes.c_int64
+                _rr_fn = _RowRead(lib.rr_read, lib.rr_hot, hm)
             except Exception:
                 pass
     return _rr_fn or None
